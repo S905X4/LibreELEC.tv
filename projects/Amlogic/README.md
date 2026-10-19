@@ -137,6 +137,28 @@ review diagnostics in that context rather than enabling the multimedia stack.
 CPU DVFS and thermal safety under sustained load remain unverified.
 Do not treat an initial boot or a userspace simulation as a stress-test result.
 
+### USB boot enumeration
+
+With the console corrected, the owner log reaches both xHCI root hubs but no
+external USB device or block device, then stops at `mount_flash`. A root hub
+does not prove that the USB2 PHY can detect the drive; changing partition UUIDs
+or extending mount retries does not address the observed failure.
+
+The HK1 board DT now preserves the stock `snps,dis_enblslpm_quirk` and
+`snps,dis-u2-freeclk-exists-quirk` properties. Linux 6.18.57 consumes both:
+they clear `GUSB2PHYCFG.ENBLSLPM` and `U2_FREECLK_EXISTS`. The corrected DTB
+passes kernel schema validation. A host-only register smoke exercised the
+actual DWC3 setup routine on both modeled ports with properties decoded from
+that DTB; it is not a physical USB test.
+
+For an isolated hardware check, replace only
+`amlogic/meson-sc2-hk1-rbox-x4.dtb` on the existing removable FAT partition.
+Keep `KERNEL`, `SYSTEM`, `uEnv.ini`, partition UUIDs, USB port and drive unchanged.
+Look for an external USB VID/PID, storage detection and successful `/flash`
+mounting. The properties' omission is confirmed; recovery of this box's USB
+enumeration remains unverified. Do not combine this first check with global
+unused-clock/power overrides or a different PHY reset sequence.
+
 ### Verification and limits
 
 The complete `make image` build succeeded, including the removable disk image.
@@ -182,9 +204,11 @@ this dependency is explicit rather than inherited from Kodi. Without kernel IP
 autoconfiguration, initramfs creates an empty resolver file instead of reading
 the absent `/proc/net/pnp`; ConnMan configures the live network later.
 
-These checks do not execute the vendor U-Boot script or any SC2 peripheral.
+These QEMU checks do not execute the vendor U-Boot script or any SC2 peripheral.
 The initial HK1 UART log reached Linux 6.18.57, four CPUs, and `ttyAML0`
 registration, then became unreadable at console handover with the old 115200
-setting. Complete HK1 boot, SD/USB, Ethernet PHY, and memory-reservation
-compatibility still require hardware observation after the baud correction.
-HDMI and multimedia remain disabled, not validated or repaired by the QEMU results.
+setting. The owner's subsequent 921600 log reaches xHCI root hubs but no USB
+drive and stops before mounting `/flash`, as described above. Complete HK1 boot,
+SD/USB storage, Ethernet PHY, and memory-reservation compatibility remain
+unverified. HDMI and multimedia remain disabled, not validated or repaired by
+the QEMU results.
