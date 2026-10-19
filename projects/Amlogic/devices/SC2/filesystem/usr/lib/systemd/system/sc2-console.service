@@ -7,7 +7,7 @@ ConditionPathExists=/dev/ttyAML0
 
 [Service]
 Type=idle
-ExecStart=-/usr/sbin/agetty --noclear --login-program /bin/login 115200 ttyAML0 vt100
+ExecStart=-/usr/sbin/agetty --noclear --login-program /bin/login 921600 ttyAML0 vt100
 Restart=always
 RestartSec=2
 TTYPath=/dev/ttyAML0

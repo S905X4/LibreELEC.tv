@@ -76,7 +76,10 @@ USB devices `0:1` through `3:1`. There is no default MMC scan or assumed eMMC
 number. It imports only `bootargs` from `uEnv.ini`, then loads the fixed HK1 DTB.
 The image supplies unique partition UUIDs for `boot=` and `disk=`, not Android
 partitions. Load failures return to vendor U-Boot.
-Boot-file updates replace only the DTB and script on the mounted `/flash`.
+Boot-file updates replace the DTB and script on the mounted `/flash`, and migrate
+the old `console=ttyAML0,115200n8` in `uEnv.ini` to `console=ttyAML0,921600n8`.
+The existing partition UUIDs and other boot arguments are preserved; do not copy
+a freshly generated image's `uEnv.ini` onto partitions with different UUIDs.
 
 Kernel placement follows Linux 6.18's arm64 boot protocol: the Image has zero
 `text_offset` and needs a 2 MiB-aligned load/entry address. Buffers avoid the
@@ -99,7 +102,7 @@ map requires rechecking these bounds before booting.
 
 ### Login, network, and observations
 
-The command line selects `ttyAML0` at **115200 8N1**, DT-selected `earlycon`,
+The command line selects `ttyAML0` at **921600 8N1**, DT-selected `earlycon`,
 and `ssh`. LE's vendor `multi-user.target.wants` link pulls in
 `sc2-console.service`, running util-linux `agetty` and BusyBox `login`, not
 an autologin or a debug shell. ConnMan
@@ -112,6 +115,11 @@ isolated bring-up network until then. UART login requires the same password.
 No `systemd.debug_shell` argument is supplied; initramfs failures stop with a
 diagnostic instead of starting an unauthenticated shell.
 
+The owner confirms this box's TTL console runs at 921600 baud. Keep the host
+terminal, kernel `console=`, DT `stdout-path`, and `agetty` at that rate.
+Earlycon inherits the firmware's UART setup; the former 115200 setting changed
+the baud when the full driver took over, rather than preserving the working rate.
+
 LE's vendor `.wants` links can start a service even when `systemctl is-enabled`
 reports `disabled`; inspect runtime state with `systemctl is-active
 sc2-console.service`.
@@ -122,11 +130,10 @@ Useful headless observations include `uname -a`, `cat /proc/device-tree/model`,
 `dtc`, `memtester`, `gdb`, `usbutils`, `pciutils`, and `nano`.
 
 This target intentionally disables DRM, GPU, media, and sound in the kernel.
-There is no claim of HDMI, playback, Wi-Fi, or even board boot success without
-an actual UART/network observation from this box. The normal distro-wide
-kernel-options audit includes desktop/container/media requirements that this
-bring-up configuration intentionally does not satisfy; review diagnostics in
-that context rather than enabling the multimedia stack.
+An initial HK1 kernel log is not evidence of working HDMI or a complete board
+boot. The normal distro-wide kernel-options audit includes desktop/container/media
+requirements that this bring-up configuration intentionally does not satisfy;
+review diagnostics in that context rather than enabling the multimedia stack.
 CPU DVFS and thermal safety under sustained load remain unverified.
 Do not treat an initial boot or a userspace simulation as a stress-test result.
 
@@ -138,11 +145,11 @@ The resulting image passed its SHA-256 check. Its FAT-shipped HK1 DTB passed
 `0x02000000` load/entry address. The gap between the generated MBR and the first
 partition contains no raw U-Boot/FIP payload.
 
-Two independent QEMU boots exercised the actual image's FAT partition, `SYSTEM`,
-and production initramfs. This used a separate Linux 6.18.57 diagnostic kernel,
-built with LE's target compiler and the production configuration plus QEMU
-PL011/VirtIO support, with the production initramfs supplied externally. A
-VM-only udev rule mapped PL011 to `ttyAML0` to exercise the shipped console unit;
+The initial image was exercised in two independent QEMU boots using its FAT
+partition, `SYSTEM`, and production initramfs. This used a separate Linux 6.18.57
+diagnostic kernel, built with LE's target compiler and the production configuration
+plus QEMU PL011/VirtIO support, with the production initramfs supplied externally.
+A VM-only udev rule mapped PL011 to `ttyAML0` to exercise the shipped console unit;
 neither the diagnostic kernel nor that rule is included in the deliverable.
 
 Observed runtime results:
@@ -159,12 +166,25 @@ Observed runtime results:
 * Native `strace` observing a successful `write(2)` and native `gdb` stopping an
   inferior, reading its PC, and continuing it to normal exit.
 
+After the baud correction, the rebuilt image passed its SHA-256 check and its
+shipped DTB passed `dt-validate` against the kernel bindings. A QEMU boot of the
+new image exercised authenticated UART login and console restart after logout.
+Native Python `termios.tcgetattr` observed both input and output at `B921600`
+on each login, with `sc2-console.service` active. This checks the shipped login
+service, not physical Meson UART timing.
+
+A subsequent QEMU boot loaded the final `SYSTEM` and ran its actual boot-update
+hook against an old 115200 `uEnv.ini`. It migrated the console to 921600 without
+changing partition UUIDs or other arguments, then remounted `/flash` read-only.
+
 Headless mode still includes Python3 because LE's entropy services require it;
 this dependency is explicit rather than inherited from Kodi. Without kernel IP
 autoconfiguration, initramfs creates an empty resolver file instead of reading
 the absent `/proc/net/pnp`; ConnMan configures the live network later.
 
 These checks do not execute the vendor U-Boot script or any SC2 peripheral.
-Actual HK1 UART boot, SD/USB, Ethernet PHY, and memory-reservation compatibility
-still require hardware observation. HDMI and multimedia remain disabled, not
-validated or repaired by the QEMU results.
+The initial HK1 UART log reached Linux 6.18.57, four CPUs, and `ttyAML0`
+registration, then became unreadable at console handover with the old 115200
+setting. Complete HK1 boot, SD/USB, Ethernet PHY, and memory-reservation
+compatibility still require hardware observation after the baud correction.
+HDMI and multimedia remain disabled, not validated or repaired by the QEMU results.
