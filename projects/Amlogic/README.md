@@ -136,6 +136,59 @@ Register readback proves that selection, not a visible sink image. The
 temporary probe and BIST are diagnostic-only, with rollback; physical
 pixels, colors and direct-TCL cold-start behavior remain acceptance gates.
 
+#### Production artifact and real-board verification
+
+LE image-build commit `c17c6206475e2a6150c3ba47b89444e68eb32fe1` produced
+`target/LibreELEC-SC2.aarch64-12.2-devel-20261019224356-c17c620`:
+
+| Artifact | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `.img.gz` | 55,112,142 | `d156755bd9ec0153f0fcefd01da8e849747be05443899c5945771cf2727459e9` |
+| `.tar` | 69,754,880 | `fe209393a902cc0551a5005042e159c3fcbd9a91c3b7a28a971fccbe6fe9931b` |
+| `.kernel` | 24,865,344 | `aeeafd54dce08f76b581061f519be9912bb757aa5adc4a6398884f7a630ed98c` |
+| `.system` | 44,290,048 | `58d70536a914e0ed102cbeff4f3a75e9c0cdf097681b7e1490d7305d1a03be5b` |
+
+Sidecar SHA-256, TAR payload MD5, uImage header/data CRC and embedded CMA
+configuration checks passed. The uImage retains load/entry `0x02000000`;
+the removable script's RAM input buffer remains `0x12000000`. KERNEL,
+SYSTEM, DTB and removable script match between image and TAR. The three
+changed source files also match the integrated kernel build byte for byte.
+Checkpatch reports zero errors and warnings with only the user-required
+local Gerrit Change-Id exception; this is not an upstream/DCO acceptance claim.
+
+Before the notified standard update, running boot files were backed up as
+`Work/sc2-pre-secure-LibreELEC-SC2.aarch64-12.2-devel-20261019224356-c17c620.tar`
+(69,178,368 bytes, SHA-256
+`fa2672282e6235de0a78a5438d636d4820170da7e4f208ebfef29336030174ec`).
+The uploaded update hash matched the local TAR. The new production image
+returned over SSH after 50.34 seconds, reports `systemctl is-system-running`
+as `running`, has no failed units and kernel taint zero. Installed KERNEL,
+SYSTEM and DTB hashes match the verified artifact. `uEnv.ini` retains SHA-256
+`6f6102d520ccb1c4adae96d3cd4856dd8c7ccd9e53296a650b468a39f93f187c`,
+and `/flash` is again read-only on `/dev/sda1`. No explicit eMMC or persistent
+U-Boot environment write was requested; vendor automatic writes remain outside
+this observation without the owner's UART log.
+
+Without a diagnostic module, the native driver now reads `MC_CLKDIS=0x6c`,
+`HDCPCFG1=0x03` and `HDCP22REG_CTRL=0x02`. These protected values persist
+through a 12-second 1080p60 SMPTE/page-flip run (60.45 Hz initially, then
+60.00 Hz); the original framebuffer `fb=44` and active CRTC return on exit.
+CMA remains 256 MiB. No hardware BIST is left enabled.
+
+The shared protected clock register was also exercised through real PCM,
+not ALSA null: `hw:0,1`, S16_LE, 48 kHz, stereo, two four-second
+open/play/stop cycles. The DT route is FRDDR_B OUT2 to TDMOUT_C IN1 to
+I2S C to HDMI. DMA hardware pointers advanced from 31,104 to 79,360;
+the newly requested FRDDR_B IRQ advanced from 5 to 13 during the first run.
+`MC_CLKDIS` transitions `0x6c -> 0x64 -> 0x6c`, proving native audio gate
+enable/disable through the protected callback. All five touched mixer controls
+were restored to their observed values and the temporary WAV was removed.
+This proves PCM/DMA/IRQ and gate lifecycle, not audible stereo at a receiver.
+
+`Work/sc2-hdmi-secure-verification.json` and its referenced live-state,
+page-flip and PCM logs retain the evidence. Visible pixels/colors, receiver
+audio and direct-TCL cold-start behavior still require physical acceptance.
+
 ### Removable boot only
 
 Write the resulting image to an SD card or USB drive, **not eMMC**. The image
