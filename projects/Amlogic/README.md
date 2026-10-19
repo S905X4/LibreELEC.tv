@@ -134,7 +134,7 @@ An encoder hardware-color-bar trial explicitly enabled `VENC_VIDEO_TST_EN`
 and cleared `ENCP_VIDEO_MODE_ADV[3]`, unlike a framebuffer SMPTE test.
 Register readback proves that selection, not a visible sink image. The
 temporary probe and BIST are diagnostic-only, with rollback; physical
-pixels, colors and direct-TCL cold-start behavior remain acceptance gates.
+image quality, colors and direct-TCL cold-start behavior remain acceptance gates.
 
 #### Production artifact and real-board verification
 
@@ -186,8 +186,12 @@ were restored to their observed values and the temporary WAV was removed.
 This proves PCM/DMA/IRQ and gate lifecycle, not audible stereo at a receiver.
 
 `Work/sc2-hdmi-secure-verification.json` and its referenced live-state,
-page-flip and PCM logs retain the evidence. Visible pixels/colors, receiver
-audio and direct-TCL cold-start behavior still require physical acceptance.
+page-flip and PCM logs retain the evidence. After the production update,
+the owner reported “有东西了” (visible output is now present). This confirms
+that HDMI is no longer completely blank in the current setup; it is not
+an assistant-captured image or confirmation of readable content, correct
+colors, audible receiver audio or direct-TCL cold-start behavior. Those
+remaining physical acceptance gates are unchanged.
 
 ### Removable boot only
 
