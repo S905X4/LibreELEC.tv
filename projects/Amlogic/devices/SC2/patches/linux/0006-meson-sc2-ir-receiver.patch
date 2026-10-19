@@ -1,0 +1,146 @@
+From cc2bea26a91da27fcab62d5255cba5188876f0e7 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Mon, 19 Oct 2026 20:22:46 +0800
+Subject: [PATCH] media: meson-ir: wire the SC2 receiver and bus clock
+
+The SC2 receiver is gated by CLKID_IR_CTRL and receives its signal on
+GPIOD_5 on the HK1 RBOX X4. Describe the raw decoder register window
+and IRQ from the stock AH212 device tree and retain the GXBB register
+programming fallback.
+
+Manage the optional bus clock with devres so existing ungated Meson
+receivers retain their behavior. Require a clock for the SC2 binding.
+
+Do not select one of the six stock remote tables without an observed
+handset identity. Raw reception and key mapping require board input
+validation in the combined peripheral image.
+
+Change-Id: Ic09af9862f825c90c8cad3bfd89c9fbc376dfdb1
+---
+ .../bindings/media/amlogic,meson6-ir.yaml        | 14 ++++++++++++++
+ .../boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts   |  6 ++++++
+ arch/arm64/boot/dts/amlogic/meson-sc2.dtsi       | 16 ++++++++++++++++
+ drivers/media/rc/meson-ir.c                      |  6 ++++++
+ 4 files changed, 42 insertions(+)
+
+diff --git a/Documentation/devicetree/bindings/media/amlogic,meson6-ir.yaml b/Documentation/devicetree/bindings/media/amlogic,meson6-ir.yaml
+index 0f95fe8dd9ac78455a3182e3c7860a029620912d..4e9103fe8d165b048a5290089dc61efb73843f3f 100644
+--- a/Documentation/devicetree/bindings/media/amlogic,meson6-ir.yaml
++++ b/Documentation/devicetree/bindings/media/amlogic,meson6-ir.yaml
+@@ -11,6 +11,14 @@ maintainers:
+ 
+ allOf:
+   - $ref: rc.yaml#
++  - if:
++      properties:
++        compatible:
++          contains:
++            const: amlogic,meson-sc2-ir
++    then:
++      required:
++        - clocks
+ 
+ properties:
+   compatible:
+@@ -23,6 +31,9 @@ properties:
+       - items:
+           - const: amlogic,meson-gx-ir
+           - const: amlogic,meson-gxbb-ir
++      - items:
++          - const: amlogic,meson-sc2-ir
++          - const: amlogic,meson-gxbb-ir
+ 
+   reg:
+     maxItems: 1
+@@ -30,6 +41,9 @@ properties:
+   interrupts:
+     maxItems: 1
+ 
++  clocks:
++    maxItems: 1
++
+ required:
+   - compatible
+   - reg
+diff --git a/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts b/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
+index 5c650131ecfb02f7a3eef85281c985488e5f14f1..8a51ab454e5e2f82dd5c8640195b695332ae8190 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
++++ b/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
+@@ -67,6 +67,12 @@ &uart_b {
+ 	status = "okay";
+ };
+ 
++&ir {
++	status = "okay";
++	pinctrl-names = "default";
++	pinctrl-0 = <&remote_input_pins>;
++};
++
+ &sd_emmc_b {
+ 	status = "okay";
+ 	pinctrl-names = "default";
+diff --git a/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi b/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi
+index 9d2f34acedf88074eca4c80612aabadfc397d026..974106db46981cee26bf89e4f66178590b4781ba 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi
++++ b/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi
+@@ -186,6 +186,14 @@ uart_b: serial@7a000 {
+ 			};
+ 		};
+ 
++		ir: ir-receiver@fe084040 {
++			compatible = "amlogic,meson-sc2-ir", "amlogic,meson-gxbb-ir";
++			reg = <0 0xfe084040 0 0x24>;
++			interrupts = <GIC_SPI 22 IRQ_TYPE_EDGE_RISING>;
++			clocks = <&clkc CLKID_IR_CTRL>;
++			status = "disabled";
++		};
++
+ 		sd_emmc_b: mmc@fe08a000 {
+ 			compatible = "amlogic,meson-axg-mmc";
+ 			reg = <0 0xfe08a000 0 0x800>;
+@@ -294,6 +302,14 @@ mdio0: mdio {
+ };
+ 
+ &periphs_pinctrl {
++	remote_input_pins: remote-input-pins {
++		mux {
++			groups = "remote_input_d5";
++			function = "remote_input";
++			bias-disable;
++		};
++	};
++
+ 	sdcard_pins: sdcard-pins {
+ 		mux {
+ 			groups = "sdcard_d0_c", "sdcard_d1_c", "sdcard_d2_c",
+diff --git a/drivers/media/rc/meson-ir.c b/drivers/media/rc/meson-ir.c
+index 272ebb0d97c81156070013ae73a6c64479caea48..64b68e3be0763fdf54aa9683b61d2c9230066960 100644
+--- a/drivers/media/rc/meson-ir.c
++++ b/drivers/media/rc/meson-ir.c
+@@ -5,6 +5,7 @@
+  * Copyright (C) 2014 Beniamino Galvani <b.galvani@gmail.com>
+  */
+ 
++#include <linux/clk.h>
+ #include <linux/device.h>
+ #include <linux/err.h>
+ #include <linux/interrupt.h>
+@@ -449,6 +450,7 @@ static int meson_ir_probe(struct platform_device *pdev)
+ 	void __iomem *res_start;
+ 	const char *map_name;
+ 	struct meson_ir *ir;
++	struct clk *clk;
+ 	int irq, ret;
+ 
+ 	ir = devm_kzalloc(dev, sizeof(struct meson_ir), GFP_KERNEL);
+@@ -461,6 +463,10 @@ static int meson_ir_probe(struct platform_device *pdev)
+ 
+ 	ir->param = match_data;
+ 
++	clk = devm_clk_get_optional_enabled(dev, NULL);
++	if (IS_ERR(clk))
++		return dev_err_probe(dev, PTR_ERR(clk), "failed to enable clock\n");
++
+ 	res_start = devm_platform_ioremap_resource(pdev, 0);
+ 	if (IS_ERR(res_start))
+ 		return PTR_ERR(res_start);

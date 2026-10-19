@@ -54,4 +54,4 @@ SFTP_SERVER="yes"
 # Native kernel modules and a small firmware set; no AMLGX out-of-tree drivers.
 FIRMWARE="kernel-firmware"
 ADDITIONAL_DRIVERS=""
-ADDITIONAL_PACKAGES="dtc ethtool pciutils usbutils strace memtester nano"
+ADDITIONAL_PACKAGES="dtc ethtool pciutils usbutils strace memtester nano v4l-utils"

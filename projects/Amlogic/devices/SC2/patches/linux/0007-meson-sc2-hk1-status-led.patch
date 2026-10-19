@@ -1,0 +1,46 @@
+From 0336160fd218841254302d0f8376a18af923e8c9 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Mon, 19 Oct 2026 20:23:21 +0800
+Subject: [PATCH] arm64: dts: meson-sc2: describe the HK1 status LED
+
+The original AH212 device tree drives its sys_led on GPIOD_11 with
+active-high polarity. Expose the same output through the native GPIO
+LED class and preserve its default-on state without guessing a color.
+
+Runtime brightness switching remains part of the peripheral board
+validation; the GPIO assignment alone does not prove visible output.
+
+Change-Id: I9a228ec7313576cbed98c1d27eb1915b5b2a7025
+---
+ arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts b/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
+index 8a51ab454e5e2f82dd5c8640195b695332ae8190..b9b4a651bb7f01cbc604e24e93679119f1722f4a 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
++++ b/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
+@@ -6,6 +6,7 @@
+  */
+ /dts-v1/;
+ #include "meson-sc2.dtsi"
++#include <dt-bindings/leds/common.h>
+ 
+ / {
+ 	model = "HK1 RBOX X4 (S905X4, 4GB)";
+@@ -27,6 +28,16 @@ memory@0 {
+ 		reg = <0 0 0 0xf0000000>;
+ 	};
+ 
++	leds {
++		compatible = "gpio-leds";
++
++		led-status {
++			function = LED_FUNCTION_STATUS;
++			gpios = <&gpio GPIOD_11 GPIO_ACTIVE_HIGH>;
++			default-state = "on";
++		};
++	};
++
+ 	reserved-memory {
+ 		#address-cells = <2>;
+ 		#size-cells = <2>;
