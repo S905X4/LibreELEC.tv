@@ -199,8 +199,13 @@ Unblanking to `0` and writing `HK1 RBOX X4 - HDMI FRAMEBUFFER` to active
 `tty1` produced readable text and RGB labels in a direct `/dev/fb0` capture,
 `Work/sc2-hdmi-framebuffer-marker.png`. This is software-buffer evidence,
 not an HDMI sink capture. The marker log is
-`Work/sc2-hdmi-framebuffer-marker.log`; its physical visibility, receiver
-audio and direct-TCL cold-start behavior still require owner confirmation.
+`Work/sc2-hdmi-framebuffer-marker.log`. The owner then replied “有的” and
+supplied a capture image showing that distinct marker, readable console text
+and distinguishable red/green/blue/white labels. This passes ordinary
+framebuffer-to-HDMI output in the current capture setup, rather than only
+software readback or unexplained color bars. It does not establish calibrated
+color fidelity, audible receiver audio, direct-TCL cold start or display-setting
+persistence; those acceptance gates remain open.
 
 ### Removable boot only
 
