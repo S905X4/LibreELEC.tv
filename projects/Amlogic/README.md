@@ -186,12 +186,21 @@ were restored to their observed values and the temporary WAV was removed.
 This proves PCM/DMA/IRQ and gate lifecycle, not audible stereo at a receiver.
 
 `Work/sc2-hdmi-secure-verification.json` and its referenced live-state,
-page-flip and PCM logs retain the evidence. After the production update,
-the owner reported “有东西了” (visible output is now present). This confirms
-that HDMI is no longer completely blank in the current setup; it is not
-an assistant-captured image or confirmation of readable content, correct
-colors, audible receiver audio or direct-TCL cold-start behavior. Those
-remaining physical acceptance gates are unchanged.
+page-flip and PCM logs retain the evidence. The owner reported “有东西了”
+and supplied an image of eight full-height vertical color bars in the order
+white, yellow, cyan, green, magenta, red, blue and black. The image's generator
+and capture time are unknown; color bars alone do not establish ordinary
+framebuffer content at the HDMI sink, and a capture-device placeholder has
+not been excluded.
+
+A later live inspection found encoder BIST disabled (`VENC_VIDEO_TST_EN=0`,
+`ENCP_VIDEO_MODE_ADV=0x18`), active fbcon `fb=44`, and `fb0/blank=4`.
+Unblanking to `0` and writing `HK1 RBOX X4 - HDMI FRAMEBUFFER` to active
+`tty1` produced readable text and RGB labels in a direct `/dev/fb0` capture,
+`Work/sc2-hdmi-framebuffer-marker.png`. This is software-buffer evidence,
+not an HDMI sink capture. The marker log is
+`Work/sc2-hdmi-framebuffer-marker.log`; its physical visibility, receiver
+audio and direct-TCL cold-start behavior still require owner confirmation.
 
 ### Removable boot only
 
