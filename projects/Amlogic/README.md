@@ -54,7 +54,7 @@ binding correction. A fifteenth commit corrects the SC2 HDMI DWC/TOP resource
 order after tracing the vendor driver's indexed accesses; the sixteenth adds
 the reusable default CMA pool required for native scanout allocations. The seventeenth
 corrects protected SC2 HDMI register access and initializes inactive HDCP2.2 control.
-The seventeen generated patches in `devices/SC2/patches/linux/` are LibreELEC's integration copy. Review
+The generated patches in `devices/SC2/patches/linux/` are LibreELEC's integration copy. Review
 kernel changes separately from LE's recipe, configuration, image and boot-script
 changes. Donor trees are not development targets or proof of upstream support.
 
@@ -98,6 +98,18 @@ Use the corresponding existing filename, in order:
 15. `0015-meson-sc2-hdmi-register-banks.patch`
 16. `0016-meson-sc2-default-cma-pool.patch`
 17. `0017-meson-sc2-hdmi-secure-registers.patch`
+18. `0018-meson-sc2-panfrost.patch`
+19. `0019-meson-sc2-cecb.patch`
+20. `0020-bluetooth-h5-shared-lpo.patch`
+21. `0021-hk1-rbox-x4-nec-keymap.patch`
+22. `0022-meson-sc2-secure-dvfs-clocks.patch`
+23. `0023-meson-sc2-pwm-waveforms.patch`
+24. `0024-pwm-regulator-boot-selector.patch`
+25. `0025-opp-preserve-regulator-callback.patch`
+26. `0026-meson-sc2-calibrated-thermal.patch`
+27. `0027-meson-sc2-cpufreq-sequencing.patch`
+28. `0028-meson-sc2-mode-aware-usb3-phy.patch`
+29. `0029-meson-sc2-board-peripherals.patch`
 
 `Work/sc2-kernel-series.json` records the initial five exports;
 `Work/sc2-peripheral-verification.json` records the later source commits,
@@ -107,6 +119,99 @@ with the corresponding recorded values. Copy each complete generated file to
 `LibreELEC.tv/projects/Amlogic/devices/SC2/patches/linux/`; do not hand-edit its
 diff or regenerate it from a donor branch. Git may normalize diff context and
 hunk layout when exporting; the applied source payload must stay unchanged.
+
+### Consolidated peripheral candidate
+
+This candidate adds native Panfrost matching for SC2 Mali-G31, CECB with its
+external 32 kHz clock, the stock map_0 NEC keymap, RTL8821CS SDIO and H5 serdev,
+calibrated CPU/DDR thermal zones, shared CPU/DSU DVFS and real PWM_J voltage
+control. The front-panel GPIO translation is corrected to GPIOA_14 DAT and
+GPIOA_15 CLK; GPIOB_0/1 are eMMC data lines. The TF path gains its stock drive,
+detect and gated-clock pin states. eMMC C is enabled conservatively at 52 MHz
+without HS200/HS400 or invented supplies. The combo PHY selects its consumer's
+lane before enabling the reference PLL; USB3 is a candidate capability, not a
+physical pass. Existing USB2 boot quirks and the 921600 console stay unchanged.
+
+CPU policy uses all thirteen exact stock OPPs, 100..2004 MHz and 779..1019 mV,
+not CE's generic multi-table/fuse policies. BSP's initial 667000 kHz floor is
+not the table's 666000 kHz OPP; this candidate uses normal cpufreq-dt policy.
+The provider temporarily parks CPU dynamic changes on the existing 24 MHz
+crystal branch, below every OPP, rather than transiently using 1 GHz at the
+low OPPs' 779 mV. Secure mux/divider rates are read from hardware, not merely
+the requested CCF topology. CPU/DSU errors latch further voltage/clock changes
+off and retain the old/raised voltage. GP1's inherited output/divider topology
+may still prevent one of the requested 1.2/1.5 GHz DSU rates; exact readback
+must pass before accepting any corresponding CPU transition.
+
+PWM handover identifies a unique exact hardware-quantized voltage-table
+selector **before** probe-time adjustment or enable. Disabled, unrecognized,
+ambiguous, blinking or secondary waveforms fail without rewriting the rail.
+The actual PWM_J parent is inherited; CPU policy rejects mutable video-PLL
+ancestry. No guessed GPIO, voltage tolerance or nearest selector is used.
+Thermal trim validity is mandatory; invalid trim is not replaced by zero.
+Polling, CPU cooling and 105 C critical shutdown are described; the stock
+autonomous 110 C reboot is not newly programmed. Do not run unmonitored stress.
+
+Wireless uses existing rtw88 and native H5/btrtl, not an out-of-tree attach
+daemon. UART_E at fe080000 is serial1; console UART_B is unchanged. PWM_E's
+fixed FCLK_DIV3 source supplies a shared nominal 32768 Hz clock to WiFi and
+Bluetooth. Actual waveform/tolerance, ROM identity, RF and paired HID input
+are physical acceptance items. SDIO stays at 50 MHz/3.3 V without invented
+1.8 V switching or OOB wake support. The three Realtek firmware files and
+their upstream redistribution notice are included unmodified.
+
+Kodi, Mesa and HEVC/AV1 decoding remain absent. Panfrost module binding does
+not establish rendered output. HEVC and AV1 each still lack the implemented
+controls-authoritative Request/context contract, and the selected FFmpeg has
+no AV1 Request backend. Firmware bytes have been recovered, but no applicable
+firmware/TA redistribution grant was identified; those blobs are not shipped.
+Source and protocol evidence is in workspace `Work/sc2-batch-video.json` and
+`Work/sc2-video-evidence-bundle.json`. Analog AVDD/jack wiring remains unknown.
+
+#### One combined hardware acceptance round
+
+Commit the complete source and LE integration before the combined image build.
+Exercise that exact candidate as a whole; do not request per-feature cable,
+card or remote operations while adapting its source. Record kernel/image/DTB
+identity, calibration, policy, clocks, deferred probes, firmware, CEC and RF
+enumeration first. Only with working calibrated thermal readout and understood
+PWM_J handover may a bounded, temperature-monitored CPU transition run proceed.
+Reject failed transitions rather than lowering voltage or disguising errors.
+Then exercise existing HDMI/48 kHz stereo DMA and finite page flips, GPIO LED,
+panel, actual IR keys, WiFi scanning and Bluetooth input in the same session.
+Record receiver-visible/audio results separately from counters and registration.
+Actual GPU rendering needs a real userspace renderer, not this minimal image's
+module listing. TCL direct cold-boot picture persistence is a separate physical
+scenario; CEC registration alone does not prove it.
+
+The SC2-only early udev policy sets force_ro=1 for eMMC user/boot/GP disks by
+MMC ancestor type, never by mmcblk numbering alone. Before inventory, settle
+udev and verify every touched disk reports blockdev --getro=1. Only sysfs
+identity and O_RDONLY partition-table reads are allowed: no automount, fsck,
+installer, mmc-utils, RPMB access, bootpart/bootbus/partconf or power-on write
+protection commands. force_ro is block-layer protection, not raw-ioctl-proof
+hardware write protection; privileged MMC_IOC_CMD bypasses it. Enumeration has
+a pre-udev interval and normal MMC initialization may change volatile state.
+Stock U-Boot may itself save its environment; do not claim zero eMMC commands.
+
+Keep the current USB2 root card connected. Native TF transfer testing needs a
+separate card, or a verified RAM/live boot using the separate uEnv.live.ini:
+
+```text
+setenv sc2_live 1
+usb start
+fatload usb 0:1 0x22000000 s905_autoscript
+autoscr 0x22000000
+```
+
+Do not save the environment. Normal uEnv.ini UUIDs are preserved; the separate
+entry uses toram live and no disk= argument. Before moving any media, verify
+SYSTEM was copied to RAM, storage is tmpfs, no backing mount/swap/open file
+depends on the card, and explicitly unmount /flash. Merely reaching login
+does not free the card. U-Boot's mmc numbering is not Linux's MMC alias order.
+Use a separate, expendable USB3 device for SuperSpeed enumeration/transfers;
+never hot-unplug the boot/root device to test a port.
+
 
 ### SC2 protected HDMI controls
 
@@ -296,14 +401,14 @@ Useful headless observations include `uname -a`, `cat /proc/device-tree/model`,
 `lsmod`, `strace`, and `/sys/kernel/debug/clk/clk_summary`. The image also includes
 `dtc`, `memtester`, `gdb`, `usbutils`, `pciutils`, and `nano`.
 
-The target now enables native IR, GPIO LED, FD6551 auxdisplay, DRM framebuffer
-console, optical SPDIF and DW-HDMI I2S audio. Kodi, GPU acceleration, hardware
-video decoding and CEC remain disabled. Built drivers and device nodes are not
-evidence of visible output or audible sound. The normal distro-wide options
-audit also includes desktop/container/media requirements outside this target;
-review those diagnostics without enabling unrelated stacks.
-CPU DVFS and thermal safety under sustained load remain unverified.
-Do not treat an initial boot or a userspace simulation as a stress-test result.
+The target enables native IR, GPIO LED, FD6551 auxdisplay, DRM framebuffer
+console, optical SPDIF, DW-HDMI I2S, Panfrost, CECB, native wireless, calibrated
+thermal zones and coordinated CPU DVFS. Kodi, Mesa and hardware video decoding
+remain absent. Built drivers and device nodes are not physical acceptance.
+The normal distro-wide options audit also includes desktop/container/media
+requirements outside this target; do not enable unrelated stacks for its sake.
+CPU DVFS and thermal safety under sustained load remain unverified until the
+consolidated candidate is actually exercised; simulations are not stress tests.
 
 ### USB boot enumeration
 
@@ -388,15 +493,19 @@ logs remain in `Work/sc2-peripheral-smoke-16lejfj4/` at the workspace root.
 
 | Item | Implemented path | Physical acceptance boundary |
 | --- | --- | --- |
-| IR | Native SC2 IR match data and clock, GPIOD_5 input, NEC decoder | Requires actual key reception; no unmeasured keymap assumed |
+| IR | Native SC2 IR clock/GPIOD_5, NEC decoder and all 51 stock map_0 keys | Requires actual reception from the bundled handset; map_0 is a stock selection, not observed handset identity |
 | Status LED | GPIOD_11 active high, standard GPIO LED | On/off visibility not observed with the new kernel |
-| Front panel | Native FD6551 protocol over GPIOB_0 DAT/GPIOB_1 CLK, standard linedisp and LED APIs | Exact-model public layout is corroboration, not physical IC identification or segment acceptance |
+| Front panel | Native FD6551 over GPIOA_14 DAT/GPIOA_15 CLK, standard linedisp/LED APIs | Corrected controller-relative pin translation; physical IC/segment/brightness acceptance pending |
 | HDMI video | Native SC2 VPU, actual CLKCTRL/ANACTRL/PWRCTRL, DWC `fe300000`, TOP `fe308000`; corrected by patch 0015, CMA in 0016 | Production image boots with 256 MiB CMA, native 8,294,400-byte framebuffer and 1080p60 page flips. Actual HDMI pixels and TCL direct connection remain unverified |
 | Digital audio | Powered domain 10, FRDDR A to optical SPDIF on H4; FRDDR B to TDM-C and real DW-HDMI codec | Requires DMA/IRQ growth, 48 kHz stereo receiver/channel checks and repeated start/stop; HDMI ELD/hotplug separately |
 | 3.5mm AV audio | Native SC2 analog glue implemented, board analog path not activated | T9015 AVDD rail identity and actual positive/negative output-to-jack wiring are absent from stock data; no invented supply or headphone amplifier |
 | USB2 | Existing stock low-power/free-clock quirks retained | Prior physical boot and bounded file readback passed; not a USB3 result |
-| Blue USB3 port | Existing SC2 combo-PHY source retained; stock `maximum-speed = high-speed` retained | Owner reported boot failure on this port; no attached SuperSpeed device or post-change hardware result. Do not claim a fix or blindly remove the speed limit |
+| Blue USB3 port | Mode-aware combo-PHY reference sequencing and candidate super-speed cap; original USB2 quirks retained | Owner's earlier boot failure remains ground truth; no distinct PHY failure or post-change SuperSpeed transfer established |
 | Native TF slot | SD_EMMC_B, GPIOC_6 active-low detect, 4-bit/50 MHz, no 1.8 V switching | Current mmc0 is bound but detect is high and no native MMC card is present; USB card-reader storage is not this slot |
+| eMMC | Controller C, 8-bit/52 MHz, early type-MMC force_ro policy | Identity/capacity/partition inventory only after verified block RO; raw ioctls are not protected |
+| WiFi/Bluetooth | rtw88 SDIO, native H5/btrtl, shared PWM_E LPO and unmodified upstream firmware | ROM identity, RF/coexistence, calibrated LPO and paired input pending |
+| GPU/CEC | Native SC2 Panfrost match and clocked CECB/notifier | Binding is not rendering, CEC interoperability or TCL cold-boot persistence |
+| CPU/thermal | Exact stock OPP/PWM_J rail, checked CPU/DSU sequencing, calibrated CPU/DDR zones | Inherited waveform/clock topology, trim accuracy, full transitions and cooling remain physical gates |
 
 Local-series `checkpatch.pl` reported zero errors and nineteen warnings:
 six binding/source patch-separation warnings, one new-file MAINTAINERS warning,

@@ -1,0 +1,66 @@
+From fb39d3191ea120f6d54cef0de2dbc904c68ce667 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Tue, 20 Oct 2026 00:14:30 +0800
+Subject: [PATCH] drm/panfrost: Add Amlogic SC2 Mali-G31 support
+
+Select the existing Amlogic G31 power-override quirk for SC2 instead
+of falling through to the generic Bifrost match. Describe its two
+reset lines without inventing a GPU firmware power domain.
+
+The board supplies the stock fixed clock contract. GPU submission
+and physical display acceptance remain part of the later combined
+series validation, not claims of video codec decoding.
+
+Change-Id: Ic17aa15e719c1ec48f0dab267d040c3a2438e521
+---
+ .../bindings/gpu/arm,mali-bifrost.yaml           | 16 ++++++++++++++++
+ drivers/gpu/drm/panfrost/panfrost_drv.c          |  2 ++
+ 2 files changed, 18 insertions(+)
+
+diff --git a/Documentation/devicetree/bindings/gpu/arm,mali-bifrost.yaml b/Documentation/devicetree/bindings/gpu/arm,mali-bifrost.yaml
+index be198182dbfe0dba61176f7205b08be131f4845c..14305e3b15fb10d6f7c94c2c7aff0ac81035a159 100644
+--- a/Documentation/devicetree/bindings/gpu/arm,mali-bifrost.yaml
++++ b/Documentation/devicetree/bindings/gpu/arm,mali-bifrost.yaml
+@@ -19,6 +19,7 @@ properties:
+           - enum:
+               - allwinner,sun50i-h616-mali
+               - amlogic,meson-g12a-mali
++              - amlogic,meson-sc2-mali
+               - mediatek,mt8183-mali
+               - mediatek,mt8183b-mali
+               - mediatek,mt8186-mali
+@@ -142,6 +143,21 @@ allOf:
+         power-domain-names: false
+       required:
+         - resets
++  - if:
++      properties:
++        compatible:
++          contains:
++            const: amlogic,meson-sc2-mali
++    then:
++      properties:
++        clocks:
++          maxItems: 1
++        resets:
++          minItems: 2
++          maxItems: 2
++        power-domains: false
++      required:
++        - resets
+   - if:
+       properties:
+         compatible:
+diff --git a/drivers/gpu/drm/panfrost/panfrost_drv.c b/drivers/gpu/drm/panfrost/panfrost_drv.c
+index a31c5395de18c4a484e35ab4d92141a0c096ac14..ca42c231b15d0957fb1416a2d41d5e3228faf624 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_drv.c
++++ b/drivers/gpu/drm/panfrost/panfrost_drv.c
+@@ -935,6 +935,8 @@ static const struct of_device_id dt_match[] = {
+ 	  .data = &amlogic_data, },
+ 	{ .compatible = "amlogic,meson-g12a-mali",
+ 	  .data = &amlogic_data, },
++	{ .compatible = "amlogic,meson-sc2-mali",
++	  .data = &amlogic_data, },
+ 	{ .compatible = "arm,mali-t604", .data = &default_data, },
+ 	{ .compatible = "arm,mali-t624", .data = &default_data, },
+ 	{ .compatible = "arm,mali-t628", .data = &default_data, },

@@ -1,0 +1,31 @@
+From 9c85b2ae12321600758b6969dd908f3da1dc0fc8 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Tue, 20 Oct 2026 00:31:41 +0800
+Subject: [PATCH] opp: Preserve a configured single-regulator callback
+
+Do not replace an explicitly configured regulator callback when a
+single supply is acquired. This mirrors the preservation of custom
+clock callbacks and lets platform sequencing retain its voltage fault
+latch after an uncertain clock transition.
+
+The default helper remains selected when no custom callback exists.
+Verification is part of the consolidated SC2 series round.
+
+Change-Id: I0439a6d92c2bec0dca55159ea7a44387191970c0
+---
+ drivers/opp/core.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/opp/core.c b/drivers/opp/core.c
+index a179d57a5a1502a1404d4ff2d5156a46472b07b4..0adf5e76b36d56dd04fe78f2ab0e1ce88c20ed0a 100644
+--- a/drivers/opp/core.c
++++ b/drivers/opp/core.c
+@@ -2276,7 +2276,7 @@ static int _opp_set_regulators(struct opp_table *opp_table, struct device *dev,
+ 	opp_table->regulator_count = count;
+ 
+ 	/* Set generic config_regulators() for single regulators here */
+-	if (count == 1)
++	if (count == 1 && !opp_table->config_regulators)
+ 		opp_table->config_regulators = _opp_config_regulator_single;
+ 
+ 	return 0;

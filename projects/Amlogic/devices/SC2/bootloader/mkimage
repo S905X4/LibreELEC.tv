@@ -7,3 +7,7 @@ cat << EOF > "${LE_TMP}/uEnv.ini"
 bootargs=boot=UUID=${UUID_SYSTEM} disk=UUID=${UUID_STORAGE} ${EXTRA_CMDLINE}
 EOF
 mcopy -s -o "${LE_TMP}/uEnv.ini" ::
+cat << EOF > "${LE_TMP}/uEnv.live.ini"
+bootargs=boot=UUID=${UUID_SYSTEM} ${EXTRA_CMDLINE} toram live
+EOF
+mcopy -s -o "${LE_TMP}/uEnv.live.ini" ::

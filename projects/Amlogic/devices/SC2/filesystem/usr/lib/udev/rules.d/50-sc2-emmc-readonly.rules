@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0
+# SC2 diagnostics never install to internal MMC. Protect user and boot areas;
+# native removable SD cards are type SD and deliberately do not match.
+ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", KERNEL=="mmcblk[0-9]*", ATTRS{type}=="MMC", ATTR{force_ro}="1"

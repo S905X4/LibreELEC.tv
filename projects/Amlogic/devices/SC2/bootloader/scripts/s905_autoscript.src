@@ -5,7 +5,9 @@
 setenv sc2_kernel_addr 0x12000000
 setenv sc2_fdt_addr 0x20000000
 setenv sc2_env_addr 0x21000000
-setenv sc2_boot 'if fatload ${devtype} ${devnum}:1 ${sc2_env_addr} uEnv.ini; then if env import -t ${sc2_env_addr} ${filesize} bootargs; then if fatload ${devtype} ${devnum}:1 ${sc2_kernel_addr} KERNEL; then if itest ${filesize} -lt 0x03000000; then if fatload ${devtype} ${devnum}:1 ${sc2_fdt_addr} amlogic/meson-sc2-hk1-rbox-x4.dtb; then fdt addr ${sc2_fdt_addr}; fdt resize 0x10000; setenv fdt_high ffffffffffffffff; bootm ${sc2_kernel_addr} - ${sc2_fdt_addr}; fi; else echo SC2 kernel exceeds low-memory load window; fi; fi; fi; fi'
+setenv sc2_env_file uEnv.ini
+if test "${sc2_live}" = "1"; then setenv sc2_env_file uEnv.live.ini; fi
+setenv sc2_boot 'if fatload ${devtype} ${devnum}:1 ${sc2_env_addr} ${sc2_env_file}; then if env import -t ${sc2_env_addr} ${filesize} bootargs; then if fatload ${devtype} ${devnum}:1 ${sc2_kernel_addr} KERNEL; then if itest ${filesize} -lt 0x03000000; then if fatload ${devtype} ${devnum}:1 ${sc2_fdt_addr} amlogic/meson-sc2-hk1-rbox-x4.dtb; then fdt addr ${sc2_fdt_addr}; fdt resize 0x10000; setenv fdt_high ffffffffffffffff; bootm ${sc2_kernel_addr} - ${sc2_fdt_addr}; fi; else echo SC2 kernel exceeds low-memory load window; fi; fi; fi; fi'
 if test -n "${sc2_mmcdev}"; then
   setenv devtype mmc
   setenv devnum ${sc2_mmcdev}
