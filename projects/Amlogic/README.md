@@ -292,6 +292,21 @@ logs remain in `Work/sc2-peripheral-smoke-16lejfj4/` at the workspace root.
 | Blue USB3 port | Existing SC2 combo-PHY source retained; stock `maximum-speed = high-speed` retained | Owner reported boot failure on this port; no attached SuperSpeed device or post-change hardware result. Do not claim a fix or blindly remove the speed limit |
 | Native TF slot | SD_EMMC_B, GPIOC_6 active-low detect, 4-bit/50 MHz, no 1.8 V switching | Current mmc0 is bound but detect is high and no native MMC card is present; USB card-reader storage is not this slot |
 
+Local-series `checkpatch.pl` reported zero errors and nineteen warnings:
+six binding/source patch-separation warnings, one new-file MAINTAINERS warning,
+and twelve lines over 100 columns. The project's required Change-Id and absent
+sign-off were excluded explicitly. This is not a warning-clean upstream submission;
+no existing commit history was rewritten to conceal the findings.
+
+The session's `/dev/ttyUSB0` entry was observed as a mode-000 empty regular file,
+not an accessible character TTY. `stty` returned permission denied and
+noninteractive sudo required a password. Do not chmod this placeholder and call
+it a recovered console. A real UART must be exposed to the session, or the owner
+must operate and capture a 921600-baud console outside it before the board reboot.
+The existing removable boot files were backed up without changing them to
+`Work/sc2-pre-peripheral-boot-backup.tar` at the workspace root, SHA-256
+`54a503c3fa1fba847767c3d30ec85e613c2c6612bc7f1166d0e101432c186afa`.
+
 For the next board boot, reconnect the 921600-baud TTL recovery channel first;
 the user selected this path rather than an SSH-only reboot. Keep the known-good
 USB2 boot medium connected. No live KERNEL/SYSTEM/DTB replacement, reboot or eMMC
