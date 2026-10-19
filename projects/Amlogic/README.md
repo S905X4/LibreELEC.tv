@@ -52,8 +52,9 @@ commits add native IR, the status LED, FD6551 panel, audio clocks/arbitration,
 HDMI output-divider readback, SC2 DRM/HDMI, digital ASoC playback and the panel
 binding correction. A fifteenth commit corrects the SC2 HDMI DWC/TOP resource
 order after tracing the vendor driver's indexed accesses; the sixteenth adds
-the reusable default CMA pool required for native scanout allocations. The sixteen
-generated patches in `devices/SC2/patches/linux/` are LibreELEC's integration copy. Review
+the reusable default CMA pool required for native scanout allocations. The seventeenth
+corrects protected SC2 HDMI register access and initializes inactive HDCP2.2 control.
+The seventeen generated patches in `devices/SC2/patches/linux/` are LibreELEC's integration copy. Review
 kernel changes separately from LE's recipe, configuration, image and boot-script
 changes. Donor trees are not development targets or proof of upstream support.
 
@@ -94,6 +95,9 @@ Use the corresponding existing filename, in order:
 12. `0012-meson-sc2-native-hdmi.patch`
 13. `0013-meson-sc2-native-audio.patch`
 14. `0014-fd6551-indicator-reg-schema.patch`
+15. `0015-meson-sc2-hdmi-register-banks.patch`
+16. `0016-meson-sc2-default-cma-pool.patch`
+17. `0017-meson-sc2-hdmi-secure-registers.patch`
 
 `Work/sc2-kernel-series.json` records the initial five exports;
 `Work/sc2-peripheral-verification.json` records the later source commits,
@@ -103,6 +107,34 @@ with the corresponding recorded values. Copy each complete generated file to
 `LibreELEC.tv/projects/Amlogic/devices/SC2/patches/linux/`; do not hand-edit its
 diff or regenerate it from a donor branch. Git may normalize diff context and
 hunk layout when exporting; the applied source payload must stay unchanged.
+
+### SC2 protected HDMI controls
+
+Linux `f36ff4f96555de48f8c0e4f7e40dc54b22384787` routes protected DWC
+clock-disable, HDCP configuration and HDCP2.2 control registers through
+firmware SMC `0x82000018`/`0x82000019`, using encoded secure selectors.
+Ordinary DWC registers and non-SC2 variants retain their existing access.
+The unencrypted bridge initializes HDCP2.2 control to `0x02`, matching
+the SC2 CoreELEC reference driver's initialization; this does not add HDCP authentication.
+
+The board reproduced the access defect: HDCPCFG1 remained `0x01` despite
+the generic bridge requesting `0x03`. A reversible SMC probe wrote and read
+`0x03`; a subsequent byte-MMIO attempt to write `0x01` still read `0x03`.
+The inactive HDCP2.2 value was independently read back through SMC.
+Source, probe and direct-write-control logs are retained under
+`Work/sc2-hdmi-blank-secure-*.log` in the workspace.
+
+The stock-declared SC2 frequency counter measured ENCP, HDMI pixel, TMDS
+and frontend clocks at approximately 148.5 MHz, VPU at 666.6 MHz and VAPB
+at 250 MHz. Its programmable configuration was restored after measurement;
+the counter's completion-status bit remained set. Zero-rate CCF summaries
+therefore do not prove stopped video clocks and are not the target of this fix.
+
+An encoder hardware-color-bar trial explicitly enabled `VENC_VIDEO_TST_EN`
+and cleared `ENCP_VIDEO_MODE_ADV[3]`, unlike a framebuffer SMPTE test.
+Register readback proves that selection, not a visible sink image. The
+temporary probe and BIST are diagnostic-only, with rollback; physical
+pixels, colors and direct-TCL cold-start behavior remain acceptance gates.
 
 ### Removable boot only
 
