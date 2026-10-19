@@ -229,7 +229,7 @@ to satisfy Linux upstream submission/DCO requirements. Decoding the DTB
 with the system dtc also retains the existing Meson pinctrl empty-ranges
 warning; final full-DTB schema validation itself has no diagnostics.
 
-#### Authorized online update: recovery not confirmed
+#### Authorized online update: failed candidate boot
 
 Before staging, authenticated SSH confirmed the `c17c620` baseline,
 `running` state, an empty update directory and the USB SD Card Reader's
@@ -257,11 +257,12 @@ failure below. No post-boot peripheral, voltage or stress tests passed.
 `Work/sc2-batch-deployment.json` retains the transaction and recovery
 observations. The box-side backup is
 `/storage/sc2-pre-batch-20261020012723-971df5c.tar`; neither that file nor a
-local backup is an automatic rollback. Recovery needs the owner-operated
-921600-baud console or access to the removable boot medium to restore the
-verified backup. No further reboot, guessed low-level write or eMMC flash
-was attempted; vendor U-Boot's automatic environment saves remain outside
-that no-explicit-eMMC-write claim.
+local backup is an automatic rollback. At that stage recovery required the
+owner-operated 921600-baud console or removable boot medium. No further
+remote reboot, guessed low-level write or eMMC flash was attempted during
+the failed-update transaction. The later completed recovery is recorded
+below; vendor U-Boot's automatic environment saves remain outside the
+no-explicit-eMMC-write claim.
 
 #### Confirmed CPU/DSU boot regression and one-time recovery
 
@@ -271,8 +272,9 @@ checksum and entered Linux 6.18.57 built at 00:47:07. At 0.941883 seconds,
 `CPU/DSU transition failed (-5); retaining voltage` preceded the initial
 frequency-correction `BUG_ON(ret)` in `drivers/cpufreq/cpufreq.c:1529`.
 The failure is therefore not merely a missing DHCP lease or an unbootable
-vendor bootloader. The exact failed clock operation/readback and actual
-rail state remain unknown; the error message is not a voltage measurement.
+vendor bootloader.
+The original UART log does not identify the exact failed clock call or
+measure the rail. The PLL ABI defect was subsequently reproduced below.
 The separate eMMC voltage-negotiation `-22` is also not evidence that the
 vendor partition table was corrupted, nor the identified cause of this BUG.
 
@@ -301,8 +303,10 @@ Stop on any USB/read/import/FDT failure; do not run `bootm` after an error.
 Do not `saveenv` or rerun the autoscript, which reimports the original
 bootargs. `toram` copies SYSTEM to `/dev/SYSTEM`; it does not imply `live`,
 and the imported original disk UUID preserves persistent `/storage`.
-These entry points are checked against the delivered source/config/map,
-but the owner has not yet confirmed this physical rescue boot.
+The owner confirmed that the blacklist took effect, but this candidate
+still stopped after a USB discovery message without a userspace prompt.
+That last message does not establish a USB root cause or prove that
+`toram` ran. The matched accepted KERNEL/DTB rescue was used instead.
 
 After authenticated SSH recovery, require the root loop backing file to
 be `/dev/SYSTEM` and rediscover the USB provenance of `/flash` and `/storage`
@@ -315,8 +319,57 @@ MD5 sidecars are stale and must not be used as verification authority.
 Stage and verify every payload before promotion, preserve the original
 UUIDs, keep any of this transaction's remaining candidate TAR out of
 `.update`, sync and restore `/flash` read-only before a notified reboot.
-No physical restore or recovered boot is claimed yet. Detailed evidence
-is retained in `Work/sc2-cpufreq-recovery.json`.
+The owner subsequently restored and verified these five payloads from
+the matched known-good RAM rescue. Authenticated SSH now confirms normal
+`c17c620` operation, `running`, no failed units, and installed payload hashes
+matching that recovery authority. `/flash` is `/dev/sda1`, mounted read-only;
+`/storage` is `/dev/sda2`. Earlier recovery events remain in
+`Work/sc2-cpufreq-recovery.json`; current observations and PLL checks are
+indexed by `Work/sc2-pll-fixed-verification.json`.
+
+#### SC2 secure PLL output ABI correction
+
+The board's firmware accepts the final PLL output frequency, not the
+internal DCO frequency. With CPU safely on the independent dynamic path,
+the old 3216 MHz DCO request produced a 3072 MHz DCO divided by 128;
+requesting the original 3024 MHz DCO did not restore it. A 1512 MHz output
+request restored the exact 3024 MHz DCO and divide-by-two configuration.
+The wrong boundary is therefore a physical observation, not a host model.
+
+SYS and GP1 now use SC2-specific output operations: one firmware request
+programs M, N and OD together, then checks lock and the actual output rate.
+Their published DCO clocks remain read-only; CCF must not independently
+program a DCO and divider or propagate an output request to the DCO.
+Output recalculation reads the DCO hardware rather than its stale CCF
+cache. BSP output tables constrain rounding and programming. The generic
+secure-DCO writer is removed; ordinary Meson PLLs are unchanged. This does
+not add an OPP, suppress the CPUFreq BUG, or bypass transition failures.
+
+An isolated diagnostic module ran the extracted production operations on
+the real board, with both CPU and DSU parked at 996999996 Hz. All sixteen
+SYS rates from 1008 through 2004 MHz and both GP1 rates (1200/1500 MHz)
+matched their exact CCF readbacks. Both consumers stayed parked during
+each request; no CPU voltage operation or active high-frequency CPU test
+was performed. Restoration returned CPU to 1512 MHz, DSU to 1200 MHz and
+the spare branch to 24 MHz. SYS/GP1 CTRL0 returned to `d001047e`/`d00204c8`;
+CPU, DSU and sync controls returned to `a4010800`/`10003`/`8000122`.
+The temporary module was unloaded and its box-side payload removed.
+
+The restored baseline remains `running` with no failed units, unchanged
+boot payload hashes and read-only `/flash`. Kernel taint is 4096 from the
+out-of-tree diagnostics; unloading them does not clear that bit. Clock
+objects built with the production config; `W=1` reports the existing
+duplicate `CLKID_VID_PLL` initializer. Strict patch checks retain the
+atomic `udelay(10)` advice: the same path serves `.enable()` and cannot
+sleep. Raw before/failure/restoration and corrected live logs are indexed
+in `Work/sc2-pll-fixed-verification.json`.
+
+This verifies the firmware boundary and parked-consumer output operations,
+not full OPP/regulator/thermal policy or a newly deployed image. The
+separate startup stall with CPUFreq skipped is still unresolved. The next
+notified, owner-observed diagnostic boot must capture that path before any
+claim of full candidate recovery; no new image was deployed or rebooted
+as part of this PLL probe.
 
 #### One combined hardware acceptance round
 
