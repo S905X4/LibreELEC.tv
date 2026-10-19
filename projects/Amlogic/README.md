@@ -180,9 +180,11 @@ Source and protocol evidence is in workspace `Work/sc2-batch-video.json` and
 Linux `5ba418afc34643f279dc17870f0e927f7c807f16` and LE build commit
 `971df5cc5359f587090684210f86c71c26c66f00` produced
 `LibreELEC-SC2.aarch64-12.2-devel-20261020012723-971df5c` in `target/`.
-This candidate is **not deployed**; the installed baseline remains
-`20261019224356-c17c620`. Later documentation commits do not change the
-identity of that built candidate.
+The last fully verified installed baseline was `20261019224356-c17c620`.
+The owner subsequently authorized a standard online update and reboot to
+this candidate, but SSH did not recover; its installed identity and boot
+stage are currently **unverified**. Later documentation commits do not
+change the identity of the built candidate.
 
 The image SHA-256 is
 `616689a5e918479f792a5e2c5b0e6355ba7fe58f997d44ef4984e7e09944ca3f`;
@@ -225,6 +227,41 @@ local no-signoff policy used `--no-signoff`. These commits are not claimed
 to satisfy Linux upstream submission/DCO requirements. Decoding the DTB
 with the system dtc also retains the existing Meson pinctrl empty-ranges
 warning; final full-DTB schema validation itself has no diagnostics.
+
+#### Authorized online update: recovery not confirmed
+
+Before staging, authenticated SSH confirmed the `c17c620` baseline,
+`running` state, an empty update directory and the USB SD Card Reader's
+`/dev/sda1` read-only `/flash` plus `/dev/sda2` `/storage`. The complete boot
+partition was backed up on the box and downloaded to
+`Work/sc2-pre-batch-20261020012723-971df5c.tar`: 69185024 bytes, SHA-256
+`9a762a96e8d7ff7b8abb919d9c45f79b49f7ad2dbd173fd77e882c3537ba0cfe`.
+It contains the old KERNEL, SYSTEM, DTB, startup script and original UUIDs.
+
+The 83742720-byte candidate update TAR was uploaded outside `.update`,
+checked against the TAR hash above, synced and atomically moved into the
+empty `/storage/.update/` directory. `/flash` remained read-only during
+staging. After explicitly notifying the owner, `sync && systemctl reboot`
+returned zero. This proves staging and the accepted reboot request, **not**
+completion of the updater or successful candidate boot.
+
+At 513.58 seconds after the request, SSH to the old `10.0.0.151` address
+still returned `No route to host`; its ARP neighbor was `FAILED`. mDNS
+returned no reply. Bounded discovery of the directly connected `/24`,
+including TCP22 independently of ICMP replies, found no SSH server with
+the board's previously trusted Ed25519 host key. No login to unrelated
+hosts was attempted. Without a new authenticated session or owner UART
+log, the failure stage and cause remain unknown; no peripheral checks or
+voltage/stress tests were performed after reboot.
+
+`Work/sc2-batch-deployment.json` retains the transaction and recovery
+observations. The box-side backup is
+`/storage/sc2-pre-batch-20261020012723-971df5c.tar`; neither that file nor a
+local backup is an automatic rollback. Recovery needs the owner-operated
+921600-baud console or access to the removable boot medium to restore the
+verified backup. No further reboot, guessed low-level write or eMMC flash
+was attempted; vendor U-Boot's automatic environment saves remain outside
+that no-explicit-eMMC-write claim.
 
 #### One combined hardware acceptance round
 
