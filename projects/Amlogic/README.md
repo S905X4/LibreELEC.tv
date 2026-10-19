@@ -307,6 +307,24 @@ The existing removable boot files were backed up without changing them to
 `Work/sc2-pre-peripheral-boot-backup.tar` at the workspace root, SHA-256
 `54a503c3fa1fba847767c3d30ec85e613c2c6612bc7f1166d0e101432c186afa`.
 
+The owner selected capturing UART in their own host terminal. The verified
+update TAR is now staged at
+`/storage/.update/LibreELEC-SC2.aarch64-12.2-devel-20261019204550-b15c469.tar`
+on the board: 69,683,200 bytes, SHA-256
+`27b3b77bb21ddc4799c88e997b972a588af0617427eccde85ac94def4b5d7dee`.
+It was uploaded under a non-update suffix, checked, fsynced and published only
+after identity matched. `/flash` was still read-only afterwards; no reboot was
+requested. This staging schedules the normal initramfs update at the next USB
+boot; it does not mean the new kernel is already running.
+
+Start the owner's UART capture before rebooting. Boot from the same known-good
+USB2 medium using the previously working vendor-U-Boot removable script path.
+The old initramfs will apply the archive and request another reboot; boot from
+that same medium again, manually if the stock boot policy requires it. Do not
+interrupt power during the update and do not save a new U-Boot environment.
+Keep logs from both boots. `/etc/os-release` should identify `b15c469` after
+the update; `uname` showing 6.18.57 alone cannot distinguish the old image.
+
 For the next board boot, reconnect the 921600-baud TTL recovery channel first;
 the user selected this path rather than an SSH-only reboot. Keep the known-good
 USB2 boot medium connected. No live KERNEL/SYSTEM/DTB replacement, reboot or eMMC
