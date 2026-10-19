@@ -1,0 +1,5 @@
+# RTL8821CS firmware is available for diagnostic SDIO bring-up; this does not
+# assert that the onboard module has been physically identified or validated.
+rtw88/rtw8821c_fw.bin
+# USB Ethernet fallback firmware (upstream r8152 module).
+rtl_nic/rtl8153a-3.fw

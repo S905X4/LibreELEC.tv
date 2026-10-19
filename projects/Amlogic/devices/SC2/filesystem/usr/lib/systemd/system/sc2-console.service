@@ -1,0 +1,20 @@
+[Unit]
+Description=Authenticated SC2 UART console
+After=systemd-user-sessions.service userconfig.service
+BindsTo=dev-ttyAML0.device
+After=dev-ttyAML0.device
+ConditionPathExists=/dev/ttyAML0
+
+[Service]
+Type=idle
+ExecStart=-/usr/sbin/agetty --noclear --login-program /bin/login 115200 ttyAML0 vt100
+Restart=always
+RestartSec=2
+TTYPath=/dev/ttyAML0
+TTYReset=yes
+TTYVHangup=yes
+KillMode=process
+SendSIGHUP=yes
+
+[Install]
+WantedBy=multi-user.target
