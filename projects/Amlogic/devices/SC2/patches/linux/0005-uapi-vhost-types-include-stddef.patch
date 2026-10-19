@@ -1,0 +1,23 @@
+Subject: [PATCH] uapi: vhost: include exported stddef for counted_by
+
+Linux 6.18.57 vhost_types.h includes linux/compiler.h for __counted_by.
+headers_install deliberately removes that internal include, leaving the
+exported vhost_features_array declaration uncompilable in userspace.
+
+Use linux/stddef.h instead. It provides the existing UAPI annotation
+fallback and includes compiler_types.h for kernel consumers. Keep the
+annotation and ABI intact; do not work around this in systemd or CFLAGS.
+
+---
+diff --git a/include/uapi/linux/vhost_types.h b/include/uapi/linux/vhost_types.h
+--- a/include/uapi/linux/vhost_types.h
++++ b/include/uapi/linux/vhost_types.h
+@@ -12,7 +12,7 @@
+  */
+ 
+ #include <linux/types.h>
+-#include <linux/compiler.h>
++#include <linux/stddef.h>
+ #include <linux/virtio_config.h>
+ #include <linux/virtio_ring.h>
+ 

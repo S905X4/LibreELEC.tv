@@ -1,0 +1,603 @@
+Subject: [PATCH] arm64: dts: add minimal SC2 HK1 RBOX X4 removable-boot platform
+
+Target Linux 6.18.57. Structural source: hkallweit linux-amlogic-sc2
+3730dc06ac5eb6282995ca8f82636b106429a796, board commit79f5fc0fa7.
+Board wiring source: Stock_ROM/unpacked_img/stock_dtb_1.dts, original
+sc2_ah212_4g. Cross-check power-domain IDs/SMC ABI with CE linux-amlogic
+a3aaaa5b0e646dcd8cf4a23d6b8d66a5292840eb and Khadas linux
+ef8cd851f48356675c3e987fead999fe28f6f69d.
+
+Expose the original 0xf0000000 usable-memory boundary of the 4GB variant.
+Preserve the low firmware/BL31 ranges from the SC2 port and stock fixed
+secure, DSP and framebuffer ranges as no-map. Stock ramoops lies inside
+the secmon range, so it is not mapped independently. Do not transplant
+Android multimedia CMA heaps or fabricate regulators.
+
+Use existing G12A UART operations (XTAL/2 and ttyAML0); S4 UART operations
+would change the device name to ttyS0. Set the SD input mux to XTAL in DT
+for identification clocks rather than altering all Meson MMC hosts. SD is
+limited to 50MHz/3.3V; original eMMC is disabled. Ethernet uses the stock
+external RGMII PHY/reset, not the donor board internal PHY. Keep the stock
+USB high-speed limit. CPU DVFS, Wi-Fi, display and media are not described.
+This patch series is source enablement, not evidence of a physical boot.
+
+---
+
+diff --git a/drivers/pmdomain/amlogic/meson-secure-pwrc.c b/drivers/pmdomain/amlogic/meson-secure-pwrc.c
+--- a/drivers/pmdomain/amlogic/meson-secure-pwrc.c
++++ b/drivers/pmdomain/amlogic/meson-secure-pwrc.c
+@@ -13,6 +13,7 @@
+ #include <dt-bindings/power/meson-a1-power.h>
+ #include <dt-bindings/power/amlogic,c3-pwrc.h>
+ #include <dt-bindings/power/meson-s4-power.h>
++#include <dt-bindings/power/meson-sc2-power.h>
+ #include <dt-bindings/power/amlogic,t7-pwrc.h>
+ #include <dt-bindings/power/amlogic,a4-pwrc.h>
+ #include <dt-bindings/power/amlogic,a5-pwrc.h>
+@@ -192,6 +193,21 @@
+ 	SEC_PD(C3_VCODEC,	0),
+ };
+ 
++static const struct meson_secure_pwrc_domain_desc sc2_pwrc_domains[] = {
++	SEC_PD(SC2_DSP,		0),
++	SEC_PD(SC2_DOS_HCODEC,	0),
++	SEC_PD(SC2_DOS_HEVC,	0),
++	SEC_PD(SC2_DOS_VDEC,	0),
++	SEC_PD(SC2_DOS_WAVE,	0),
++	SEC_PD(SC2_VPU_HDMI,	0),
++	/* Keep the shared USB fabric powered, as in the vendor driver. */
++	SEC_PD(SC2_USB_COMB,	GENPD_FLAG_ALWAYS_ON),
++	SEC_PD(SC2_PCIE,		0),
++	SEC_PD(SC2_GE2D,		0),
++	SEC_PD(SC2_ETH,		GENPD_FLAG_ALWAYS_ON),
++	SEC_PD(SC2_AUDIO,		0),
++};
++
+ static const struct meson_secure_pwrc_domain_desc s4_pwrc_domains[] = {
+ 	SEC_PD(S4_DOS_HEVC,	0),
+ 	SEC_PD(S4_DOS_VDEC,	0),
+@@ -430,6 +446,11 @@
+ 	.count = ARRAY_SIZE(c3_pwrc_domains),
+ };
+ 
++static const struct meson_secure_pwrc_domain_data meson_secure_sc2_pwrc_data = {
++	.domains = sc2_pwrc_domains,
++	.count = ARRAY_SIZE(sc2_pwrc_domains),
++};
++
+ static const struct meson_secure_pwrc_domain_data meson_secure_s4_pwrc_data = {
+ 	.domains = s4_pwrc_domains,
+ 	.count = ARRAY_SIZE(s4_pwrc_domains),
+@@ -457,6 +478,10 @@
+ 
+ static const struct of_device_id meson_secure_pwrc_match_table[] = {
+ 	{
++		.compatible = "amlogic,meson-sc2-pwrc",
++		.data = &meson_secure_sc2_pwrc_data,
++	},
++	{
+ 		.compatible = "amlogic,meson-a1-pwrc",
+ 		.data = &meson_secure_a1_pwrc_data,
+ 	},
+diff --git a/arch/arm64/boot/dts/amlogic/Makefile b/arch/arm64/boot/dts/amlogic/Makefile
+--- a/arch/arm64/boot/dts/amlogic/Makefile
++++ b/arch/arm64/boot/dts/amlogic/Makefile
+@@ -84,6 +84,7 @@
+ dtb-$(CONFIG_ARCH_MESON) += meson-gxm-vega-s96.dtb
+ dtb-$(CONFIG_ARCH_MESON) += meson-gxm-wetek-core2.dtb
+ dtb-$(CONFIG_ARCH_MESON) += meson-s4-s805x2-aq222.dtb
++dtb-$(CONFIG_ARCH_MESON) += meson-sc2-hk1-rbox-x4.dtb
+ dtb-$(CONFIG_ARCH_MESON) += meson-sm1-a95xf3-air-gbit.dtb
+ dtb-$(CONFIG_ARCH_MESON) += meson-sm1-a95xf3-air.dtb
+ dtb-$(CONFIG_ARCH_MESON) += meson-sm1-bananapi-m2-pro.dtb
+diff --git a/Documentation/devicetree/bindings/arm/amlogic.yaml b/Documentation/devicetree/bindings/arm/amlogic.yaml
+--- a/Documentation/devicetree/bindings/arm/amlogic.yaml
++++ b/Documentation/devicetree/bindings/arm/amlogic.yaml
+@@ -240,6 +240,11 @@
+               - amlogic,aw419
+           - const: amlogic,c3
+ 
++      - description: HK1 RBOX X4 with the Amlogic SC2 S905X4 SoC
++        items:
++          - const: hk1,rbox-x4
++          - const: amlogic,sc2
++
+       - description: Boards with the Amlogic Meson S4 S805X2 SoC
+         items:
+           - enum:
+diff --git a/Documentation/devicetree/bindings/vendor-prefixes.yaml b/Documentation/devicetree/bindings/vendor-prefixes.yaml
+--- a/Documentation/devicetree/bindings/vendor-prefixes.yaml
++++ b/Documentation/devicetree/bindings/vendor-prefixes.yaml
+@@ -693,6 +693,8 @@
+     description: Hitachi Ltd.
+   "^hitex,.*":
+     description: Hitex Development Tools
++  "^hk1,.*":
++    description: HK1 TV boxes
+   "^holt,.*":
+     description: Holt Integrated Circuits, Inc.
+   "^holtek,.*":
+diff --git a/Documentation/devicetree/bindings/power/amlogic,meson-sec-pwrc.yaml b/Documentation/devicetree/bindings/power/amlogic,meson-sec-pwrc.yaml
+--- a/Documentation/devicetree/bindings/power/amlogic,meson-sec-pwrc.yaml
++++ b/Documentation/devicetree/bindings/power/amlogic,meson-sec-pwrc.yaml
+@@ -12,7 +12,7 @@
+   - Jianxin Pan <jianxin.pan@amlogic.com>
+ 
+ description: |+
+-  Secure Power Domains used in Meson A1/C1/S4 & C3/T7 SoCs, and should be the child node
++  Secure Power Domains used in Meson A1/C1/SC2/S4 & C3/T7 SoCs, and should be the child node
+   of secure-monitor.
+ 
+ properties:
+@@ -20,6 +20,7 @@
+     enum:
+       - amlogic,meson-a1-pwrc
+       - amlogic,meson-s4-pwrc
++      - amlogic,meson-sc2-pwrc
+       - amlogic,a4-pwrc
+       - amlogic,a5-pwrc
+       - amlogic,c3-pwrc
+diff --git a/include/dt-bindings/power/meson-sc2-power.h b/include/dt-bindings/power/meson-sc2-power.h
+new file mode 100644
+--- /dev/null
++++ b/include/dt-bindings/power/meson-sc2-power.h
+@@ -0,0 +1,18 @@
++// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
++/* SC2 firmware power-domain indices from Amlogic sc2-pd.h. */
++#ifndef _DT_BINDINGS_MESON_SC2_POWER_H
++#define _DT_BINDINGS_MESON_SC2_POWER_H
++
++#define PWRC_SC2_DSP_ID		0
++#define PWRC_SC2_DOS_HCODEC_ID	1
++#define PWRC_SC2_DOS_HEVC_ID	2
++#define PWRC_SC2_DOS_VDEC_ID	3
++#define PWRC_SC2_DOS_WAVE_ID	4
++#define PWRC_SC2_VPU_HDMI_ID	5
++#define PWRC_SC2_USB_COMB_ID	6
++#define PWRC_SC2_PCIE_ID		7
++#define PWRC_SC2_GE2D_ID		8
++#define PWRC_SC2_ETH_ID		9
++#define PWRC_SC2_AUDIO_ID	10
++
++#endif
+diff --git a/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi b/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi
+new file mode 100644
+--- /dev/null
++++ b/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi
+@@ -0,0 +1,318 @@
++// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
++/*
++ * Amlogic SC2 minimal peripheral description.
++ * Derived from Heiner Kallweit's SC2 tree (3730dc06ac), with register,
++ * interrupt and pin data cross-checked against the original SC2 AH212 DT.
++ * Copyright (c) 2019 Amlogic, Inc. All rights reserved.
++ */
++#include <dt-bindings/clock/amlogic,sc2-clkc.h>
++#include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/gpio/meson-sc2-gpio.h>
++#include <dt-bindings/interrupt-controller/arm-gic.h>
++#include <dt-bindings/interrupt-controller/irq.h>
++#include <dt-bindings/phy/phy.h>
++#include <dt-bindings/power/meson-sc2-power.h>
++#include <dt-bindings/reset/amlogic,meson-sc2-reset.h>
++
++/ {
++	compatible = "amlogic,sc2";
++	interrupt-parent = <&gic>;
++	#address-cells = <2>;
++	#size-cells = <2>;
++
++	cpus {
++		#address-cells = <2>;
++		#size-cells = <0>;
++
++		cpu0: cpu@0 {
++			device_type = "cpu";
++			compatible = "arm,cortex-a55";
++			reg = <0 0>;
++			enable-method = "psci";
++			next-level-cache = <&l2>;
++		};
++		cpu1: cpu@1 {
++			device_type = "cpu";
++			compatible = "arm,cortex-a55";
++			reg = <0 1>;
++			enable-method = "psci";
++			next-level-cache = <&l2>;
++		};
++		cpu2: cpu@2 {
++			device_type = "cpu";
++			compatible = "arm,cortex-a55";
++			reg = <0 2>;
++			enable-method = "psci";
++			next-level-cache = <&l2>;
++		};
++		cpu3: cpu@3 {
++			device_type = "cpu";
++			compatible = "arm,cortex-a55";
++			reg = <0 3>;
++			enable-method = "psci";
++			next-level-cache = <&l2>;
++		};
++		l2: l2-cache {
++			compatible = "cache";
++			cache-level = <2>;
++			cache-unified;
++		};
++	};
++
++	timer {
++		compatible = "arm,armv8-timer";
++		interrupts = <GIC_PPI 13 IRQ_TYPE_LEVEL_LOW>,
++			     <GIC_PPI 14 IRQ_TYPE_LEVEL_LOW>,
++			     <GIC_PPI 11 IRQ_TYPE_LEVEL_LOW>,
++			     <GIC_PPI 10 IRQ_TYPE_LEVEL_LOW>;
++	};
++
++	psci {
++		compatible = "arm,psci-0.2";
++		method = "smc";
++	};
++
++	firmware {
++		sm: secure-monitor {
++			compatible = "amlogic,meson-gxbb-sm";
++
++			pwrc: power-controller {
++				compatible = "amlogic,meson-sc2-pwrc";
++				#power-domain-cells = <1>;
++			};
++		};
++	};
++
++	xtal: xtal-clk {
++		compatible = "fixed-clock";
++		clock-frequency = <24000000>;
++		clock-output-names = "xtal";
++		#clock-cells = <0>;
++	};
++
++	soc {
++		compatible = "simple-bus";
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++
++		gic: interrupt-controller@fff01000 {
++			compatible = "arm,gic-400";
++			reg = <0 0xfff01000 0 0x1000>,
++			      <0 0xfff02000 0 0x2000>,
++			      <0 0xfff04000 0 0x2000>,
++			      <0 0xfff06000 0 0x2000>;
++			interrupt-controller;
++			#interrupt-cells = <3>;
++			#address-cells = <0>;
++			interrupts = <GIC_PPI 9 IRQ_TYPE_LEVEL_HIGH>;
++		};
++
++		apb4: bus@fe000000 {
++			compatible = "simple-bus";
++			#address-cells = <2>;
++			#size-cells = <2>;
++			ranges = <0 0 0 0xfe000000 0 0x480000>;
++
++			clkc: clock-controller@0 {
++				compatible = "amlogic,sc2-clkc";
++				reg = <0 0 0 0x49c>, <0 0x8000 0 0x2e8>,
++				      <0 0xe140 0 0x24>;
++				reg-names = "basic", "pll", "cpu_clk";
++				#clock-cells = <1>;
++				clocks = <&xtal>;
++				clock-names = "xtal";
++			};
++
++			reset: reset-controller@2000 {
++				compatible = "amlogic,meson-s4-reset";
++				reg = <0 0x2000 0 0x98>;
++				#reset-cells = <1>;
++			};
++
++			periphs_pinctrl: pinctrl@4000 {
++				compatible = "amlogic,meson-sc2-periphs-pinctrl";
++				#address-cells = <2>;
++				#size-cells = <2>;
++				ranges;
++
++				gpio: bank@4000 {
++					reg = <0 0x4000 0 0x4c>, <0 0x40c0 0 0x220>;
++					reg-names = "mux", "gpio";
++					gpio-controller;
++					#gpio-cells = <2>;
++					gpio-ranges = <&periphs_pinctrl 0 0 87>;
++				};
++			};
++
++			gpio_intc: interrupt-controller@4080 {
++				compatible = "amlogic,meson-sc2-gpio-intc",
++					     "amlogic,meson-gpio-intc";
++				reg = <0 0x4080 0 0x20>;
++				interrupt-controller;
++				#interrupt-cells = <2>;
++				#address-cells = <0>;
++				amlogic,channel-interrupts =
++					<10 11 12 13 14 15 16 17 18 19 20 21>;
++			};
++
++			mdio_mux: mdio-multiplexer@28000 {
++				compatible = "amlogic,g12a-mdio-mux";
++				reg = <0 0x28000 0 0xa4>;
++				clocks = <&clkc CLKID_ETHPHY>, <&xtal>,
++					 <&clkc CLKID_MPLL_50M>;
++				clock-names = "pclk", "clkin0", "clkin1";
++				mdio-parent-bus = <&mdio0>;
++				#address-cells = <1>;
++				#size-cells = <0>;
++				status = "disabled";
++
++				ext_mdio: mdio@0 {
++					reg = <0>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++				};
++			};
++
++			uart_b: serial@7a000 {
++				compatible = "amlogic,meson-g12a-uart",
++					     "amlogic,meson-gx-uart",
++					     "amlogic,meson-ao-uart";
++				reg = <0 0x7a000 0 0x18>;
++				interrupts = <GIC_SPI 169 IRQ_TYPE_EDGE_RISING>;
++				clocks = <&xtal>, <&xtal>, <&xtal>;
++				clock-names = "xtal", "pclk", "baud";
++				status = "disabled";
++			};
++		};
++
++		sd_emmc_b: mmc@fe08a000 {
++			compatible = "amlogic,meson-axg-mmc";
++			reg = <0 0xfe08a000 0 0x800>;
++			interrupts = <GIC_SPI 177 IRQ_TYPE_EDGE_RISING>;
++			clocks = <&clkc CLKID_SD_EMMC_B>,
++				 <&clkc CLKID_SD_EMMC_B_CLK>, <&clkc CLKID_FCLK_DIV2>;
++			clock-names = "core", "clkin0", "clkin1";
++			/* Initial identification needs the 24MHz parent, not fclk. */
++			assigned-clocks = <&clkc CLKID_SD_EMMC_B_CLK_MUX>,
++					  <&clkc CLKID_SD_EMMC_B_CLK>;
++			assigned-clock-parents = <&xtal>;
++			assigned-clock-rates = <0>, <24000000>;
++			resets = <&reset RESET_SD_EMMC_B>;
++			status = "disabled";
++		};
++
++		/* Deliberately disabled: the original eMMC firmware is not a target. */
++		sd_emmc_c: mmc@fe08c000 {
++			compatible = "amlogic,meson-axg-mmc";
++			reg = <0 0xfe08c000 0 0x800>;
++			interrupts = <GIC_SPI 178 IRQ_TYPE_EDGE_RISING>;
++			clocks = <&clkc CLKID_NAND>,
++				 <&clkc CLKID_SD_EMMC_C_CLK>, <&clkc CLKID_FCLK_DIV2>;
++			clock-names = "core", "clkin0", "clkin1";
++			status = "disabled";
++		};
++
++		usb2_phy0: phy@fe03c000 {
++			compatible = "amlogic,sc2-usb2-phy";
++			reg = <0 0xfe03c000 0 0x2000>;
++			clocks = <&xtal>;
++			clock-names = "xtal";
++			resets = <&reset RESET_USBPHY20>;
++			reset-names = "phy";
++			#phy-cells = <0>;
++		};
++
++		usb2_phy1: phy@fe03e000 {
++			compatible = "amlogic,sc2-usb2-phy";
++			reg = <0 0xfe03e000 0 0x2000>;
++			clocks = <&xtal>;
++			clock-names = "xtal";
++			resets = <&reset RESET_USBPHY21>;
++			reset-names = "phy";
++			#phy-cells = <0>;
++		};
++
++		usb3_pcie_phy: phy@fe02a000 {
++			compatible = "amlogic,sc2-usb3-pcie-phy";
++			reg = <0 0xfe02a000 0 0x2000>;
++			clocks = <&clkc CLKID_PCIE_PLL>, <&clkc CLKID_PCIE_BGP>;
++			clock-names = "ref_clk", "bgp";
++			resets = <&reset RESET_PCIE_PHY>;
++			reset-names = "phy";
++			#phy-cells = <1>;
++		};
++
++		usb: usb@fe03a000 {
++			compatible = "amlogic,meson-g12a-usb-ctrl";
++			reg = <0 0xfe03a000 0 0xa0>;
++			interrupts = <GIC_SPI 129 IRQ_TYPE_LEVEL_HIGH>;
++			#address-cells = <2>;
++			#size-cells = <2>;
++			ranges;
++			clocks = <&clkc CLKID_USB>;
++			resets = <&reset RESET_USBCTRL>;
++			power-domains = <&pwrc PWRC_SC2_USB_COMB_ID>;
++			phys = <&usb2_phy0>, <&usb2_phy1>,
++			       <&usb3_pcie_phy PHY_TYPE_USB3>;
++			phy-names = "usb2-phy0", "usb2-phy1", "usb3-phy0";
++			dr_mode = "host";
++			status = "disabled";
++
++			dwc3: usb@fde00000 {
++				compatible = "snps,dwc3";
++				reg = <0 0xfde00000 0 0x100000>;
++				interrupts = <GIC_SPI 130 IRQ_TYPE_LEVEL_HIGH>;
++				dr_mode = "host";
++				snps,dis_u2_susphy_quirk;
++				snps,quirk-frame-length-adjustment = <0x20>;
++				snps,parkmode-disable-ss-quirk;
++			};
++		};
++
++		ethmac: ethernet@fdc00000 {
++			compatible = "amlogic,meson-axg-dwmac", "snps,dwmac-3.70a",
++				     "snps,dwmac";
++			reg = <0 0xfdc00000 0 0x10000>, <0 0xfe024000 0 8>;
++			interrupts = <GIC_SPI 74 IRQ_TYPE_LEVEL_HIGH>;
++			interrupt-names = "macirq";
++			clocks = <&clkc CLKID_ETH>, <&clkc CLKID_FCLK_DIV2>,
++				 <&clkc CLKID_MPLL2>;
++			clock-names = "stmmaceth", "clkin0", "clkin1";
++			power-domains = <&pwrc PWRC_SC2_ETH_ID>;
++			rx-fifo-depth = <4096>;
++			tx-fifo-depth = <2048>;
++			status = "disabled";
++
++			mdio0: mdio {
++				compatible = "snps,dwmac-mdio";
++				#address-cells = <1>;
++				#size-cells = <0>;
++			};
++		};
++	};
++};
++
++&periphs_pinctrl {
++	sdcard_pins: sdcard-pins {
++		mux {
++			groups = "sdcard_d0_c", "sdcard_d1_c", "sdcard_d2_c",
++				 "sdcard_d3_c", "sdcard_cmd_c", "sdcard_clk_c";
++			function = "sdcard";
++			bias-pull-up;
++		};
++	};
++
++	eth_pins: eth-pins {
++		mux {
++			groups = "eth_mdio", "eth_mdc", "eth_rgmii_rx_clk",
++				 "eth_rx_dv", "eth_rxd0", "eth_rxd1", "eth_txen",
++				 "eth_txd0", "eth_txd1", "eth_rxd2_rgmii",
++				 "eth_rxd3_rgmii", "eth_rgmii_tx_clk",
++				 "eth_txd2_rgmii", "eth_txd3_rgmii";
++			function = "eth";
++			drive-strength-microamp = <4000>;
++			bias-disable;
++		};
++	};
++};
+diff --git a/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts b/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
+new file mode 100644
+--- /dev/null
++++ b/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
+@@ -0,0 +1,113 @@
++// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
++/*
++ * HK1 RBOX X4, S905X4, 4GB variant.
++ * Wiring and usable-memory boundary: original sc2_ah212_4g vendor DT.
++ * This intentionally leaves CPU DVFS, Wi-Fi, display and media unmodelled.
++ */
++/dts-v1/;
++#include "meson-sc2.dtsi"
++
++/ {
++	model = "HK1 RBOX X4 (S905X4, 4GB)";
++	compatible = "hk1,rbox-x4", "amlogic,sc2";
++
++	aliases {
++		serial0 = &uart_b;
++		mmc0 = &sd_emmc_b;
++		ethernet0 = &ethmac;
++	};
++
++	chosen {
++		stdout-path = "serial0:115200n8";
++	};
++
++	/* The original 4GB DT exposes 0xf0000000 bytes below the MMIO hole. */
++	memory@0 {
++		device_type = "memory";
++		reg = <0 0 0 0xf0000000>;
++	};
++
++	reserved-memory {
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++
++		/* Low firmware and BL31 carveouts retained from the SC2 port. */
++		firmware@0 {
++			reg = <0 0 0 0x1000000>;
++			no-map;
++		};
++
++		/* Stock secmon alloc-ranges: never make secure memory reusable. */
++		secmon@5000000 {
++			reg = <0 0x05000000 0 0x03400000>;
++			no-map;
++		};
++
++		secmon@10000000 {
++			reg = <0 0x10000000 0 0x00200000>;
++			no-map;
++		};
++
++		/* Stock fixed DSP/scanout pools: firmware ownership is unverified. */
++		dsp-firmware@30000000 {
++			reg = <0 0x30000000 0 0x00800000>;
++			no-map;
++		};
++
++		framebuffer@df800000 {
++			reg = <0 0xdf800000 0 0x00800000>;
++			no-map;
++		};
++		/* Stock ramoops@7400000 overlaps secmon; do not map it here. */
++	};
++};
++
++&uart_b {
++	status = "okay";
++};
++
++&sd_emmc_b {
++	status = "okay";
++	pinctrl-names = "default";
++	pinctrl-0 = <&sdcard_pins>;
++	bus-width = <4>;
++	cap-sd-highspeed;
++	max-frequency = <50000000>;
++	no-1-8-v;
++	disable-wp;
++	cd-gpios = <&gpio GPIOC_6 GPIO_ACTIVE_LOW>;
++};
++
++&ethmac {
++	status = "okay";
++	pinctrl-names = "default";
++	pinctrl-0 = <&eth_pins>;
++	phy-mode = "rgmii";
++	phy-handle = <&external_phy>;
++	amlogic,tx-delay-ns = <2>;
++};
++
++&mdio_mux {
++	status = "okay";
++};
++
++&ext_mdio {
++	external_phy: ethernet-phy@0 {
++		reg = <0>;
++		max-speed = <1000>;
++		reset-gpios = <&gpio GPIOZ_15 (GPIO_ACTIVE_LOW | GPIO_OPEN_DRAIN)>;
++		reset-assert-us = <20000>;
++		reset-deassert-us = <50000>;
++		/* Use PHY polling; vendor IRQ 0x154 is not a GPIO binding index. */
++	};
++};
++
++&usb {
++	status = "okay";
++};
++
++&dwc3 {
++	/* Preserve the original board DT's limit, not an assumed USB3 result. */
++	maximum-speed = "high-speed";
++};
