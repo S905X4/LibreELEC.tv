@@ -114,6 +114,7 @@ Use the corresponding existing filename, in order:
 30. `0030-meson-sc2-thermal-tuple-schema.patch`
 31. `0031-meson-sc2-cecb-clock-ids.patch`
 32. `0032-meson-sc2-inverted-pwm-roundtrip.patch`
+33. `0033-hk1-rbox-x4-rc-map-binding.patch`
 
 `Work/sc2-kernel-series.json` records the initial five exports;
 `Work/sc2-peripheral-verification.json` records the later source commits,
