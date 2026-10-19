@@ -47,20 +47,23 @@ the donor trees under `reference-kernels/`. Its `hk1-sc2-6.18` branch starts at
 official stable tag `v6.18.57`, commit
 `2ff600d29ee478d0a8d46ef8a58afb5e038fe692`, from
 `https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git`.
-The five commits above that base are the source series; the five generated
-patches in `devices/SC2/patches/linux/` are LibreELEC's integration copy.
-Review the kernel series separately from LE's recipe, configuration, image,
-boot-script, and headless userspace changes. The reference trees remain donors,
-not development targets or proof of upstream support.
+The first five commits preserve the initial peripheral baseline. Nine subsequent
+commits add native IR, the status LED, FD6551 panel, audio clocks/arbitration,
+HDMI output-divider readback, SC2 DRM/HDMI, digital ASoC playback and the panel
+binding correction. The fourteen generated patches in `devices/SC2/patches/linux/`
+are LibreELEC's integration copy. Review kernel changes separately from LE's
+recipe, configuration, image and boot-script changes. Donor trees are not
+development targets or proof of upstream support.
 
 The LE review branch is also named `hk1-sc2-6.18`, based on official LE
 `12.2.1` (`6209f5a3b067c45fbf527286dd84ee483294b46a`). Review and commit
 each repository independently; kernel commits do not replace LE integration
 commits, and neither local branch is an upstream acceptance claim.
 
-The source series migrates the existing patch payload into reviewable kernel
-commits; it does not represent a newly built or newly booted kernel. Preserve
-donor attribution and licenses when reviewing or exporting it. Local commits
+The initial source series migrates the existing patch payload into reviewable
+commits; the later native-peripheral series has a combined build and userspace
+smoke run, not a physical output acceptance result. Preserve donor attribution
+and licenses when reviewing or exporting it. Local commits
 use `hiper25 <whydonit@gmail.com>` and distinct `Change-Id` trailers without
 adding `Signed-off-by`. This local rule does **not** satisfy Linux upstream's
 DCO sign-off requirement: these commits are local review material, not an
@@ -80,9 +83,19 @@ Use the corresponding existing filename, in order:
 3. `0003-amlogic-sc2-usb-phys.patch`
 4. `0004-amlogic-sc2-hk1-rbox-x4.patch`
 5. `0005-uapi-vhost-types-include-stddef.patch`
+6. `0006-meson-sc2-ir-receiver.patch`
+7. `0007-meson-sc2-hk1-status-led.patch`
+8. `0008-meson-sc2-fd6551-panel.patch`
+9. `0009-meson-sc2-audio-clocks.patch`
+10. `0010-meson-sc2-audio-arbiter.patch`
+11. `0011-meson-sc2-hdmi-od-readback.patch`
+12. `0012-meson-sc2-native-hdmi.patch`
+13. `0013-meson-sc2-native-audio.patch`
+14. `0014-fd6551-indicator-reg-schema.patch`
 
-`Work/sc2-kernel-series.json` records the exact commits, export arguments,
-filenames, and source patch hashes for this local handoff. Create the output
+`Work/sc2-kernel-series.json` records the initial five exports;
+`Work/sc2-peripheral-verification.json` records the later source commits,
+exported patch hashes, artifact identities and exercised verification. Create the output
 directory before exporting; replace `FULL_COMMIT_SHA` and `LE_PATCH_FILENAME`
 with the corresponding recorded values. Copy each complete generated file to
 `LibreELEC.tv/projects/Amlogic/devices/SC2/patches/linux/`; do not hand-edit its
@@ -178,11 +191,12 @@ Useful headless observations include `uname -a`, `cat /proc/device-tree/model`,
 `lsmod`, `strace`, and `/sys/kernel/debug/clk/clk_summary`. The image also includes
 `dtc`, `memtester`, `gdb`, `usbutils`, `pciutils`, and `nano`.
 
-This target intentionally disables DRM, GPU, media, and sound in the kernel.
-An initial HK1 kernel log is not evidence of working HDMI or a complete board
-boot. The normal distro-wide kernel-options audit includes desktop/container/media
-requirements that this bring-up configuration intentionally does not satisfy;
-review diagnostics in that context rather than enabling the multimedia stack.
+The target now enables native IR, GPIO LED, FD6551 auxdisplay, DRM framebuffer
+console, optical SPDIF and DW-HDMI I2S audio. Kodi, GPU acceleration, hardware
+video decoding and CEC remain disabled. Built drivers and device nodes are not
+evidence of visible output or audible sound. The normal distro-wide options
+audit also includes desktop/container/media requirements outside this target;
+review those diagnostics without enabling unrelated stacks.
 CPU DVFS and thermal safety under sustained load remain unverified.
 Do not treat an initial boot or a userspace simulation as a stress-test result.
 
@@ -242,6 +256,55 @@ powered switch port. Check whether networking returns without touching it.
 If not, capture the failure before reconnecting the cable; do not add an
 automatic interface restart that would hide this distinction.
 
+### Native peripheral series and hardware acceptance
+
+The series is built from Linux source head `25dafc9a120a` and LE integration
+commit `b15c469a10fe`. The complete image and update are in `target/` with stem
+`LibreELEC-SC2.aarch64-12.2-devel-20261019204550-b15c469` and `.sha256` files.
+The source kernel Image, modules and board DTB compiled without warning/error
+matches. Changed bindings passed `dt-doc-validate` after correcting the FD6551
+single-cell indicator index schema. Source and FAT-shipped DTBs both passed
+`dt-validate` without diagnostics. The shipped DTB additionally contains overlay
+symbols and corresponding phandles; it is not byte-identical to the plain build.
+The uImage remains uncompressed with load/entry `0x02000000`, below the existing
+size bound. Image and update SHA-256 checks passed.
+
+The final shipped SYSTEM and initramfs ran on a private image in QEMU using the
+existing Linux 6.18.57 diagnostic kernel and virtual block/network devices.
+The production first-boot resize requested a reboot; the second boot mounted
+read-only `/flash` and SquashFS root, writable `/storage`, and started ConnMan
+and SSH without failed units in the observation. `aplay` and `amixer` reported
+1.2.11; `speaker-test` completed 48 kHz S16_LE stereo through ALSA's **null** PCM.
+`ir-keytable` reported 1.30.1. `modetest -M meson -c` ran and correctly could not
+open a Meson device in this VM. This checks installed userspace, not SC2 DRM,
+audio DMA, IR reception, GPIO or any physical output. The private disk was removed;
+logs remain in `Work/sc2-peripheral-smoke-16lejfj4/` at the workspace root.
+
+| Item | Implemented path | Physical acceptance boundary |
+| --- | --- | --- |
+| IR | Native SC2 IR match data and clock, GPIOD_5 input, NEC decoder | Requires actual key reception; no unmeasured keymap assumed |
+| Status LED | GPIOD_11 active high, standard GPIO LED | On/off visibility not observed with the new kernel |
+| Front panel | Native FD6551 protocol over GPIOB_0 DAT/GPIOB_1 CLK, standard linedisp and LED APIs | Exact-model public layout is corroboration, not physical IC identification or segment acceptance |
+| HDMI video | Native SC2 VPU, actual CLKCTRL/ANACTRL/PWRCTRL, TOP `fe300000` before DWC `fe308000` | Initial target 1080p60 RGB 8bpc; HPD/EDID, vblank, pattern geometry/color and visible picture still need the board |
+| Digital audio | Powered domain 10, FRDDR A to optical SPDIF on H4; FRDDR B to TDM-C and real DW-HDMI codec | Requires DMA/IRQ growth, 48 kHz stereo receiver/channel checks and repeated start/stop; HDMI ELD/hotplug separately |
+| 3.5mm AV audio | Native SC2 analog glue implemented, board analog path not activated | T9015 AVDD rail identity and actual positive/negative output-to-jack wiring are absent from stock data; no invented supply or headphone amplifier |
+| USB2 | Existing stock low-power/free-clock quirks retained | Prior physical boot and bounded file readback passed; not a USB3 result |
+| Blue USB3 port | Existing SC2 combo-PHY source retained; stock `maximum-speed = high-speed` retained | Owner reported boot failure on this port; no attached SuperSpeed device or post-change hardware result. Do not claim a fix or blindly remove the speed limit |
+| Native TF slot | SD_EMMC_B, GPIOC_6 active-low detect, 4-bit/50 MHz, no 1.8 V switching | Current mmc0 is bound but detect is high and no native MMC card is present; USB card-reader storage is not this slot |
+
+For the next board boot, reconnect the 921600-baud TTL recovery channel first;
+the user selected this path rather than an SSH-only reboot. Keep the known-good
+USB2 boot medium connected. No live KERNEL/SYSTEM/DTB replacement, reboot or eMMC
+write was performed by this series. Discover actual device/control names before
+operating them: `ir-keytable`, `modetest -M meson -c -p`, `aplay -l`, `amixer
+controls`, DRM connector status/EDID, and the FD6551 parent's `linedisp.N/message`.
+Use `1234`, brightness 1/4/8/off, and individual panel icons for visual checks;
+inspect the real ALSA routes before sending stereo PCM. Never connect headphones
+on the assumption that T9015 differential line outputs constitute a headphone amp.
+
+CEC remains disabled and no forced EDID or HPD/+5V manipulation was added.
+This series does not establish or repair TCL picture-setting persistence.
+
 ### Verification and limits
 
 The complete `make image` build succeeded, including the removable disk image.
@@ -296,5 +359,6 @@ negotiated at 1000 Mb/s full duplex on the running system. It does not establish
 cold-boot networking or throughput. Ethernet PHY detection and owner-reported
 recovery after cable reconnection are recorded above. Native
 SD-slot operation, USB3, cold-boot Ethernet reliability, and memory-reservation
-compatibility remain unverified. HDMI and multimedia remain disabled, not
-validated or repaired by either the QEMU checks or these headless observations.
+compatibility remain unverified. Those observations used the earlier headless
+image; the later native-peripheral build and its still-pending hardware acceptance
+are recorded separately above.
