@@ -22,4 +22,7 @@ make_target() {
 makeinstall_target() {
   mkdir -p ${INSTALL}/usr/share/bootloader
     cp -a ${PKG_BUILD}/* ${INSTALL}/usr/share/bootloader/
+    if find_file_path bootloader/update.sh; then
+      cp -a ${FOUND_PATH} ${INSTALL}/usr/share/bootloader/update.sh
+    fi
 }

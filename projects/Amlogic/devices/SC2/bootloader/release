@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: GPL-2.0
+# Script-only removable boot; never package vendor firmware or an installer.
+SRCDIR="${BUILD}/image/system/usr/share/bootloader"
+DSTDIR="${RELEASE_DIR}/3rdparty/bootloader"
+mkdir -p "${DSTDIR}/amlogic"
+cp -a "${SRCDIR}/s905_autoscript" "${DSTDIR}/"
+cp -a "${SRCDIR}/meson-sc2-hk1-rbox-x4.dtb" "${DSTDIR}/amlogic/"

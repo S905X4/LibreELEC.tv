@@ -129,7 +129,7 @@ alias mmd='mmd -i "${LE_TMP}/part1.fat"'
 # create filesystem on part1
 echo "image: creating filesystem on part1..."
 
-if [ "${BOOTLOADER}" = "syslinux" -o "${BOOTLOADER}" = "bcm2835-bootloader" -o "${BOOTLOADER}" = "u-boot" ]; then
+if [ "${BOOTLOADER}" = "syslinux" -o "${BOOTLOADER}" = "bcm2835-bootloader" -o "${BOOTLOADER}" = "u-boot" -o "${BOOTLOADER}" = "u-boot-script" ]; then
   mformat -i "${LE_TMP}/part1.fat" -v "${DISTRO_BOOTLABEL}" -N "${UUID_SYSTEM//-/}" :: >"${SAVE_ERROR}" 2>&1 || show_error
 fi
 sync
@@ -238,11 +238,14 @@ EOF
     mcopy -s "${RELEASE_DIR}/3rdparty/bootloader/overlays" :: >"${SAVE_ERROR}" 2>&1 || show_error
   fi
 
-elif [ "${BOOTLOADER}" = "u-boot" -a -n "${UBOOT_SYSTEM}" ]; then
+elif [ "${BOOTLOADER}" = "u-boot-script" ] || [ "${BOOTLOADER}" = "u-boot" -a -n "${UBOOT_SYSTEM}" ]; then
   # create bootloader configuration
   echo "image: creating bootloader configuration..."
 
-  DTB="$(${SCRIPTS}/uboot_helper ${PROJECT} ${DEVICE} ${UBOOT_SYSTEM} dtb)"
+  DTB=""
+  if [ "${BOOTLOADER}" = "u-boot" ]; then
+    DTB="$(${SCRIPTS}/uboot_helper ${PROJECT} ${DEVICE} ${UBOOT_SYSTEM} dtb)"
+  fi
   if [ -n "${DTB}" ]; then
 
     if [ -f "${RELEASE_DIR}/3rdparty/bootloader/${DTB}" ]; then
