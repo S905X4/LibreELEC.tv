@@ -175,6 +175,57 @@ firmware/TA redistribution grant was identified; those blobs are not shipped.
 Source and protocol evidence is in workspace `Work/sc2-batch-video.json` and
 `Work/sc2-video-evidence-bundle.json`. Analog AVDD/jack wiring remains unknown.
 
+#### Built candidate and automatic verification
+
+Linux `5ba418afc34643f279dc17870f0e927f7c807f16` and LE build commit
+`971df5cc5359f587090684210f86c71c26c66f00` produced
+`LibreELEC-SC2.aarch64-12.2-devel-20261020012723-971df5c` in `target/`.
+This candidate is **not deployed**; the installed baseline remains
+`20261019224356-c17c620`. Later documentation commits do not change the
+identity of that built candidate.
+
+The image SHA-256 is
+`616689a5e918479f792a5e2c5b0e6355ba7fe58f997d44ef4984e7e09944ca3f`;
+the standard update TAR SHA-256 is
+`027fd7ff990418d51d7c614fb582fb840f04075af3b5b9fa883e5e6d4f5edadd`.
+`Work/sc2-batch-acceptance.json` indexes complete build/runtime evidence,
+including retained failed attempts rather than only the final success.
+
+The exact packaged board DTB passed full-schema validation without
+diagnostics and all 28 semantic checks. Host execution of extracted
+production functions passed 738 PWM assertions, 510650 thermal arithmetic
+assertions, and 4932 CPU/DSU sequencing cases with 195629 assertions. The
+models cover mathematical boundaries and injected failures, not Linux
+framework concurrency, actual rail voltage, secure firmware or calibration.
+
+The shipped SYSTEM and extracted embedded initramfs booted on a private
+QEMU disk with a separate current-source diagnostic kernel: real first-boot
+resize/reboot, persistent storage, authenticated SSH/SFTP with a checked
+1 MiB roundtrip, native module loading, 256 MiB CMA, tool startup and ALSA
+null PCM all passed. Persistent-mode system state reached `running` with
+no failed units. QEMU lacks SC2 UART_B: a RAM-only udev rule mapped its real
+PL011 `ttyAMA0` to `ttyAML0`; the unmodified production console service
+then ran normally. Standard outbound user-mode NAT allowed real time-sync;
+SSH forwarding stayed loopback-only. No production service was masked and
+neither fixture changes the shipped SYSTEM. This is not a physical UART,
+Panfrost rendering or audible-audio pass.
+
+The separate `toram live` entry also booted that SYSTEM: the root loop used
+`/dev/SYSTEM`, `/storage` was tmpfs, no swap was active, and `/flash` was
+explicitly unmounted. SSH/ConnMan and a matching RAM SYSTEM hash remained
+available with neither virtual card partition mounted. This proves the
+VM RAM/live path, not that physical boot media may be removed without the
+same mount, swap and open-file checks on the box.
+
+Checkpatch is **not fully clean**: its 17 errors all reject the locally
+required Change-Id footer. Ten warnings retain binding/implementation
+split advice, MAINTAINERS advice and the thermal minimum-settling
+`msleep(10)` timing-slack advisory. No warnings were hidden; the explicit
+local no-signoff policy used `--no-signoff`. These commits are not claimed
+to satisfy Linux upstream submission/DCO requirements. Decoding the DTB
+with the system dtc also retains the existing Meson pinctrl empty-ranges
+warning; final full-DTB schema validation itself has no diagnostics.
+
 #### One combined hardware acceptance round
 
 Commit the complete source and LE integration before the combined image build.
@@ -194,8 +245,8 @@ separate physical scenario; CEC registration alone does not prove it.
 
 The SC2-only early udev policy sets force_ro=1 for eMMC user/boot/GP disks by
 MMC ancestor type, never by mmcblk numbering alone. Before inventory, settle
-udev and verify every touched disk reports blockdev --getro=1. Only sysfs
-identity and O_RDONLY partition-table reads are allowed: no automount, fsck,
+udev and verify every touched disk's `/sys/class/block/DEVICE/ro` is `1`. Only
+sysfs identity and O_RDONLY partition-table reads are allowed: no automount, fsck,
 installer, mmc-utils, RPMB access, bootpart/bootbus/partconf or power-on write
 protection commands. force_ro is block-layer protection, not raw-ioctl-proof
 hardware write protection; privileged MMC_IOC_CMD bypasses it. Enumeration has
@@ -327,7 +378,8 @@ contains `KERNEL`, `SYSTEM`, `uEnv.ini`, `s905_autoscript`, and the preselected
 `amlogic/meson-sc2-hk1-rbox-x4.dtb`. There is no U-Boot/FIP binary, activation
 script, `installtointernal`, environment installer, or raw bootloader write.
 In particular, the AMLGX `aml_autoscript` that runs `defenv`/`saveenv` is not
-included. The kernel board DT leaves eMMC disabled.
+included. eMMC is not an installation target; the candidate's enumeration and
+block-layer read-only limits are described above.
 
 On a stock bootloader without an already-enabled removable autoscript path,
 interrupt vendor U-Boot over UART and invoke the script explicitly. First use
