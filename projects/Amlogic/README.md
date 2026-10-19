@@ -25,8 +25,9 @@ LOCAL_CC=gcc-12 LOCAL_CXX=g++-12 PROJECT=Amlogic DEVICE=SC2 ARCH=aarch64 make im
 ```
 
 This selects `LINUX=amlogic-sc2`, Cortex-A55, and the pinned Linux 6.18.57
-recipe. It does not select Kodi, skins, the settings addon, Mesa, FFmpeg,
-PulseAudio, or PipeWire. The independent `AMLGX` device is unchanged.
+recipe. It selects Mesa's Panfrost GLES path and DRM/GBM render diagnostics,
+not Kodi, skins, the settings addon, FFmpeg, PulseAudio or PipeWire. The
+independent `AMLGX` device is unchanged.
 The kernel includes its gzip-compressed initramfs inside an **uncompressed
 legacy uImage**; there is no separate initrd to load. SD, USB host/storage,
 the serial console, and wired-network drivers are built in. Optional native
@@ -160,8 +161,9 @@ are physical acceptance items. SDIO stays at 50 MHz/3.3 V without invented
 1.8 V switching or OOB wake support. The three Realtek firmware files and
 their upstream redistribution notice are included unmodified.
 
-Kodi, Mesa and HEVC/AV1 decoding remain absent. Panfrost module binding does
-not establish rendered output. HEVC and AV1 each still lack the implemented
+Kodi and HEVC/AV1 decoding remain absent. Mesa Panfrost, kmscube and glmark2
+provide native DRM/GBM rendering diagnostics; module binding alone is not
+rendered output. HEVC and AV1 each still lack the implemented
 controls-authoritative Request/context contract, and the selected FFmpeg has
 no AV1 Request backend. Firmware bytes have been recovered, but no applicable
 firmware/TA redistribution grant was identified; those blobs are not shipped.
@@ -180,9 +182,10 @@ Reject failed transitions rather than lowering voltage or disguising errors.
 Then exercise existing HDMI/48 kHz stereo DMA and finite page flips, GPIO LED,
 panel, actual IR keys, WiFi scanning and Bluetooth input in the same session.
 Record receiver-visible/audio results separately from counters and registration.
-Actual GPU rendering needs a real userspace renderer, not this minimal image's
-module listing. TCL direct cold-boot picture persistence is a separate physical
-scenario; CEC registration alone does not prove it.
+Exercise actual Panfrost rendering with the installed kmscube/glmark2 DRM/GBM
+tools, verify the reported renderer is Mali rather than a software fallback,
+and observe displayed output. TCL direct cold-boot picture persistence is a
+separate physical scenario; CEC registration alone does not prove it.
 
 The SC2-only early udev policy sets force_ro=1 for eMMC user/boot/GP disks by
 MMC ancestor type, never by mmcblk numbering alone. Before inventory, settle
@@ -403,8 +406,9 @@ Useful headless observations include `uname -a`, `cat /proc/device-tree/model`,
 
 The target enables native IR, GPIO LED, FD6551 auxdisplay, DRM framebuffer
 console, optical SPDIF, DW-HDMI I2S, Panfrost, CECB, native wireless, calibrated
-thermal zones and coordinated CPU DVFS. Kodi, Mesa and hardware video decoding
-remain absent. Built drivers and device nodes are not physical acceptance.
+thermal zones and coordinated CPU DVFS. Mesa Panfrost and DRM/GBM render tools
+are selected; Kodi and hardware video decoding remain absent. Built drivers
+and device nodes are not physical acceptance.
 The normal distro-wide options audit also includes desktop/container/media
 requirements outside this target; do not enable unrelated stacks for its sake.
 CPU DVFS and thermal safety under sustained load remain unverified until the
