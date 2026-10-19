@@ -51,8 +51,9 @@ The first five commits preserve the initial peripheral baseline. Nine subsequent
 commits add native IR, the status LED, FD6551 panel, audio clocks/arbitration,
 HDMI output-divider readback, SC2 DRM/HDMI, digital ASoC playback and the panel
 binding correction. A fifteenth commit corrects the SC2 HDMI DWC/TOP resource
-order after tracing the vendor driver's indexed accesses. The fifteen generated
-patches in `devices/SC2/patches/linux/` are LibreELEC's integration copy. Review
+order after tracing the vendor driver's indexed accesses; the sixteenth adds
+the reusable default CMA pool required for native scanout allocations. The sixteen
+generated patches in `devices/SC2/patches/linux/` are LibreELEC's integration copy. Review
 kernel changes separately from LE's recipe, configuration, image and boot-script
 changes. Donor trees are not development targets or proof of upstream support.
 
@@ -287,7 +288,7 @@ logs remain in `Work/sc2-peripheral-smoke-16lejfj4/` at the workspace root.
 | IR | Native SC2 IR match data and clock, GPIOD_5 input, NEC decoder | Requires actual key reception; no unmeasured keymap assumed |
 | Status LED | GPIOD_11 active high, standard GPIO LED | On/off visibility not observed with the new kernel |
 | Front panel | Native FD6551 protocol over GPIOB_0 DAT/GPIOB_1 CLK, standard linedisp and LED APIs | Exact-model public layout is corroboration, not physical IC identification or segment acceptance |
-| HDMI video | Native SC2 VPU, actual CLKCTRL/ANACTRL/PWRCTRL, DWC `fe300000`, TOP `fe308000`; corrected by patch 0015 | Initial target 1080p60 RGB 8bpc; deployed b15c469 hangs after the CVBS message, corrected mapping still needs board acceptance |
+| HDMI video | Native SC2 VPU, actual CLKCTRL/ANACTRL/PWRCTRL, DWC `fe300000`, TOP `fe308000`; corrected by patch 0015 | RAM-corrected DTB boots to login and reads HD TO USB EDID; framebuffer fails with -ENOMEM while CMA is disabled. Visible output and TCL direct connection remain unverified |
 | Digital audio | Powered domain 10, FRDDR A to optical SPDIF on H4; FRDDR B to TDM-C and real DW-HDMI codec | Requires DMA/IRQ growth, 48 kHz stereo receiver/channel checks and repeated start/stop; HDMI ELD/hotplug separately |
 | 3.5mm AV audio | Native SC2 analog glue implemented, board analog path not activated | T9015 AVDD rail identity and actual positive/negative output-to-jack wiring are absent from stock data; no invented supply or headphone amplifier |
 | USB2 | Existing stock low-power/free-clock quirks retained | Prior physical boot and bounded file readback passed; not a USB3 result |
@@ -323,8 +324,10 @@ The next USB boot loaded the 24,793,664-byte kernel and 16,614-byte DTB, reachin
 Linux 6.18.57 built at 20:49:04. IR registered and the GPIO-I2C panel bus probed;
 these are not key reception or panel visibility results. The owner confirms a
 hang at the CVBS informational message. That probe returns zero without a CVBS
-connector; HDMI component binding follows. SSH is unreachable. Patch 0015 fixes
-the source-proven bank reversal, but its effect on this hang is not yet observed.
+connector; HDMI component binding follows. After the owner read back the corrected
+RAM DTB and ran `bootm 0x12000000 - 0x20000000`, the same kernel detected HDMI TX
+v2.01a, registered DDC, bound the component and reached the LibreELEC login prompt.
+SSH is available again; `systemctl is-system-running` reports `running`.
 
 Keep the known-good USB2 boot medium connected. No deployment command writes
 eMMC firmware or saves U-Boot environment, but the original firmware itself logs
@@ -386,6 +389,31 @@ Do not rerun the removable script after editing: it would reload the old DTB.
 One owner attempt hit `Unknown command 'fdtfdt'` and ran `bootm 0x12000000 -`
 without the third argument; firmware selected the FDT at `0x01000000`, not the
 loaded `0x20000000` image. That attempt did not exercise the bank correction.
+
+#### Native framebuffer allocation and CMA
+
+The successful RAM-corrected boot reads an EDID named `HD TO USB`, with preferred
+1920x1080 at 60 Hz and basic audio support. This is not a TCL-direct observation.
+`modetest -M meson -c -p` opens the native DRM device and enumerates the connector,
+CRTC and planes; the connector is connected but disabled, with no active framebuffer.
+The kernel reports `failed to allocate buffer with size 8294400` followed by
+`fbdev: Failed to setup emulation (ret=-12)`. Its embedded config has
+`# CONFIG_CMA is not set`; `/proc/meminfo` has no CMA counters despite over 3 GiB
+available RAM. Do not treat this as total RAM exhaustion or fix it by reducing
+the display resolution, disabling fbdev, or merely appending `cma=` to a kernel
+without CMA support.
+
+Kernel commit `27d55aa73dee`, exported as patch 0016, adds the same reusable
+256 MiB, 4 MiB-aligned `shared-dma-pool` used by `meson-g12-common.dtsi`.
+Dynamic placement excludes existing firmware/secure-monitor/board reservations;
+movable allocations can use idle CMA pages. The SC2 kernel config now explicitly
+enables `CONFIG_CMA` and `CONFIG_DMA_CMA`. This is Linux DMA allocation policy,
+not a vendor Android multimedia heap or permission to reuse secure carveouts.
+The old b15c469 kernel cannot gain this allocator from a DTB-only update.
+Controller/DDC success does not establish scanout, visible color, audio playback,
+or TCL picture-setting persistence. The CMA-enabled kernel still requires a new
+build and physical boot; do not mark those checks passed from this source change.
+
 
 
 ### Verification and limits
