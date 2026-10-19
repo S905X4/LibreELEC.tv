@@ -181,10 +181,11 @@ Linux `5ba418afc34643f279dc17870f0e927f7c807f16` and LE build commit
 `971df5cc5359f587090684210f86c71c26c66f00` produced
 `LibreELEC-SC2.aarch64-12.2-devel-20261020012723-971df5c` in `target/`.
 The last fully verified installed baseline was `20261019224356-c17c620`.
-The owner subsequently authorized a standard online update and reboot to
-this candidate, but SSH did not recover; its installed identity and boot
-stage are currently **unverified**. Later documentation commits do not
-change the identity of the built candidate.
+The owner subsequently authorized a standard online update and reboot.
+SSH did not recover. The owner's later UART log confirms that the new
+USB-loaded kernel entered Linux and failed during initial CPU/DSU scaling;
+the installed SYSTEM hash is still unverified. Later documentation commits
+do not change the identity of the built candidate.
 
 The image SHA-256 is
 `616689a5e918479f792a5e2c5b0e6355ba7fe58f997d44ef4984e7e09944ca3f`;
@@ -250,9 +251,8 @@ still returned `No route to host`; its ARP neighbor was `FAILED`. mDNS
 returned no reply. Bounded discovery of the directly connected `/24`,
 including TCP22 independently of ICMP replies, found no SSH server with
 the board's previously trusted Ed25519 host key. No login to unrelated
-hosts was attempted. Without a new authenticated session or owner UART
-log, the failure stage and cause remain unknown; no peripheral checks or
-voltage/stress tests were performed after reboot.
+hosts was attempted. The later owner UART log establishes the CPUFreq boot
+failure below. No post-boot peripheral, voltage or stress tests passed.
 
 `Work/sc2-batch-deployment.json` retains the transaction and recovery
 observations. The box-side backup is
@@ -262,6 +262,61 @@ local backup is an automatic rollback. Recovery needs the owner-operated
 verified backup. No further reboot, guessed low-level write or eMMC flash
 was attempted; vendor U-Boot's automatic environment saves remain outside
 that no-explicit-eMMC-write claim.
+
+#### Confirmed CPU/DSU boot regression and one-time recovery
+
+The owner subsequently supplied a complete physical UART log. U-Boot read
+the 25346624-byte KERNEL and 25883-byte DTB from USB, verified the uImage
+checksum and entered Linux 6.18.57 built at 00:47:07. At 0.941883 seconds,
+`CPU/DSU transition failed (-5); retaining voltage` preceded the initial
+frequency-correction `BUG_ON(ret)` in `drivers/cpufreq/cpufreq.c:1529`.
+The failure is therefore not merely a missing DHCP lease or an unbootable
+vendor bootloader. The exact failed clock operation/readback and actual
+rail state remain unknown; the error message is not a voltage measurement.
+The separate eMMC voltage-negotiation `-22` is also not evidence that the
+vendor partition table was corrupted, nor the identified cause of this BUG.
+
+Do not redeploy this candidate unchanged, suppress the CPUFreq core BUG,
+pretend that a failed transition succeeded, or add a guessed OPP. First
+recover the last physically verified `c17c620` image. The delivered config
+has KALLSYMS and its packaged System.map contains `sc2_cpufreq_init`.
+SC2 is also excluded from generic CPUFreq platform-device creation. At
+the owner-operated 921600-baud U-Boot prompt, this one-time rescue skips
+the SC2 initializer and CPUFreq registration without persistent changes:
+
+```text
+usb start
+fatload usb 0:1 0x21000000 uEnv.ini
+env import -t 0x21000000 ${filesize} bootargs
+setenv bootargs "${bootargs} initcall_blacklist=sc2_cpufreq_init cpufreq.off=1 toram"
+fatload usb 0:1 0x12000000 KERNEL
+fatload usb 0:1 0x20000000 amlogic/meson-sc2-hk1-rbox-x4.dtb
+fdt addr 0x20000000
+fdt resize 0x10000
+setenv fdt_high ffffffffffffffff
+bootm 0x12000000 - 0x20000000
+```
+
+Stop on any USB/read/import/FDT failure; do not run `bootm` after an error.
+Do not `saveenv` or rerun the autoscript, which reimports the original
+bootargs. `toram` copies SYSTEM to `/dev/SYSTEM`; it does not imply `live`,
+and the imported original disk UUID preserves persistent `/storage`.
+These entry points are checked against the delivered source/config/map,
+but the owner has not yet confirmed this physical rescue boot.
+
+After authenticated SSH recovery, require the root loop backing file to
+be `/dev/SYSTEM` and rediscover the USB provenance of `/flash` and `/storage`
+before writing. Never overwrite a SYSTEM still backing the mounted root.
+The five rollback payloads have been extracted and SHA-256 checked in
+`Work/sc2-recovery-c17c620/`: KERNEL, SYSTEM, the board DTB, s905_autoscript
+and the original uEnv.ini. KERNEL and SYSTEM also match the retained
+known-good release artifacts byte-for-byte by SHA-256. The old backup's
+MD5 sidecars are stale and must not be used as verification authority.
+Stage and verify every payload before promotion, preserve the original
+UUIDs, keep any of this transaction's remaining candidate TAR out of
+`.update`, sync and restore `/flash` read-only before a notified reboot.
+No physical restore or recovered boot is claimed yet. Detailed evidence
+is retained in `Work/sc2-cpufreq-recovery.json`.
 
 #### One combined hardware acceptance round
 
