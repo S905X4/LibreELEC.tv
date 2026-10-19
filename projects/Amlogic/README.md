@@ -50,10 +50,11 @@ official stable tag `v6.18.57`, commit
 The first five commits preserve the initial peripheral baseline. Nine subsequent
 commits add native IR, the status LED, FD6551 panel, audio clocks/arbitration,
 HDMI output-divider readback, SC2 DRM/HDMI, digital ASoC playback and the panel
-binding correction. The fourteen generated patches in `devices/SC2/patches/linux/`
-are LibreELEC's integration copy. Review kernel changes separately from LE's
-recipe, configuration, image and boot-script changes. Donor trees are not
-development targets or proof of upstream support.
+binding correction. A fifteenth commit corrects the SC2 HDMI DWC/TOP resource
+order after tracing the vendor driver's indexed accesses. The fifteen generated
+patches in `devices/SC2/patches/linux/` are LibreELEC's integration copy. Review
+kernel changes separately from LE's recipe, configuration, image and boot-script
+changes. Donor trees are not development targets or proof of upstream support.
 
 The LE review branch is also named `hk1-sc2-6.18`, based on official LE
 `12.2.1` (`6209f5a3b067c45fbf527286dd84ee483294b46a`). Review and commit
@@ -258,8 +259,9 @@ automatic interface restart that would hide this distinction.
 
 ### Native peripheral series and hardware acceptance
 
-The series is built from Linux source head `25dafc9a120a` and LE integration
-commit `b15c469a10fe`. The complete image and update are in `target/` with stem
+The deployed fourteen-patch series was built from Linux source head
+`25dafc9a120a` and LE integration commit `b15c469a10fe`. That complete image and
+update are in `target/` with stem
 `LibreELEC-SC2.aarch64-12.2-devel-20261019204550-b15c469` and `.sha256` files.
 The source kernel Image, modules and board DTB compiled without warning/error
 matches. Changed bindings passed `dt-doc-validate` after correcting the FD6551
@@ -285,7 +287,7 @@ logs remain in `Work/sc2-peripheral-smoke-16lejfj4/` at the workspace root.
 | IR | Native SC2 IR match data and clock, GPIOD_5 input, NEC decoder | Requires actual key reception; no unmeasured keymap assumed |
 | Status LED | GPIOD_11 active high, standard GPIO LED | On/off visibility not observed with the new kernel |
 | Front panel | Native FD6551 protocol over GPIOB_0 DAT/GPIOB_1 CLK, standard linedisp and LED APIs | Exact-model public layout is corroboration, not physical IC identification or segment acceptance |
-| HDMI video | Native SC2 VPU, actual CLKCTRL/ANACTRL/PWRCTRL, TOP `fe300000` before DWC `fe308000` | Initial target 1080p60 RGB 8bpc; HPD/EDID, vblank, pattern geometry/color and visible picture still need the board |
+| HDMI video | Native SC2 VPU, actual CLKCTRL/ANACTRL/PWRCTRL, DWC `fe300000`, TOP `fe308000`; corrected by patch 0015 | Initial target 1080p60 RGB 8bpc; deployed b15c469 hangs after the CVBS message, corrected mapping still needs board acceptance |
 | Digital audio | Powered domain 10, FRDDR A to optical SPDIF on H4; FRDDR B to TDM-C and real DW-HDMI codec | Requires DMA/IRQ growth, 48 kHz stereo receiver/channel checks and repeated start/stop; HDMI ELD/hotplug separately |
 | 3.5mm AV audio | Native SC2 analog glue implemented, board analog path not activated | T9015 AVDD rail identity and actual positive/negative output-to-jack wiring are absent from stock data; no invented supply or headphone amplifier |
 | USB2 | Existing stock low-power/free-clock quirks retained | Prior physical boot and bounded file readback passed; not a USB3 result |
@@ -301,34 +303,33 @@ no existing commit history was rewritten to conceal the findings.
 The session's `/dev/ttyUSB0` entry was observed as a mode-000 empty regular file,
 not an accessible character TTY. `stty` returned permission denied and
 noninteractive sudo required a password. Do not chmod this placeholder and call
-it a recovered console. A real UART must be exposed to the session, or the owner
-must operate and capture a 921600-baud console outside it before the board reboot.
+it a recovered console. The owner operates the 921600-baud console externally;
+the assistant only notifies before reboot and does not verify TTL access.
 The existing removable boot files were backed up without changing them to
 `Work/sc2-pre-peripheral-boot-backup.tar` at the workspace root, SHA-256
 `54a503c3fa1fba847767c3d30ec85e613c2c6612bc7f1166d0e101432c186afa`.
 
-The owner selected capturing UART in their own host terminal. The verified
-update TAR is now staged at
+The verified update TAR was staged at
 `/storage/.update/LibreELEC-SC2.aarch64-12.2-devel-20261019204550-b15c469.tar`
 on the board: 69,683,200 bytes, SHA-256
 `27b3b77bb21ddc4799c88e997b972a588af0617427eccde85ac94def4b5d7dee`.
 It was uploaded under a non-update suffix, checked, fsynced and published only
-after identity matched. `/flash` was still read-only afterwards; no reboot was
-requested. This staging schedules the normal initramfs update at the next USB
-boot; it does not mean the new kernel is already running.
+after identity matched. `/flash` was still read-only at staging. After notifying
+the owner, SSH `sync && systemctl reboot` returned success. The owner's log
+confirms KERNEL/SYSTEM checksum checks, both payloads updated to 100%, boot-file
+update and cleanup complete, and the standard automatic reboot.
 
-Start the owner's UART capture before rebooting. Boot from the same known-good
-USB2 medium using the previously working vendor-U-Boot removable script path.
-The old initramfs will apply the archive and request another reboot; boot from
-that same medium again, manually if the stock boot policy requires it. Do not
-interrupt power during the update and do not save a new U-Boot environment.
-Keep logs from both boots. `/etc/os-release` should identify `b15c469` after
-the update; `uname` showing 6.18.57 alone cannot distinguish the old image.
+The next USB boot loaded the 24,793,664-byte kernel and 16,614-byte DTB, reaching
+Linux 6.18.57 built at 20:49:04. IR registered and the GPIO-I2C panel bus probed;
+these are not key reception or panel visibility results. The owner confirms a
+hang at the CVBS informational message. That probe returns zero without a CVBS
+connector; HDMI component binding follows. SSH is unreachable. Patch 0015 fixes
+the source-proven bank reversal, but its effect on this hang is not yet observed.
 
-For the next board boot, reconnect the 921600-baud TTL recovery channel first;
-the user selected this path rather than an SSH-only reboot. Keep the known-good
-USB2 boot medium connected. No live KERNEL/SYSTEM/DTB replacement, reboot or eMMC
-write was performed by this series. Discover actual device/control names before
+Keep the known-good USB2 boot medium connected. No deployment command writes
+eMMC firmware or saves U-Boot environment, but the original firmware itself logs
+`Saving Environment to STORAGE... OK`; do not claim zero writes across boot.
+Discover actual device/control names before
 operating them: `ir-keytable`, `modetest -M meson -c -p`, `aplay -l`, `amixer
 controls`, DRM connector status/EDID, and the FD6551 parent's `linedisp.N/message`.
 Use `1234`, brightness 1/4/8/off, and individual panel icons for visual checks;
@@ -337,6 +338,55 @@ on the assumption that T9015 differential line outputs constitute a headphone am
 
 CEC remains disabled and no forced EDID or HPD/+5V manipulation was added.
 This series does not establish or repair TCL picture-setting persistence.
+
+#### HDMI bank correction and RAM-only recovery
+
+Kernel commit `988e7b095ee0`, exported as patch 0015, corrects DWC to
+`0xfe300000` and TOP to `0xfe308000`. The vendor DT names those slots
+`hdmitxtop` and `hdmitxdwc`, respectively, but the driver uses numeric indices:
+`reg_ops.h` maps TOP to resource 3 and DWC to resource 4; `reg_ops.c` performs
+word TOP accesses and byte DWC accesses through those indices. Slot names are
+not programming authority. The previous reversed-map claim was wrong.
+
+The corrected source DTB and binding passed compilation, `dt-doc-validate` and
+`dt-validate`. A disposable copy of the shipped DTB accepted and read back the
+same property replacement used below; it was removed afterwards. The standalone
+corrected DTB is `target/meson-sc2-hk1-rbox-x4-hdmi-banks.dtb` (13,574 bytes),
+SHA-256 `0368e79b3cf7228592ae78a496287258f0426670c8fe0052cb10a780ee0ef4d5`.
+It lacks the image build's extra overlay symbols; that explains its smaller size.
+The existing b15c469 image has not been rebuilt with this correction.
+
+For an owner-operated recovery, notify before the power cycle, interrupt vendor
+autoboot, and enter commands one at a time. With the observed single USB storage
+device, use `usb 0:1`; stop on any load or FDT error:
+
+```text
+usb start
+fatload usb 0:1 0x21000000 uEnv.ini
+env import -t 0x21000000 ${filesize} bootargs
+setenv bootargs "${bootargs} drm.debug=0x06"
+fatload usb 0:1 0x12000000 KERNEL
+fatload usb 0:1 0x20000000 amlogic/meson-sc2-hk1-rbox-x4.dtb
+fdt addr 0x20000000
+fdt resize 0x10000
+fdt set /soc/hdmi-tx@fe308000 reg "<0x0 0xfe300000 0x0 0x8000 0x0 0xfe308000 0x0 0x8000>"
+fdt print /soc/hdmi-tx@fe308000 reg
+```
+
+Check the printed `reg` cells before continuing. The old unit-address path is
+intentional: this edits the deployed old DTB in RAM, preserving its phandles.
+After successful readback, the complete boot command must include the FDT:
+
+```text
+setenv fdt_high ffffffffffffffff
+bootm 0x12000000 - 0x20000000
+```
+
+Do not rerun the removable script after editing: it would reload the old DTB.
+One owner attempt hit `Unknown command 'fdtfdt'` and ran `bootm 0x12000000 -`
+without the third argument; firmware selected the FDT at `0x01000000`, not the
+loaded `0x20000000` image. That attempt did not exercise the bank correction.
+
 
 ### Verification and limits
 
