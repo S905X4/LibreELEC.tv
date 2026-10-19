@@ -288,7 +288,7 @@ logs remain in `Work/sc2-peripheral-smoke-16lejfj4/` at the workspace root.
 | IR | Native SC2 IR match data and clock, GPIOD_5 input, NEC decoder | Requires actual key reception; no unmeasured keymap assumed |
 | Status LED | GPIOD_11 active high, standard GPIO LED | On/off visibility not observed with the new kernel |
 | Front panel | Native FD6551 protocol over GPIOB_0 DAT/GPIOB_1 CLK, standard linedisp and LED APIs | Exact-model public layout is corroboration, not physical IC identification or segment acceptance |
-| HDMI video | Native SC2 VPU, actual CLKCTRL/ANACTRL/PWRCTRL, DWC `fe300000`, TOP `fe308000`; corrected by patch 0015 | RAM-corrected DTB boots to login and reads HD TO USB EDID; framebuffer fails with -ENOMEM while CMA is disabled. Visible output and TCL direct connection remain unverified |
+| HDMI video | Native SC2 VPU, actual CLKCTRL/ANACTRL/PWRCTRL, DWC `fe300000`, TOP `fe308000`; corrected by patch 0015, CMA in 0016 | Production image boots with 256 MiB CMA, native 8,294,400-byte framebuffer and 1080p60 page flips. Actual HDMI pixels and TCL direct connection remain unverified |
 | Digital audio | Powered domain 10, FRDDR A to optical SPDIF on H4; FRDDR B to TDM-C and real DW-HDMI codec | Requires DMA/IRQ growth, 48 kHz stereo receiver/channel checks and repeated start/stop; HDMI ELD/hotplug separately |
 | 3.5mm AV audio | Native SC2 analog glue implemented, board analog path not activated | T9015 AVDD rail identity and actual positive/negative output-to-jack wiring are absent from stock data; no invented supply or headphone amplifier |
 | USB2 | Existing stock low-power/free-clock quirks retained | Prior physical boot and bounded file readback passed; not a USB3 result |
@@ -357,7 +357,8 @@ same property replacement used below; it was removed afterwards. The standalone
 corrected DTB is `target/meson-sc2-hk1-rbox-x4-hdmi-banks.dtb` (13,574 bytes),
 SHA-256 `0368e79b3cf7228592ae78a496287258f0426670c8fe0052cb10a780ee0ef4d5`.
 It lacks the image build's extra overlay symbols; that explains its smaller size.
-The existing b15c469 image has not been rebuilt with this correction.
+The corrected mapping is now included in the complete CMA-enabled image and
+update described below; the historical b15c469 image remains unchanged.
 
 For an owner-operated recovery, notify before the power cycle, interrupt vendor
 autoboot, and enter commands one at a time. With the observed single USB storage
@@ -411,10 +412,100 @@ enables `CONFIG_CMA` and `CONFIG_DMA_CMA`. This is Linux DMA allocation policy,
 not a vendor Android multimedia heap or permission to reuse secure carveouts.
 The old b15c469 kernel cannot gain this allocator from a DTB-only update.
 Controller/DDC success does not establish scanout, visible color, audio playback,
-or TCL picture-setting persistence. The CMA-enabled kernel still requires a new
-build and physical boot; do not mark those checks passed from this source change.
+or TCL picture-setting persistence. The production CMA reservation, native
+framebuffer allocation and finite 1080p60 flip checks below have now passed;
+visible output remains a separate physical acceptance gate.
 
+#### CMA-enabled build and removable update
 
+Linux source `27d55aa73dee` and LE integration `87eb356972` produced the complete
+`target/LibreELEC-SC2.aarch64-12.2-devel-20261019215739-87eb356` artifact set:
+
+| Artifact | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `.img.gz` | 55,111,945 | `30e741a792d99174a385b32fd80761013bfab687121bd743557ac012c71dc9e2` |
+| `.tar` | 69,754,880 | `44326faecfecc7d7cd0bea18859ee6463e14d92085f1d9fedf905a9cb609dbde` |
+| `.kernel` | 24,865,344 | `9d5caa751b57cecedff55cc29dc3005572cb35fb55c267df2e59524fe483e93e` |
+| `.system` | 44,290,048 | `0f7db34a9e24d345beb816d231445eb0e1086622258a0bf63bfc2771de85b5cd` |
+
+The decompressed image has FAT32 and Linux partitions, with no firmware payload.
+Its KERNEL, SYSTEM, DTB and removable script match the TAR byte for byte. TAR MD5
+and artifact SHA-256 checks passed. The kernel's embedded config enables CMA and
+DMA_CMA; uImage header/data CRCs, load/entry and size checks passed. The shipped
+16,768-byte DTB has corrected DWC/TOP banks and a 256 MiB/4 MiB-aligned CMA node;
+it passed `dt-validate` without diagnostics. Its SHA-256 is
+`7945280afe7471e1b7f882966a2d7d6e67f9f580a36f70b7e4df87b160941674`.
+
+The TAR is staged under `/storage/.update/` on the board with the hash above.
+Before staging, current removable boot files were backed up to workspace-root
+`Work/sc2-pre-cma-boot-backup.tar` (69,108,736 bytes), SHA-256
+`8c3329a454c9d230d351da40066cb64eb42a022302acdb9f23447337193e457c`.
+The old on-disk DTB still had reversed HDMI banks. To let that kernel reach the
+standard updater, only its two differing register bytes were corrected, exactly
+as in the successful owner-operated RAM boot; existing phandles were preserved.
+The temporary bridge DTB is 16,614 bytes, SHA-256
+`07c6168ab6cb6ba740f414ec977fc06db641826be3ba913ca1393cf86a0b37c6`.
+KERNEL, SYSTEM and `uEnv.ini` hashes remained unchanged, including partition UUIDs.
+`/flash` was remounted read-only after the DTB replacement. This is not a CMA
+DTB-only upgrade: the standard updater must install the matching new kernel,
+modules, SYSTEM and final DTB together.
+
+The owner was notified before SSH `sync && systemctl reboot`; the command
+returned zero. Later SSH confirmed the new production image and matching installed
+KERNEL/SYSTEM/DTB hashes. The owner operates UART;
+the assistant does not inspect TTL availability.
+
+After reboot, invoke the existing USB removable script from vendor U-Boot:
+
+```text
+usb start
+fatload usb 0:1 0x22000000 s905_autoscript
+autoscr 0x22000000
+```
+
+Stop if any command fails. Do not interrupt the standard update. If the
+vendor boot policy does not automatically return to USB after its automatic
+reboot, invoke those same three commands again. No manual bank edit is needed
+with the bridge DTB or the final updated DTB. Do not save the U-Boot environment.
+
+The running production kernel reports a 256 MiB pool at
+`0xe0800000..0xf07fffff`, outside the existing secure and firmware reservations.
+`CmaTotal` is 262,144 kB and `CmaFree` was 250,188 kB before the pattern test.
+`systemctl is-system-running` reports `running`, with no failed units in the
+observed output. Native fbcon now owns `mesondrmfb`: 1920x1080, 32 bpp, XR24,
+pitch 7,680, size 8,294,400 bytes, DMA address `0xe0a00000`. CRTC 42 is enabled
+and active at 1920x1080@60 on HDMI-A-1 connector 34. The previous framebuffer
+`-ENOMEM` is absent from this boot's log.
+
+A finite `(sleep 12; echo) | modetest -M meson -s 34@42:1920x1080-60 -F smpte -v`
+run programmed the SMPTE pattern and reported 60.45 Hz initially, then eleven
+60.00 Hz intervals before completing. This exercises allocation, modesetting
+and flip events; it is not captured HDMI pixels. The sink EDID remains `HD TO USB`,
+not TCL. Host `/dev/video0` and `/dev/video1` are mode-000 empty regular files,
+not usable capture devices; they were not chmodded or presented as video proof.
+Logs are workspace-root `Work/sc2-cma-after-live-state.log` and
+`Work/sc2-hdmi-pageflip.log`. Visible output still requires the owner's observation;
+HDMI/optical audio, IR keys, LED/panel visibility and TCL persistence are not
+established by these checks.
+
+After the finite pattern run, the original fbcon framebuffer was active again.
+The board still reported `running`; its log contained no allocation failure,
+DRM flip/vblank timeout or module-version disagreement. The standard update
+directory was empty. This observation is recorded in
+`Work/sc2-cma-after-pageflip.log`.
+
+The final SYSTEM/initramfs also completed actual first-boot resize, reboot,
+read-only flash/root mounts, writable storage, SSH and tool execution in QEMU.
+The historical diagnostic kernel could not load the new production modules;
+its symbol-version failures are retained rather than suppressed. A fresh
+diagnostic kernel used the current production configuration plus PL011/VirtIO,
+with explicit `LOCALVERSION=` to match `6.18.57`. It loaded the shipped
+`pkcs8_key_parser`, `nfnetlink` and `fuse` modules and reported ConnMan, SSH and
+modules-load active with no failed units. Mirroring the production CMA node's
+size/alignment onto the QEMU DTB initialized 256 MiB without a `cma=` override.
+Logs, including both failed diagnostic attempts, remain in
+`Work/sc2-cma-release-6mwgi0ap/`. The diagnostic kernel is not shipped; this VM
+result does not replace the separate SC2 hardware observations above.
 
 ### Verification and limits
 
