@@ -1,3 +1,6 @@
+From c13667a1d69130dc9a0c508dcf0a988c1198c908 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Mon, 19 Oct 2026 20:16:57 +0800
 Subject: [PATCH] uapi: vhost: include exported stddef for counted_by
 
 Linux 6.18.57 vhost_types.h includes linux/compiler.h for __counted_by.
@@ -8,8 +11,20 @@ Use linux/stddef.h instead. It provides the existing UAPI annotation
 fallback and includes compiler_types.h for kernel consumers. Keep the
 annotation and ABI intact; do not work around this in systemd or CFLAGS.
 
+Source: the existing LibreELEC SC2 vhost UAPI compatibility patch;
+this migration does not introduce a userspace workaround.
+
+Migrate the existing LibreELEC SC2 patch unchanged into the target
+kernel history. This commit records source integration only; no fresh
+build or hardware validation was performed for this migration.
+
+Change-Id: If56bf81a6441d072f1d7adb62cb734bf01212d91
 ---
+ include/uapi/linux/vhost_types.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
 diff --git a/include/uapi/linux/vhost_types.h b/include/uapi/linux/vhost_types.h
+index 1c39cc5f5a31b5f155983f66662ee6b7c454d516..f5e3560bfe8420e7ca2c0485f578e49b752c6775 100644
 --- a/include/uapi/linux/vhost_types.h
 +++ b/include/uapi/linux/vhost_types.h
 @@ -12,7 +12,7 @@

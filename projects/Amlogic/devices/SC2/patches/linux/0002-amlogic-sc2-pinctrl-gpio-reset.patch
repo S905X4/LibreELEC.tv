@@ -1,3 +1,6 @@
+From 107202e7562e0a1c457784072671c9296188d99e Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Mon, 19 Oct 2026 20:16:56 +0800
 Subject: [PATCH] pinctrl: meson: add SC2 peripheral pins and GPIO interrupts
 
 Port hkallweit commits 6501dbd70a179fc58793988539c5ae59afc4075a,
@@ -7,12 +10,129 @@ Use existing upstream S4 reset controller operations and 12-channel GPIO
 interrupt operations. SC2 has 87 GPIO inputs. Correct the D-bank IRQ end
 to match its twelve pins.
 
----
+Donor: Heiner Kallweit <hkallweit1@gmail.com>.
+Full donor revisions for the abbreviated references above:
+c1e15da1c8ae1996466f4e27931273df1f515f30
+e85ff31b762d8e85473dfd2578eaac9b74f12503
 
+Migrate the existing LibreELEC SC2 patch unchanged into the target
+kernel history. This commit records source integration only; no fresh
+build or hardware validation was performed for this migration.
+
+Change-Id: I3770e62c4fb21c8627fcd1b9ed18e760ecfc9404
+---
+ .../amlogic,meson-gpio-intc.yaml              |    4 +
+ .../amlogic,meson-pinctrl-sc2-periphs.yaml    |   42 +
+ drivers/irqchip/irq-meson-gpio.c              |    5 +
+ drivers/pinctrl/meson/Kconfig                 |    6 +
+ drivers/pinctrl/meson/Makefile                |    1 +
+ drivers/pinctrl/meson/pinctrl-meson-sc2.c     | 1360 +++++++++++++++++
+ include/dt-bindings/gpio/meson-sc2-gpio.h     |  103 ++
+ .../reset/amlogic,meson-sc2-reset.h           |  109 ++
+ 8 files changed, 1630 insertions(+)
+ create mode 100644 Documentation/devicetree/bindings/pinctrl/amlogic,meson-pinctrl-sc2-periphs.yaml
+ create mode 100644 drivers/pinctrl/meson/pinctrl-meson-sc2.c
+ create mode 100644 include/dt-bindings/gpio/meson-sc2-gpio.h
+ create mode 100644 include/dt-bindings/reset/amlogic,meson-sc2-reset.h
+
+diff --git a/Documentation/devicetree/bindings/interrupt-controller/amlogic,meson-gpio-intc.yaml b/Documentation/devicetree/bindings/interrupt-controller/amlogic,meson-gpio-intc.yaml
+index 3d60d9e9e20813072f50f776c90416fa5642ba10..0d125ad3b22416f653b305c70304dfc245126fa2 100644
+--- a/Documentation/devicetree/bindings/interrupt-controller/amlogic,meson-gpio-intc.yaml
++++ b/Documentation/devicetree/bindings/interrupt-controller/amlogic,meson-gpio-intc.yaml
+@@ -35,6 +35,7 @@ properties:
+               - amlogic,meson-sm1-gpio-intc
+               - amlogic,meson-a1-gpio-intc
+               - amlogic,meson-s4-gpio-intc
++              - amlogic,meson-sc2-gpio-intc
+               - amlogic,a4-gpio-intc
+               - amlogic,a4-gpio-ao-intc
+               - amlogic,a5-gpio-intc
+@@ -50,6 +51,9 @@ properties:
+   "#interrupt-cells":
+     const: 2
+ 
++  "#address-cells":
++    const: 0
++
+   amlogic,channel-interrupts:
+     description: Array with the upstream hwirq numbers
+     minItems: 2
+diff --git a/Documentation/devicetree/bindings/pinctrl/amlogic,meson-pinctrl-sc2-periphs.yaml b/Documentation/devicetree/bindings/pinctrl/amlogic,meson-pinctrl-sc2-periphs.yaml
+new file mode 100644
+index 0000000000000000000000000000000000000000..ac3f321cc5328086ca20f2444db382d6d61e3fdb
+--- /dev/null
++++ b/Documentation/devicetree/bindings/pinctrl/amlogic,meson-pinctrl-sc2-periphs.yaml
+@@ -0,0 +1,42 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/pinctrl/amlogic,meson-pinctrl-sc2-periphs.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Amlogic SC2 peripheral pin controller
++
++maintainers:
++  - Heiner Kallweit <hkallweit1@gmail.com>
++
++description: |
++  SC2 integrates direction, pull enable, pull selection and drive strength
++  registers into each GPIO bank. Its pin mux register window is separate.
++
++allOf:
++  - $ref: amlogic,meson-pinctrl-common.yaml#
++
++properties:
++  compatible:
++    const: amlogic,meson-sc2-periphs-pinctrl
++
++required:
++  - compatible
++
++patternProperties:
++  "^bank@[0-9a-f]+$":
++    $ref: amlogic,meson-pinctrl-common.yaml#/$defs/meson-gpio
++    unevaluatedProperties: false
++    properties:
++      reg:
++        maxItems: 2
++      reg-names:
++        items:
++          - const: mux
++          - const: gpio
++      gpio-line-names:
++        maxItems: 87
++
++unevaluatedProperties:
++  type: object
++  $ref: amlogic,meson-pinctrl-common.yaml#/$defs/meson-pins
+diff --git a/drivers/irqchip/irq-meson-gpio.c b/drivers/irqchip/irq-meson-gpio.c
+index a6663b36bc07fe4a140e9cafd218e1cecc80db77..e4267e4fd4c1f231bf4265c26e6f9265d67601cd 100644
+--- a/drivers/irqchip/irq-meson-gpio.c
++++ b/drivers/irqchip/irq-meson-gpio.c
+@@ -174,6 +174,10 @@ static const struct meson_gpio_irq_params s4_params = {
+ 	INIT_MESON_S4_COMMON_DATA(82)
+ };
+ 
++static const struct meson_gpio_irq_params sc2_params = {
++	INIT_MESON_S4_COMMON_DATA(87)
++};
++
+ static const struct meson_gpio_irq_params c3_params = {
+ 	INIT_MESON_S4_COMMON_DATA(55)
+ };
+@@ -192,6 +196,7 @@ static const struct of_device_id meson_irq_gpio_matches[] __maybe_unused = {
+ 	{ .compatible = "amlogic,meson-sm1-gpio-intc", .data = &sm1_params },
+ 	{ .compatible = "amlogic,meson-a1-gpio-intc", .data = &a1_params },
+ 	{ .compatible = "amlogic,meson-s4-gpio-intc", .data = &s4_params },
++	{ .compatible = "amlogic,meson-sc2-gpio-intc", .data = &sc2_params },
+ 	{ .compatible = "amlogic,a4-gpio-ao-intc", .data = &a4_ao_params },
+ 	{ .compatible = "amlogic,a4-gpio-intc", .data = &a4_params },
+ 	{ .compatible = "amlogic,a5-gpio-intc", .data = &a5_params },
 diff --git a/drivers/pinctrl/meson/Kconfig b/drivers/pinctrl/meson/Kconfig
+index 0315e224bce6934229d5c6d0f7493cf33e491b08..3dca7201554ce4ef9b93d9206212325a3e59db9e 100644
 --- a/drivers/pinctrl/meson/Kconfig
 +++ b/drivers/pinctrl/meson/Kconfig
-@@ -67,6 +67,12 @@
+@@ -67,6 +67,12 @@ config PINCTRL_MESON_S4
  	select PINCTRL_MESON_AXG_PMX
  	default ARCH_MESON
  
@@ -26,9 +146,10 @@ diff --git a/drivers/pinctrl/meson/Kconfig b/drivers/pinctrl/meson/Kconfig
  	bool "AMLOGIC pincontrol"
  	depends on ARM64
 diff --git a/drivers/pinctrl/meson/Makefile b/drivers/pinctrl/meson/Makefile
+index c92a65a8334454a2c5f26475e540a9f9acbe0938..52d42a555652d6bdfe6ade051a65d8505424f0e4 100644
 --- a/drivers/pinctrl/meson/Makefile
 +++ b/drivers/pinctrl/meson/Makefile
-@@ -10,6 +10,7 @@
+@@ -10,6 +10,7 @@ obj-$(CONFIG_PINCTRL_MESON_AXG) += pinctrl-meson-axg.o
  obj-$(CONFIG_PINCTRL_MESON_G12A) += pinctrl-meson-g12a.o
  obj-$(CONFIG_PINCTRL_MESON_A1) += pinctrl-meson-a1.o
  obj-$(CONFIG_PINCTRL_MESON_S4) += pinctrl-meson-s4.o
@@ -36,30 +157,9 @@ diff --git a/drivers/pinctrl/meson/Makefile b/drivers/pinctrl/meson/Makefile
  obj-$(CONFIG_PINCTRL_AMLOGIC_A4) += pinctrl-amlogic-a4.o
  obj-$(CONFIG_PINCTRL_AMLOGIC_C3) += pinctrl-amlogic-c3.o
  obj-$(CONFIG_PINCTRL_AMLOGIC_T7) += pinctrl-amlogic-t7.o
-diff --git a/drivers/irqchip/irq-meson-gpio.c b/drivers/irqchip/irq-meson-gpio.c
---- a/drivers/irqchip/irq-meson-gpio.c
-+++ b/drivers/irqchip/irq-meson-gpio.c
-@@ -174,6 +174,10 @@
- 	INIT_MESON_S4_COMMON_DATA(82)
- };
- 
-+static const struct meson_gpio_irq_params sc2_params = {
-+	INIT_MESON_S4_COMMON_DATA(87)
-+};
-+
- static const struct meson_gpio_irq_params c3_params = {
- 	INIT_MESON_S4_COMMON_DATA(55)
- };
-@@ -192,6 +196,7 @@
- 	{ .compatible = "amlogic,meson-sm1-gpio-intc", .data = &sm1_params },
- 	{ .compatible = "amlogic,meson-a1-gpio-intc", .data = &a1_params },
- 	{ .compatible = "amlogic,meson-s4-gpio-intc", .data = &s4_params },
-+	{ .compatible = "amlogic,meson-sc2-gpio-intc", .data = &sc2_params },
- 	{ .compatible = "amlogic,a4-gpio-ao-intc", .data = &a4_ao_params },
- 	{ .compatible = "amlogic,a4-gpio-intc", .data = &a4_params },
- 	{ .compatible = "amlogic,a5-gpio-intc", .data = &a5_params },
 diff --git a/drivers/pinctrl/meson/pinctrl-meson-sc2.c b/drivers/pinctrl/meson/pinctrl-meson-sc2.c
 new file mode 100644
+index 0000000000000000000000000000000000000000..94979dff10bda46f9c7d9344646a529e2522df53
 --- /dev/null
 +++ b/drivers/pinctrl/meson/pinctrl-meson-sc2.c
 @@ -0,0 +1,1360 @@
@@ -1425,6 +1525,7 @@ new file mode 100644
 +MODULE_LICENSE("Dual BSD/GPL");
 diff --git a/include/dt-bindings/gpio/meson-sc2-gpio.h b/include/dt-bindings/gpio/meson-sc2-gpio.h
 new file mode 100644
+index 0000000000000000000000000000000000000000..a674bfd2885489958553b56997a0399179bd9379
 --- /dev/null
 +++ b/include/dt-bindings/gpio/meson-sc2-gpio.h
 @@ -0,0 +1,103 @@
@@ -1533,6 +1634,7 @@ new file mode 100644
 +#endif /* _DT_BINDINGS_MESON_SC2_GPIO_H */
 diff --git a/include/dt-bindings/reset/amlogic,meson-sc2-reset.h b/include/dt-bindings/reset/amlogic,meson-sc2-reset.h
 new file mode 100644
+index 0000000000000000000000000000000000000000..1ecf1c6182806c8fd5df3af2b0934de9dc5cfb06
 --- /dev/null
 +++ b/include/dt-bindings/reset/amlogic,meson-sc2-reset.h
 @@ -0,0 +1,109 @@
@@ -1645,71 +1747,3 @@ new file mode 100644
 +#define RESET_BRG_NIC_ALL		191
 +
 +#endif
-diff --git a/Documentation/devicetree/bindings/interrupt-controller/amlogic,meson-gpio-intc.yaml b/Documentation/devicetree/bindings/interrupt-controller/amlogic,meson-gpio-intc.yaml
---- a/Documentation/devicetree/bindings/interrupt-controller/amlogic,meson-gpio-intc.yaml
-+++ b/Documentation/devicetree/bindings/interrupt-controller/amlogic,meson-gpio-intc.yaml
-@@ -35,6 +35,7 @@
-               - amlogic,meson-sm1-gpio-intc
-               - amlogic,meson-a1-gpio-intc
-               - amlogic,meson-s4-gpio-intc
-+              - amlogic,meson-sc2-gpio-intc
-               - amlogic,a4-gpio-intc
-               - amlogic,a4-gpio-ao-intc
-               - amlogic,a5-gpio-intc
-@@ -50,6 +51,9 @@
-   "#interrupt-cells":
-     const: 2
- 
-+  "#address-cells":
-+    const: 0
-+
-   amlogic,channel-interrupts:
-     description: Array with the upstream hwirq numbers
-     minItems: 2
-diff --git a/Documentation/devicetree/bindings/pinctrl/amlogic,meson-pinctrl-sc2-periphs.yaml b/Documentation/devicetree/bindings/pinctrl/amlogic,meson-pinctrl-sc2-periphs.yaml
-new file mode 100644
---- /dev/null
-+++ b/Documentation/devicetree/bindings/pinctrl/amlogic,meson-pinctrl-sc2-periphs.yaml
-@@ -0,0 +1,42 @@
-+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
-+%YAML 1.2
-+---
-+$id: http://devicetree.org/schemas/pinctrl/amlogic,meson-pinctrl-sc2-periphs.yaml#
-+$schema: http://devicetree.org/meta-schemas/core.yaml#
-+
-+title: Amlogic SC2 peripheral pin controller
-+
-+maintainers:
-+  - Heiner Kallweit <hkallweit1@gmail.com>
-+
-+description: |
-+  SC2 integrates direction, pull enable, pull selection and drive strength
-+  registers into each GPIO bank. Its pin mux register window is separate.
-+
-+allOf:
-+  - $ref: amlogic,meson-pinctrl-common.yaml#
-+
-+properties:
-+  compatible:
-+    const: amlogic,meson-sc2-periphs-pinctrl
-+
-+required:
-+  - compatible
-+
-+patternProperties:
-+  "^bank@[0-9a-f]+$":
-+    $ref: amlogic,meson-pinctrl-common.yaml#/$defs/meson-gpio
-+    unevaluatedProperties: false
-+    properties:
-+      reg:
-+        maxItems: 2
-+      reg-names:
-+        items:
-+          - const: mux
-+          - const: gpio
-+      gpio-line-names:
-+        maxItems: 87
-+
-+unevaluatedProperties:
-+  type: object
-+  $ref: amlogic,meson-pinctrl-common.yaml#/$defs/meson-pins

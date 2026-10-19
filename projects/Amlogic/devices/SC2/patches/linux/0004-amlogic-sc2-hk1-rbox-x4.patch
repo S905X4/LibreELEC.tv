@@ -1,4 +1,8 @@
-Subject: [PATCH] arm64: dts: add minimal SC2 HK1 RBOX X4 removable-boot platform
+From a7d3c2e685cc908fdda3fb8b679438aee96a6a4d Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Mon, 19 Oct 2026 20:16:57 +0800
+Subject: [PATCH] arm64: dts: add minimal SC2 HK1 RBOX X4 removable-boot
+ platform
 
 Target Linux 6.18.57. Structural source: hkallweit linux-amlogic-sc2
 3730dc06ac5eb6282995ca8f82636b106429a796, board commit79f5fc0fa7.
@@ -21,79 +25,33 @@ external RGMII PHY/reset, not the donor board internal PHY. Keep the stock
 USB high-speed limit. CPU DVFS, Wi-Fi, display and media are not described.
 This patch series is source enablement, not evidence of a physical boot.
 
----
+Donor: Heiner Kallweit <hkallweit1@gmail.com>.
+Full donor board revision: 79f5fc0fa756edf9c960b9f66e126b38d8b05d95.
 
-diff --git a/drivers/pmdomain/amlogic/meson-secure-pwrc.c b/drivers/pmdomain/amlogic/meson-secure-pwrc.c
---- a/drivers/pmdomain/amlogic/meson-secure-pwrc.c
-+++ b/drivers/pmdomain/amlogic/meson-secure-pwrc.c
-@@ -13,6 +13,7 @@
- #include <dt-bindings/power/meson-a1-power.h>
- #include <dt-bindings/power/amlogic,c3-pwrc.h>
- #include <dt-bindings/power/meson-s4-power.h>
-+#include <dt-bindings/power/meson-sc2-power.h>
- #include <dt-bindings/power/amlogic,t7-pwrc.h>
- #include <dt-bindings/power/amlogic,a4-pwrc.h>
- #include <dt-bindings/power/amlogic,a5-pwrc.h>
-@@ -192,6 +193,21 @@
- 	SEC_PD(C3_VCODEC,	0),
- };
- 
-+static const struct meson_secure_pwrc_domain_desc sc2_pwrc_domains[] = {
-+	SEC_PD(SC2_DSP,		0),
-+	SEC_PD(SC2_DOS_HCODEC,	0),
-+	SEC_PD(SC2_DOS_HEVC,	0),
-+	SEC_PD(SC2_DOS_VDEC,	0),
-+	SEC_PD(SC2_DOS_WAVE,	0),
-+	SEC_PD(SC2_VPU_HDMI,	0),
-+	/* Keep the shared USB fabric powered, as in the vendor driver. */
-+	SEC_PD(SC2_USB_COMB,	GENPD_FLAG_ALWAYS_ON),
-+	SEC_PD(SC2_PCIE,		0),
-+	SEC_PD(SC2_GE2D,		0),
-+	SEC_PD(SC2_ETH,		GENPD_FLAG_ALWAYS_ON),
-+	SEC_PD(SC2_AUDIO,		0),
-+};
-+
- static const struct meson_secure_pwrc_domain_desc s4_pwrc_domains[] = {
- 	SEC_PD(S4_DOS_HEVC,	0),
- 	SEC_PD(S4_DOS_VDEC,	0),
-@@ -430,6 +446,11 @@
- 	.count = ARRAY_SIZE(c3_pwrc_domains),
- };
- 
-+static const struct meson_secure_pwrc_domain_data meson_secure_sc2_pwrc_data = {
-+	.domains = sc2_pwrc_domains,
-+	.count = ARRAY_SIZE(sc2_pwrc_domains),
-+};
-+
- static const struct meson_secure_pwrc_domain_data meson_secure_s4_pwrc_data = {
- 	.domains = s4_pwrc_domains,
- 	.count = ARRAY_SIZE(s4_pwrc_domains),
-@@ -457,6 +478,10 @@
- 
- static const struct of_device_id meson_secure_pwrc_match_table[] = {
- 	{
-+		.compatible = "amlogic,meson-sc2-pwrc",
-+		.data = &meson_secure_sc2_pwrc_data,
-+	},
-+	{
- 		.compatible = "amlogic,meson-a1-pwrc",
- 		.data = &meson_secure_a1_pwrc_data,
- 	},
-diff --git a/arch/arm64/boot/dts/amlogic/Makefile b/arch/arm64/boot/dts/amlogic/Makefile
---- a/arch/arm64/boot/dts/amlogic/Makefile
-+++ b/arch/arm64/boot/dts/amlogic/Makefile
-@@ -84,6 +84,7 @@
- dtb-$(CONFIG_ARCH_MESON) += meson-gxm-vega-s96.dtb
- dtb-$(CONFIG_ARCH_MESON) += meson-gxm-wetek-core2.dtb
- dtb-$(CONFIG_ARCH_MESON) += meson-s4-s805x2-aq222.dtb
-+dtb-$(CONFIG_ARCH_MESON) += meson-sc2-hk1-rbox-x4.dtb
- dtb-$(CONFIG_ARCH_MESON) += meson-sm1-a95xf3-air-gbit.dtb
- dtb-$(CONFIG_ARCH_MESON) += meson-sm1-a95xf3-air.dtb
- dtb-$(CONFIG_ARCH_MESON) += meson-sm1-bananapi-m2-pro.dtb
+Migrate the existing LibreELEC SC2 patch unchanged into the target
+kernel history. This commit records source integration only; no fresh
+build or hardware validation was performed for this migration.
+
+Change-Id: Ia4278d83fc765a453751afc438b626e2c41e972f
+---
+ .../devicetree/bindings/arm/amlogic.yaml      |   5 +
+ .../power/amlogic,meson-sec-pwrc.yaml         |   3 +-
+ .../devicetree/bindings/vendor-prefixes.yaml  |   2 +
+ arch/arm64/boot/dts/amlogic/Makefile          |   1 +
+ .../dts/amlogic/meson-sc2-hk1-rbox-x4.dts     | 115 +++++++
+ arch/arm64/boot/dts/amlogic/meson-sc2.dtsi    | 318 ++++++++++++++++++
+ drivers/pmdomain/amlogic/meson-secure-pwrc.c  |  25 ++
+ include/dt-bindings/power/meson-sc2-power.h   |  18 +
+ 8 files changed, 486 insertions(+), 1 deletion(-)
+ create mode 100644 arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
+ create mode 100644 arch/arm64/boot/dts/amlogic/meson-sc2.dtsi
+ create mode 100644 include/dt-bindings/power/meson-sc2-power.h
+
 diff --git a/Documentation/devicetree/bindings/arm/amlogic.yaml b/Documentation/devicetree/bindings/arm/amlogic.yaml
+index 2a096e060ed3d30f243d39b47817d2a5a36361b3..137ee79943af428d77847d9672220c3cd0a86b3c 100644
 --- a/Documentation/devicetree/bindings/arm/amlogic.yaml
 +++ b/Documentation/devicetree/bindings/arm/amlogic.yaml
-@@ -240,6 +240,11 @@
+@@ -240,6 +240,11 @@ properties:
                - amlogic,aw419
            - const: amlogic,c3
  
@@ -105,22 +63,11 @@ diff --git a/Documentation/devicetree/bindings/arm/amlogic.yaml b/Documentation/
        - description: Boards with the Amlogic Meson S4 S805X2 SoC
          items:
            - enum:
-diff --git a/Documentation/devicetree/bindings/vendor-prefixes.yaml b/Documentation/devicetree/bindings/vendor-prefixes.yaml
---- a/Documentation/devicetree/bindings/vendor-prefixes.yaml
-+++ b/Documentation/devicetree/bindings/vendor-prefixes.yaml
-@@ -693,6 +693,8 @@
-     description: Hitachi Ltd.
-   "^hitex,.*":
-     description: Hitex Development Tools
-+  "^hk1,.*":
-+    description: HK1 TV boxes
-   "^holt,.*":
-     description: Holt Integrated Circuits, Inc.
-   "^holtek,.*":
 diff --git a/Documentation/devicetree/bindings/power/amlogic,meson-sec-pwrc.yaml b/Documentation/devicetree/bindings/power/amlogic,meson-sec-pwrc.yaml
+index 12b71688dd3407f7183d81e2da8b2c18784a6e77..c3fbaf9e1845e3e1c6df3c0b4440ef7cfc767ef3 100644
 --- a/Documentation/devicetree/bindings/power/amlogic,meson-sec-pwrc.yaml
 +++ b/Documentation/devicetree/bindings/power/amlogic,meson-sec-pwrc.yaml
-@@ -12,7 +12,7 @@
+@@ -12,7 +12,7 @@ maintainers:
    - Jianxin Pan <jianxin.pan@amlogic.com>
  
  description: |+
@@ -129,7 +76,7 @@ diff --git a/Documentation/devicetree/bindings/power/amlogic,meson-sec-pwrc.yaml
    of secure-monitor.
  
  properties:
-@@ -20,6 +20,7 @@
+@@ -20,6 +20,7 @@ properties:
      enum:
        - amlogic,meson-a1-pwrc
        - amlogic,meson-s4-pwrc
@@ -137,31 +84,155 @@ diff --git a/Documentation/devicetree/bindings/power/amlogic,meson-sec-pwrc.yaml
        - amlogic,a4-pwrc
        - amlogic,a5-pwrc
        - amlogic,c3-pwrc
-diff --git a/include/dt-bindings/power/meson-sc2-power.h b/include/dt-bindings/power/meson-sc2-power.h
+diff --git a/Documentation/devicetree/bindings/vendor-prefixes.yaml b/Documentation/devicetree/bindings/vendor-prefixes.yaml
+index a9cf85fd6fbec7ea41c15afff0f4c45268d4c30d..6f6261f3ec7093737fa6bac576bed5112db68d84 100644
+--- a/Documentation/devicetree/bindings/vendor-prefixes.yaml
++++ b/Documentation/devicetree/bindings/vendor-prefixes.yaml
+@@ -693,6 +693,8 @@ patternProperties:
+     description: Hitachi Ltd.
+   "^hitex,.*":
+     description: Hitex Development Tools
++  "^hk1,.*":
++    description: HK1 TV boxes
+   "^holt,.*":
+     description: Holt Integrated Circuits, Inc.
+   "^holtek,.*":
+diff --git a/arch/arm64/boot/dts/amlogic/Makefile b/arch/arm64/boot/dts/amlogic/Makefile
+index 619dce79b0204d286d1f45443fd681c9b58e7f2d..d74613bd370ca8ee46e03432c2c0e83ec883b796 100644
+--- a/arch/arm64/boot/dts/amlogic/Makefile
++++ b/arch/arm64/boot/dts/amlogic/Makefile
+@@ -84,6 +84,7 @@ dtb-$(CONFIG_ARCH_MESON) += meson-gxm-ugoos-am3.dtb
+ dtb-$(CONFIG_ARCH_MESON) += meson-gxm-vega-s96.dtb
+ dtb-$(CONFIG_ARCH_MESON) += meson-gxm-wetek-core2.dtb
+ dtb-$(CONFIG_ARCH_MESON) += meson-s4-s805x2-aq222.dtb
++dtb-$(CONFIG_ARCH_MESON) += meson-sc2-hk1-rbox-x4.dtb
+ dtb-$(CONFIG_ARCH_MESON) += meson-sm1-a95xf3-air-gbit.dtb
+ dtb-$(CONFIG_ARCH_MESON) += meson-sm1-a95xf3-air.dtb
+ dtb-$(CONFIG_ARCH_MESON) += meson-sm1-bananapi-m2-pro.dtb
+diff --git a/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts b/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
 new file mode 100644
+index 0000000000000000000000000000000000000000..5c650131ecfb02f7a3eef85281c985488e5f14f1
 --- /dev/null
-+++ b/include/dt-bindings/power/meson-sc2-power.h
-@@ -0,0 +1,18 @@
++++ b/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
+@@ -0,0 +1,115 @@
 +// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
-+/* SC2 firmware power-domain indices from Amlogic sc2-pd.h. */
-+#ifndef _DT_BINDINGS_MESON_SC2_POWER_H
-+#define _DT_BINDINGS_MESON_SC2_POWER_H
++/*
++ * HK1 RBOX X4, S905X4, 4GB variant.
++ * Wiring and usable-memory boundary: original sc2_ah212_4g vendor DT.
++ * This intentionally leaves CPU DVFS, Wi-Fi, display and media unmodelled.
++ */
++/dts-v1/;
++#include "meson-sc2.dtsi"
 +
-+#define PWRC_SC2_DSP_ID		0
-+#define PWRC_SC2_DOS_HCODEC_ID	1
-+#define PWRC_SC2_DOS_HEVC_ID	2
-+#define PWRC_SC2_DOS_VDEC_ID	3
-+#define PWRC_SC2_DOS_WAVE_ID	4
-+#define PWRC_SC2_VPU_HDMI_ID	5
-+#define PWRC_SC2_USB_COMB_ID	6
-+#define PWRC_SC2_PCIE_ID		7
-+#define PWRC_SC2_GE2D_ID		8
-+#define PWRC_SC2_ETH_ID		9
-+#define PWRC_SC2_AUDIO_ID	10
++/ {
++	model = "HK1 RBOX X4 (S905X4, 4GB)";
++	compatible = "hk1,rbox-x4", "amlogic,sc2";
 +
-+#endif
++	aliases {
++		serial0 = &uart_b;
++		mmc0 = &sd_emmc_b;
++		ethernet0 = &ethmac;
++	};
++
++	chosen {
++		stdout-path = "serial0:921600n8";
++	};
++
++	/* The original 4GB DT exposes 0xf0000000 bytes below the MMIO hole. */
++	memory@0 {
++		device_type = "memory";
++		reg = <0 0 0 0xf0000000>;
++	};
++
++	reserved-memory {
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++
++		/* Low firmware and BL31 carveouts retained from the SC2 port. */
++		firmware@0 {
++			reg = <0 0 0 0x1000000>;
++			no-map;
++		};
++
++		/* Stock secmon alloc-ranges: never make secure memory reusable. */
++		secmon@5000000 {
++			reg = <0 0x05000000 0 0x03400000>;
++			no-map;
++		};
++
++		secmon@10000000 {
++			reg = <0 0x10000000 0 0x00200000>;
++			no-map;
++		};
++
++		/* Stock fixed DSP/scanout pools: firmware ownership is unverified. */
++		dsp-firmware@30000000 {
++			reg = <0 0x30000000 0 0x00800000>;
++			no-map;
++		};
++
++		framebuffer@df800000 {
++			reg = <0 0xdf800000 0 0x00800000>;
++			no-map;
++		};
++		/* Stock ramoops@7400000 overlaps secmon; do not map it here. */
++	};
++};
++
++&uart_b {
++	status = "okay";
++};
++
++&sd_emmc_b {
++	status = "okay";
++	pinctrl-names = "default";
++	pinctrl-0 = <&sdcard_pins>;
++	bus-width = <4>;
++	cap-sd-highspeed;
++	max-frequency = <50000000>;
++	no-1-8-v;
++	disable-wp;
++	cd-gpios = <&gpio GPIOC_6 GPIO_ACTIVE_LOW>;
++};
++
++&ethmac {
++	status = "okay";
++	pinctrl-names = "default";
++	pinctrl-0 = <&eth_pins>;
++	phy-mode = "rgmii";
++	phy-handle = <&external_phy>;
++	amlogic,tx-delay-ns = <2>;
++};
++
++&mdio_mux {
++	status = "okay";
++};
++
++&ext_mdio {
++	external_phy: ethernet-phy@0 {
++		reg = <0>;
++		max-speed = <1000>;
++		reset-gpios = <&gpio GPIOZ_15 (GPIO_ACTIVE_LOW | GPIO_OPEN_DRAIN)>;
++		reset-assert-us = <20000>;
++		reset-deassert-us = <50000>;
++		/* Use PHY polling; vendor IRQ 0x154 is not a GPIO binding index. */
++	};
++};
++
++&usb {
++	status = "okay";
++};
++
++&dwc3 {
++	/* Preserve the original board DT's limit, not an assumed USB3 result. */
++	maximum-speed = "high-speed";
++	snps,dis_enblslpm_quirk;
++	snps,dis-u2-freeclk-exists-quirk;
++};
 diff --git a/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi b/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi
 new file mode 100644
+index 0000000000000000000000000000000000000000..9d2f34acedf88074eca4c80612aabadfc397d026
 --- /dev/null
 +++ b/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi
 @@ -0,0 +1,318 @@
@@ -483,123 +554,84 @@ new file mode 100644
 +		};
 +	};
 +};
-diff --git a/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts b/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
+diff --git a/drivers/pmdomain/amlogic/meson-secure-pwrc.c b/drivers/pmdomain/amlogic/meson-secure-pwrc.c
+index 1d2f371d2d7f04b6a20c1bad360a8319cbb51d94..8aee1ff6c80c33d956741b997dca6d24b6f04208 100644
+--- a/drivers/pmdomain/amlogic/meson-secure-pwrc.c
++++ b/drivers/pmdomain/amlogic/meson-secure-pwrc.c
+@@ -13,6 +13,7 @@
+ #include <dt-bindings/power/meson-a1-power.h>
+ #include <dt-bindings/power/amlogic,c3-pwrc.h>
+ #include <dt-bindings/power/meson-s4-power.h>
++#include <dt-bindings/power/meson-sc2-power.h>
+ #include <dt-bindings/power/amlogic,t7-pwrc.h>
+ #include <dt-bindings/power/amlogic,a4-pwrc.h>
+ #include <dt-bindings/power/amlogic,a5-pwrc.h>
+@@ -192,6 +193,21 @@ static const struct meson_secure_pwrc_domain_desc c3_pwrc_domains[] = {
+ 	SEC_PD(C3_VCODEC,	0),
+ };
+ 
++static const struct meson_secure_pwrc_domain_desc sc2_pwrc_domains[] = {
++	SEC_PD(SC2_DSP,		0),
++	SEC_PD(SC2_DOS_HCODEC,	0),
++	SEC_PD(SC2_DOS_HEVC,	0),
++	SEC_PD(SC2_DOS_VDEC,	0),
++	SEC_PD(SC2_DOS_WAVE,	0),
++	SEC_PD(SC2_VPU_HDMI,	0),
++	/* Keep the shared USB fabric powered, as in the vendor driver. */
++	SEC_PD(SC2_USB_COMB,	GENPD_FLAG_ALWAYS_ON),
++	SEC_PD(SC2_PCIE,		0),
++	SEC_PD(SC2_GE2D,		0),
++	SEC_PD(SC2_ETH,		GENPD_FLAG_ALWAYS_ON),
++	SEC_PD(SC2_AUDIO,		0),
++};
++
+ static const struct meson_secure_pwrc_domain_desc s4_pwrc_domains[] = {
+ 	SEC_PD(S4_DOS_HEVC,	0),
+ 	SEC_PD(S4_DOS_VDEC,	0),
+@@ -430,6 +446,11 @@ static const struct meson_secure_pwrc_domain_data amlogic_secure_c3_pwrc_data =
+ 	.count = ARRAY_SIZE(c3_pwrc_domains),
+ };
+ 
++static const struct meson_secure_pwrc_domain_data meson_secure_sc2_pwrc_data = {
++	.domains = sc2_pwrc_domains,
++	.count = ARRAY_SIZE(sc2_pwrc_domains),
++};
++
+ static const struct meson_secure_pwrc_domain_data meson_secure_s4_pwrc_data = {
+ 	.domains = s4_pwrc_domains,
+ 	.count = ARRAY_SIZE(s4_pwrc_domains),
+@@ -456,6 +477,10 @@ static const struct meson_secure_pwrc_domain_data amlogic_secure_t7_pwrc_data =
+ };
+ 
+ static const struct of_device_id meson_secure_pwrc_match_table[] = {
++	{
++		.compatible = "amlogic,meson-sc2-pwrc",
++		.data = &meson_secure_sc2_pwrc_data,
++	},
+ 	{
+ 		.compatible = "amlogic,meson-a1-pwrc",
+ 		.data = &meson_secure_a1_pwrc_data,
+diff --git a/include/dt-bindings/power/meson-sc2-power.h b/include/dt-bindings/power/meson-sc2-power.h
 new file mode 100644
+index 0000000000000000000000000000000000000000..6c0608b873184736c6f5c2876d7d8d8918f27a45
 --- /dev/null
-+++ b/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
-@@ -0,0 +1,115 @@
++++ b/include/dt-bindings/power/meson-sc2-power.h
+@@ -0,0 +1,18 @@
 +// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
-+/*
-+ * HK1 RBOX X4, S905X4, 4GB variant.
-+ * Wiring and usable-memory boundary: original sc2_ah212_4g vendor DT.
-+ * This intentionally leaves CPU DVFS, Wi-Fi, display and media unmodelled.
-+ */
-+/dts-v1/;
-+#include "meson-sc2.dtsi"
++/* SC2 firmware power-domain indices from Amlogic sc2-pd.h. */
++#ifndef _DT_BINDINGS_MESON_SC2_POWER_H
++#define _DT_BINDINGS_MESON_SC2_POWER_H
 +
-+/ {
-+	model = "HK1 RBOX X4 (S905X4, 4GB)";
-+	compatible = "hk1,rbox-x4", "amlogic,sc2";
++#define PWRC_SC2_DSP_ID		0
++#define PWRC_SC2_DOS_HCODEC_ID	1
++#define PWRC_SC2_DOS_HEVC_ID	2
++#define PWRC_SC2_DOS_VDEC_ID	3
++#define PWRC_SC2_DOS_WAVE_ID	4
++#define PWRC_SC2_VPU_HDMI_ID	5
++#define PWRC_SC2_USB_COMB_ID	6
++#define PWRC_SC2_PCIE_ID		7
++#define PWRC_SC2_GE2D_ID		8
++#define PWRC_SC2_ETH_ID		9
++#define PWRC_SC2_AUDIO_ID	10
 +
-+	aliases {
-+		serial0 = &uart_b;
-+		mmc0 = &sd_emmc_b;
-+		ethernet0 = &ethmac;
-+	};
-+
-+	chosen {
-+		stdout-path = "serial0:921600n8";
-+	};
-+
-+	/* The original 4GB DT exposes 0xf0000000 bytes below the MMIO hole. */
-+	memory@0 {
-+		device_type = "memory";
-+		reg = <0 0 0 0xf0000000>;
-+	};
-+
-+	reserved-memory {
-+		#address-cells = <2>;
-+		#size-cells = <2>;
-+		ranges;
-+
-+		/* Low firmware and BL31 carveouts retained from the SC2 port. */
-+		firmware@0 {
-+			reg = <0 0 0 0x1000000>;
-+			no-map;
-+		};
-+
-+		/* Stock secmon alloc-ranges: never make secure memory reusable. */
-+		secmon@5000000 {
-+			reg = <0 0x05000000 0 0x03400000>;
-+			no-map;
-+		};
-+
-+		secmon@10000000 {
-+			reg = <0 0x10000000 0 0x00200000>;
-+			no-map;
-+		};
-+
-+		/* Stock fixed DSP/scanout pools: firmware ownership is unverified. */
-+		dsp-firmware@30000000 {
-+			reg = <0 0x30000000 0 0x00800000>;
-+			no-map;
-+		};
-+
-+		framebuffer@df800000 {
-+			reg = <0 0xdf800000 0 0x00800000>;
-+			no-map;
-+		};
-+		/* Stock ramoops@7400000 overlaps secmon; do not map it here. */
-+	};
-+};
-+
-+&uart_b {
-+	status = "okay";
-+};
-+
-+&sd_emmc_b {
-+	status = "okay";
-+	pinctrl-names = "default";
-+	pinctrl-0 = <&sdcard_pins>;
-+	bus-width = <4>;
-+	cap-sd-highspeed;
-+	max-frequency = <50000000>;
-+	no-1-8-v;
-+	disable-wp;
-+	cd-gpios = <&gpio GPIOC_6 GPIO_ACTIVE_LOW>;
-+};
-+
-+&ethmac {
-+	status = "okay";
-+	pinctrl-names = "default";
-+	pinctrl-0 = <&eth_pins>;
-+	phy-mode = "rgmii";
-+	phy-handle = <&external_phy>;
-+	amlogic,tx-delay-ns = <2>;
-+};
-+
-+&mdio_mux {
-+	status = "okay";
-+};
-+
-+&ext_mdio {
-+	external_phy: ethernet-phy@0 {
-+		reg = <0>;
-+		max-speed = <1000>;
-+		reset-gpios = <&gpio GPIOZ_15 (GPIO_ACTIVE_LOW | GPIO_OPEN_DRAIN)>;
-+		reset-assert-us = <20000>;
-+		reset-deassert-us = <50000>;
-+		/* Use PHY polling; vendor IRQ 0x154 is not a GPIO binding index. */
-+	};
-+};
-+
-+&usb {
-+	status = "okay";
-+};
-+
-+&dwc3 {
-+	/* Preserve the original board DT's limit, not an assumed USB3 result. */
-+	maximum-speed = "high-speed";
-+	snps,dis_enblslpm_quirk;
-+	snps,dis-u2-freeclk-exists-quirk;
-+};
++#endif

@@ -1,3 +1,6 @@
+From e075a7cbf5047a38dcb56a6e3991b8493b0e1d6d Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Mon, 19 Oct 2026 20:16:56 +0800
 Subject: [PATCH] clk: meson: port the SC2 secure clock controller
 
 Port Heiner Kallweit commit 46c8c9a3676448d20f0b4434d26c18550ed508ff
@@ -7,12 +10,93 @@ adapt divider APIs and module lifetime to Linux 6.18.57. Existing upstream
 PLL/MPLL behavior is retained. Firmware must implement SC2 SMCs
 0x8200009a and 0x8200009b; this is not a hardware-boot validation.
 
----
+Donor: Heiner Kallweit <hkallweit1@gmail.com>.
 
+Migrate the existing LibreELEC SC2 patch unchanged into the target
+kernel history. This commit records source integration only; no fresh
+build or hardware validation was performed for this migration.
+
+Change-Id: Ida052f3873d14b92db19fbbd3e3a7d200ecd9241
+---
+ .../bindings/clock/amlogic,sc2-clkc.yaml      |   51 +
+ drivers/clk/meson/Kconfig                     |   15 +
+ drivers/clk/meson/Makefile                    |    2 +
+ drivers/clk/meson/clk-pll.c                   |  101 +
+ drivers/clk/meson/clk-secure.h                |   46 +
+ drivers/clk/meson/sc2.c                       | 6166 +++++++++++++++++
+ drivers/clk/meson/sc2.h                       |  211 +
+ drivers/clk/meson/sc2_clk_regmap.c            |  235 +
+ include/dt-bindings/clock/amlogic,sc2-clkc.h  |  365 +
+ 9 files changed, 7192 insertions(+)
+ create mode 100644 Documentation/devicetree/bindings/clock/amlogic,sc2-clkc.yaml
+ create mode 100644 drivers/clk/meson/clk-secure.h
+ create mode 100644 drivers/clk/meson/sc2.c
+ create mode 100644 drivers/clk/meson/sc2.h
+ create mode 100644 drivers/clk/meson/sc2_clk_regmap.c
+ create mode 100644 include/dt-bindings/clock/amlogic,sc2-clkc.h
+
+diff --git a/Documentation/devicetree/bindings/clock/amlogic,sc2-clkc.yaml b/Documentation/devicetree/bindings/clock/amlogic,sc2-clkc.yaml
+new file mode 100644
+index 0000000000000000000000000000000000000000..40985b31a0673f553008d93fb376b3738dc1fe9c
+--- /dev/null
++++ b/Documentation/devicetree/bindings/clock/amlogic,sc2-clkc.yaml
+@@ -0,0 +1,51 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/clock/amlogic,sc2-clkc.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Amlogic SC2 clock controller
++
++maintainers:
++  - Heiner Kallweit <hkallweit1@gmail.com>
++
++description: |
++  SC2 provides peripheral clocks and PLLs through three register windows.
++  CPU, DSU and protected PLL programming uses the vendor secure firmware
++  clock services (SMC 0x8200009a and 0x8200009b). Clock indices are defined
++  in dt-bindings/clock/amlogic,sc2-clkc.h.
++
++properties:
++  compatible:
++    const: amlogic,sc2-clkc
++
++  reg:
++    items:
++      - description: Peripheral clock registers
++      - description: PLL registers
++      - description: CPU and DSU clock registers
++
++  reg-names:
++    items:
++      - const: basic
++      - const: pll
++      - const: cpu_clk
++
++  clocks:
++    maxItems: 1
++
++  clock-names:
++    const: xtal
++
++  "#clock-cells":
++    const: 1
++
++required:
++  - compatible
++  - reg
++  - reg-names
++  - clocks
++  - clock-names
++  - "#clock-cells"
++
++additionalProperties: false
 diff --git a/drivers/clk/meson/Kconfig b/drivers/clk/meson/Kconfig
+index 71481607a6d55d14898f9ecca68f004ccc6f6231..eee091d748880eee3beb713a6edb7aa7ac9da8eb 100644
 --- a/drivers/clk/meson/Kconfig
 +++ b/drivers/clk/meson/Kconfig
-@@ -177,6 +177,21 @@
+@@ -177,6 +177,21 @@ config COMMON_CLK_G12A
  	  Support for the clock controller on Amlogic S905D2, S905X2 and S905Y2
  	  devices, aka g12a. Say Y if you want peripherals to work.
  
@@ -35,9 +119,10 @@ diff --git a/drivers/clk/meson/Kconfig b/drivers/clk/meson/Kconfig
  	tristate "S4 SoC PLL clock controllers support"
  	depends on ARM64
 diff --git a/drivers/clk/meson/Makefile b/drivers/clk/meson/Makefile
+index c6998e752c683ec9d1736a6811b1cfd71559b289..c668dffb078e420c6e16021ebc755edc3d404b0e 100644
 --- a/drivers/clk/meson/Makefile
 +++ b/drivers/clk/meson/Makefile
-@@ -24,5 +24,7 @@
+@@ -24,5 +24,7 @@ obj-$(CONFIG_COMMON_CLK_C3_PERIPHERALS) += c3-peripherals.o
  obj-$(CONFIG_COMMON_CLK_GXBB) += gxbb.o gxbb-aoclk.o
  obj-$(CONFIG_COMMON_CLK_G12A) += g12a.o g12a-aoclk.o
  obj-$(CONFIG_COMMON_CLK_MESON8B) += meson8b.o meson8-ddr.o
@@ -46,6 +131,7 @@ diff --git a/drivers/clk/meson/Makefile b/drivers/clk/meson/Makefile
  obj-$(CONFIG_COMMON_CLK_S4_PLL) += s4-pll.o
  obj-$(CONFIG_COMMON_CLK_S4_PERIPHERALS) += s4-peripherals.o
 diff --git a/drivers/clk/meson/clk-pll.c b/drivers/clk/meson/clk-pll.c
+index 1ea6579a760f35fd669b5e7260df8edfa083bf29..f707d34b26b4a818a190b60d3a9055a2763df0e2 100644
 --- a/drivers/clk/meson/clk-pll.c
 +++ b/drivers/clk/meson/clk-pll.c
 @@ -5,6 +5,8 @@
@@ -73,7 +159,7 @@ diff --git a/drivers/clk/meson/clk-pll.c b/drivers/clk/meson/clk-pll.c
  
  static inline struct meson_clk_pll_data *
  meson_clk_pll_data(struct clk_regmap *clk)
-@@ -465,6 +469,93 @@
+@@ -465,6 +469,93 @@ static int meson_clk_pll_set_rate(struct clk_hw *hw, unsigned long rate,
  	return ret;
  }
  
@@ -167,7 +253,7 @@ diff --git a/drivers/clk/meson/clk-pll.c b/drivers/clk/meson/clk-pll.c
  /*
   * The Meson G12A PCIE PLL is fined tuned to deliver a very precise
   * 100MHz reference clock for the PCIe Analog PHY, and thus requires
-@@ -500,6 +591,16 @@
+@@ -500,6 +591,16 @@ const struct clk_ops meson_clk_pll_ro_ops = {
  };
  EXPORT_SYMBOL_NS_GPL(meson_clk_pll_ro_ops, "CLK_MESON");
  
@@ -184,8 +270,61 @@ diff --git a/drivers/clk/meson/clk-pll.c b/drivers/clk/meson/clk-pll.c
  MODULE_DESCRIPTION("Amlogic PLL driver");
  MODULE_AUTHOR("Carlo Caione <carlo@endlessm.com>");
  MODULE_AUTHOR("Jerome Brunet <jbrunet@baylibre.com>");
+diff --git a/drivers/clk/meson/clk-secure.h b/drivers/clk/meson/clk-secure.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..a3141d5eb4c2ebb7813d6cf6ab8aca59f6b34877
+--- /dev/null
++++ b/drivers/clk/meson/clk-secure.h
+@@ -0,0 +1,46 @@
++/* SPDX-License-Identifier: (GPL-2.0+ OR MIT) */
++/*
++ *
++ * Copyright (c) 2018 Amlogic, inc.
++ *
++ */
++
++#ifndef __CLK_SECURE_H
++#define __CLK_SECURE_H
++
++/*for sc2 secure*/
++#define CLK_SECURE_RW		0x8200009A
++#define CPUCLK_SECURE_RW	0x8200009B
++
++#define CLK_SMC_READ 0
++#define CLK_SMC_WRITE 1
++
++#define SYS_PLL_STEP0 0
++#define SYS_PLL_STEP1 1
++#define SYS_PLL_DISABLE 2
++#define GP1_PLL_STEP0 3
++#define GP1_PLL_STEP1 4
++#define GP1_PLL_DISABLE 5
++#define CLK_REG_RW 6
++
++#define CLK_CPU_REG_RW 0
++#define CLK_DSU_REG_RW 1
++#define CPU_CLK_SET_PARENT 2
++#define DSU_CLK_SET_PARENT 3
++#define CPU_CLK_SET_RATE 4
++#define DSU_CLK_SET_RATE 5
++#define CLK_CPU_DSU_REG_RW 6
++#define SET_CPU0_MUX_PARENT 7
++#define SET_CPU123_DSU_MUX_PARENT 8
++#define SET_DSU_PRE_MUX_PARENT 9
++#define DSU_DIVIDER_SET_RATE 10
++#define CPU_DIVIDER_SET_RATE 11
++
++extern const struct clk_ops meson_secure_clk_pll_ops; /* for sc2 secure pll*/
++extern const struct clk_ops meson_clk_regmap_secure_divider_ops;
++extern const struct clk_ops meson_clk_regmap_secure_divider_ro_ops;
++extern const struct clk_ops meson_clk_regmap_secure_mux_ops;
++extern const struct clk_ops meson_clk_regmap_secure_mux_ro_ops;
++extern const struct clk_ops meson_secure_clk_cpu_dyndiv_ops;
++
++#endif /* __CLK_SECURE_H */
 diff --git a/drivers/clk/meson/sc2.c b/drivers/clk/meson/sc2.c
 new file mode 100644
+index 0000000000000000000000000000000000000000..01479e7a5cefab6ac0afd39d3f8fc71dccfc2648
 --- /dev/null
 +++ b/drivers/clk/meson/sc2.c
 @@ -0,0 +1,6166 @@
@@ -6357,6 +6496,7 @@ new file mode 100644
 +MODULE_IMPORT_NS("CLK_MESON");
 diff --git a/drivers/clk/meson/sc2.h b/drivers/clk/meson/sc2.h
 new file mode 100644
+index 0000000000000000000000000000000000000000..529dc8348af8c24f07177843aed586ae69a6ec0a
 --- /dev/null
 +++ b/drivers/clk/meson/sc2.h
 @@ -0,0 +1,211 @@
@@ -6573,6 +6713,7 @@ new file mode 100644
 +#endif /* __SC2_H */
 diff --git a/drivers/clk/meson/sc2_clk_regmap.c b/drivers/clk/meson/sc2_clk_regmap.c
 new file mode 100644
+index 0000000000000000000000000000000000000000..61b3babda5b7cf2193a978e2c194540ddef5011a
 --- /dev/null
 +++ b/drivers/clk/meson/sc2_clk_regmap.c
 @@ -0,0 +1,235 @@
@@ -6811,59 +6952,9 @@ new file mode 100644
 +
 +MODULE_DESCRIPTION("Amlogic regmap backed clock driver");
 +MODULE_LICENSE("GPL v2");
-diff --git a/drivers/clk/meson/clk-secure.h b/drivers/clk/meson/clk-secure.h
-new file mode 100644
---- /dev/null
-+++ b/drivers/clk/meson/clk-secure.h
-@@ -0,0 +1,46 @@
-+/* SPDX-License-Identifier: (GPL-2.0+ OR MIT) */
-+/*
-+ *
-+ * Copyright (c) 2018 Amlogic, inc.
-+ *
-+ */
-+
-+#ifndef __CLK_SECURE_H
-+#define __CLK_SECURE_H
-+
-+/*for sc2 secure*/
-+#define CLK_SECURE_RW		0x8200009A
-+#define CPUCLK_SECURE_RW	0x8200009B
-+
-+#define CLK_SMC_READ 0
-+#define CLK_SMC_WRITE 1
-+
-+#define SYS_PLL_STEP0 0
-+#define SYS_PLL_STEP1 1
-+#define SYS_PLL_DISABLE 2
-+#define GP1_PLL_STEP0 3
-+#define GP1_PLL_STEP1 4
-+#define GP1_PLL_DISABLE 5
-+#define CLK_REG_RW 6
-+
-+#define CLK_CPU_REG_RW 0
-+#define CLK_DSU_REG_RW 1
-+#define CPU_CLK_SET_PARENT 2
-+#define DSU_CLK_SET_PARENT 3
-+#define CPU_CLK_SET_RATE 4
-+#define DSU_CLK_SET_RATE 5
-+#define CLK_CPU_DSU_REG_RW 6
-+#define SET_CPU0_MUX_PARENT 7
-+#define SET_CPU123_DSU_MUX_PARENT 8
-+#define SET_DSU_PRE_MUX_PARENT 9
-+#define DSU_DIVIDER_SET_RATE 10
-+#define CPU_DIVIDER_SET_RATE 11
-+
-+extern const struct clk_ops meson_secure_clk_pll_ops; /* for sc2 secure pll*/
-+extern const struct clk_ops meson_clk_regmap_secure_divider_ops;
-+extern const struct clk_ops meson_clk_regmap_secure_divider_ro_ops;
-+extern const struct clk_ops meson_clk_regmap_secure_mux_ops;
-+extern const struct clk_ops meson_clk_regmap_secure_mux_ro_ops;
-+extern const struct clk_ops meson_secure_clk_cpu_dyndiv_ops;
-+
-+#endif /* __CLK_SECURE_H */
 diff --git a/include/dt-bindings/clock/amlogic,sc2-clkc.h b/include/dt-bindings/clock/amlogic,sc2-clkc.h
 new file mode 100644
+index 0000000000000000000000000000000000000000..bab3de8457b6bc9dec42989fd4b86bf1f8791a83
 --- /dev/null
 +++ b/include/dt-bindings/clock/amlogic,sc2-clkc.h
 @@ -0,0 +1,365 @@
@@ -7232,59 +7323,3 @@ new file mode 100644
 +#define NR_CLKS				(CLKID_BASE + 257)
 +
 +#endif /* __SC2_CLKC_H */
-diff --git a/Documentation/devicetree/bindings/clock/amlogic,sc2-clkc.yaml b/Documentation/devicetree/bindings/clock/amlogic,sc2-clkc.yaml
-new file mode 100644
---- /dev/null
-+++ b/Documentation/devicetree/bindings/clock/amlogic,sc2-clkc.yaml
-@@ -0,0 +1,51 @@
-+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
-+%YAML 1.2
-+---
-+$id: http://devicetree.org/schemas/clock/amlogic,sc2-clkc.yaml#
-+$schema: http://devicetree.org/meta-schemas/core.yaml#
-+
-+title: Amlogic SC2 clock controller
-+
-+maintainers:
-+  - Heiner Kallweit <hkallweit1@gmail.com>
-+
-+description: |
-+  SC2 provides peripheral clocks and PLLs through three register windows.
-+  CPU, DSU and protected PLL programming uses the vendor secure firmware
-+  clock services (SMC 0x8200009a and 0x8200009b). Clock indices are defined
-+  in dt-bindings/clock/amlogic,sc2-clkc.h.
-+
-+properties:
-+  compatible:
-+    const: amlogic,sc2-clkc
-+
-+  reg:
-+    items:
-+      - description: Peripheral clock registers
-+      - description: PLL registers
-+      - description: CPU and DSU clock registers
-+
-+  reg-names:
-+    items:
-+      - const: basic
-+      - const: pll
-+      - const: cpu_clk
-+
-+  clocks:
-+    maxItems: 1
-+
-+  clock-names:
-+    const: xtal
-+
-+  "#clock-cells":
-+    const: 1
-+
-+required:
-+  - compatible
-+  - reg
-+  - reg-names
-+  - clocks
-+  - clock-names
-+  - "#clock-cells"
-+
-+additionalProperties: false

@@ -40,6 +40,55 @@ the Linux 6.18.57 exported vhost header and systemd 255's older vendored
 annotation definition. strace 6.16 uses its supported `--enable-bundled=yes`
 UAPI mode; this does not upgrade its syscall/ioctl decoders to a newer release.
 
+### Kernel source and separate review
+
+The sibling `linux/` repository is the kernel development target, not one of
+the donor trees under `reference-kernels/`. Its `hk1-sc2-6.18` branch starts at
+official stable tag `v6.18.57`, commit
+`2ff600d29ee478d0a8d46ef8a58afb5e038fe692`, from
+`https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git`.
+The five commits above that base are the source series; the five generated
+patches in `devices/SC2/patches/linux/` are LibreELEC's integration copy.
+Review the kernel series separately from LE's recipe, configuration, image,
+boot-script, and headless userspace changes. The reference trees remain donors,
+not development targets or proof of upstream support.
+
+The LE review branch is also named `hk1-sc2-6.18`, based on official LE
+`12.2.1` (`6209f5a3b067c45fbf527286dd84ee483294b46a`). Review and commit
+each repository independently; kernel commits do not replace LE integration
+commits, and neither local branch is an upstream acceptance claim.
+
+The source series migrates the existing patch payload into reviewable kernel
+commits; it does not represent a newly built or newly booted kernel. Preserve
+donor attribution and licenses when reviewing or exporting it. Local commits
+use `hiper25 <whydonit@gmail.com>` and distinct `Change-Id` trailers without
+adding `Signed-off-by`. This local rule does **not** satisfy Linux upstream's
+DCO sign-off requirement: these commits are local review material, not an
+upstream-ready submission. Retain any existing donor sign-offs.
+
+Export each kernel commit in oldest-first order from the workspace root:
+
+```sh
+git -C linux format-patch --stdout --no-signature --full-index --binary \
+  -1 FULL_COMMIT_SHA > Work/sc2-kernel-series/LE_PATCH_FILENAME
+```
+
+Use the corresponding existing filename, in order:
+
+1. `0001-amlogic-sc2-clock-controller.patch`
+2. `0002-amlogic-sc2-pinctrl-gpio-reset.patch`
+3. `0003-amlogic-sc2-usb-phys.patch`
+4. `0004-amlogic-sc2-hk1-rbox-x4.patch`
+5. `0005-uapi-vhost-types-include-stddef.patch`
+
+`Work/sc2-kernel-series.json` records the exact commits, export arguments,
+filenames, and source patch hashes for this local handoff. Create the output
+directory before exporting; replace `FULL_COMMIT_SHA` and `LE_PATCH_FILENAME`
+with the corresponding recorded values. Copy each complete generated file to
+`LibreELEC.tv/projects/Amlogic/devices/SC2/patches/linux/`; do not hand-edit its
+diff or regenerate it from a donor branch. Git may normalize diff context and
+hunk layout when exporting; the applied source payload must stay unchanged.
+
 ### Removable boot only
 
 Write the resulting image to an SD card or USB drive, **not eMMC**. The image
@@ -151,13 +200,47 @@ passes kernel schema validation. A host-only register smoke exercised the
 actual DWC3 setup routine on both modeled ports with properties decoded from
 that DTB; it is not a physical USB test.
 
-For an isolated hardware check, replace only
-`amlogic/meson-sc2-hk1-rbox-x4.dtb` on the existing removable FAT partition.
-Keep `KERNEL`, `SYSTEM`, `uEnv.ini`, partition UUIDs, USB port and drive unchanged.
-Look for an external USB VID/PID, storage detection and successful `/flash`
-mounting. The properties' omission is confirmed; recovery of this box's USB
-enumeration remains unverified. Do not combine this first check with global
-unused-clock/power overrides or a different PHY reset sequence.
+A later owner-supplied hardware log shows an external Prolific USB SD card
+reader enumerating, its storage partitions mounting at `/flash` and `/storage`,
+and the system reaching authenticated UART login at 921600 baud. USB2 boot
+therefore has physical-board evidence; native SD-slot and USB3 operation do not.
+Keep this working boot path unchanged while investigating other peripherals.
+
+### Ethernet link observation
+
+The owner's runtime queries identify an RTL8211F (`0x001cc916`) at PHY address
+0 in RGMII mode, with autonegotiation enabled. Initially `ethtool` reported
+`Link detected: no` and sysfs reported `carrier=0`. The owner then reported
+that unplugging and reconnecting the Ethernet cable restored networking.
+This establishes hotplug recovery, not reliable automatic link establishment
+at cold boot or sustained traffic stability. A later read-only SSH observation
+of the running Linux 6.18.57 system reports `1000Mb/s`, full duplex, and an
+active Ethernet link; this is negotiated link speed, not measured throughput.
+No PHY, MAC delay, EEE, Wake-on-LAN, or DHCP settings were changed in response.
+If it recurs, retain the pre-replug boot/link observations; the root cause
+is not established by the recovery alone.
+
+A bounded SSH transfer on the already-running Linux 6.18.57 / LE
+`e4a311be12` system moved 33,554,432 bytes in each direction. Upload `fsync`,
+readback, and downloaded-data SHA-256 checks matched
+`7d3499e568e8698bbe6d1fa2eec33bd2cd6e917517312f9049098583abed6099`.
+The link stayed at 1000 Mb/s full duplex with carrier present and
+`carrier_changes=3` throughout. RX/TX error, CRC, frame, length, and carrier
+error counter deltas were zero; `rx_dropped` increased from 21 to 22, with
+no established cause. `/flash` remained read-only and `/storage` remained
+ext4 on USB2 storage. Evidence is retained locally in
+`Work/sc2-live-smoke.json` at the workspace root.
+
+This confirms a bounded functional encrypted transfer, not line-rate Ethernet,
+physical USB throughput, long-term stability, or power-loss persistence.
+No reboot, kernel/DTB deployment, or persistent configuration change was made;
+temporary board test data was removed. This does not validate the newly
+exported kernel commits by building or deploying them.
+
+On the next normal cold boot, leave the same cable connected to the same
+powered switch port. Check whether networking returns without touching it.
+If not, capture the failure before reconnecting the cable; do not add an
+automatic interface restart that would hide this distinction.
 
 ### Verification and limits
 
@@ -205,10 +288,13 @@ autoconfiguration, initramfs creates an empty resolver file instead of reading
 the absent `/proc/net/pnp`; ConnMan configures the live network later.
 
 These QEMU checks do not execute the vendor U-Boot script or any SC2 peripheral.
-The initial HK1 UART log reached Linux 6.18.57, four CPUs, and `ttyAML0`
-registration, then became unreadable at console handover with the old 115200
-setting. The owner's subsequent 921600 log reaches xHCI root hubs but no USB
-drive and stops before mounting `/flash`, as described above. Complete HK1 boot,
-SD/USB storage, Ethernet PHY, and memory-reservation compatibility remain
-unverified. HDMI and multimedia remain disabled, not validated or repaired by
-the QEMU results.
+The owner's later hardware log confirms Linux 6.18.57 reaching authenticated
+921600-baud UART login after mounting USB-connected storage, superseding the
+earlier console-handover and `mount_flash` failures. A later read-only SSH
+observation confirms USB2-backed `/flash` and `/storage` mounts and Ethernet
+negotiated at 1000 Mb/s full duplex on the running system. It does not establish
+cold-boot networking or throughput. Ethernet PHY detection and owner-reported
+recovery after cable reconnection are recorded above. Native
+SD-slot operation, USB3, cold-boot Ethernet reliability, and memory-reservation
+compatibility remain unverified. HDMI and multimedia remain disabled, not
+validated or repaired by either the QEMU checks or these headless observations.
