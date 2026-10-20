@@ -195,13 +195,26 @@ Thermal trim validity is mandatory; invalid trim is not replaced by zero.
 Polling, CPU cooling and 105 C critical shutdown are described; the stock
 autonomous 110 C reboot is not newly programmed. Do not run unmonitored stress.
 
-Wireless uses existing rtw88 and native H5/btrtl, not an out-of-tree attach
-daemon. UART_E at fe080000 is serial1; console UART_B is unchanged. PWM_E's
-fixed FCLK_DIV3 source supplies a shared nominal 32768 Hz clock to WiFi and
-Bluetooth. Actual waveform/tolerance, ROM identity, RF and paired HID input
-are physical acceptance items. SDIO stays at 50 MHz/3.3 V without invented
-1.8 V switching or OOB wake support. The three Realtek firmware files and
-their upstream redistribution notice are included unmodified.
+The candidate's existing rtw88 and native H5/btrtl configuration was based on
+an incorrect RTL8821CS identity assumption. Authorized read-only stock Android
+capture identifies this physical unit as BCM4339 rev1: SDIO functions 1/2/3
+report `02d0:4339`, DHD reads chip `0x4339` revision 1 and loads
+`/vendor/etc/wifi/6335/fw_bcm4339a0_ag.bin` with `nvram_ap6335.txt`.
+The AP6335 path and SP4339S NVRAM comment do not identify a physical module
+marking. Function 3 binds `btsdio`; neither that binding nor the stock UART_E
+declaration proves the Android Bluetooth transport or a working HCI device.
+Do not treat the Realtek configuration or its three included firmware files
+as support for this box. No native driver/firmware cutover was made here.
+
+Stock boot logs show eMMC CKTM4R at HS400/8-bit and SDIO at SDR104/4-bit,
+both reporting 199999997 Hz. This does not validate mainline timing, supplies,
+RF, Bluetooth pairing or the candidate's shared nominal 32768 Hz PWM_E LPO.
+The candidate still limits SDIO to 50 MHz/3.3 V without invented 1.8 V
+switching or OOB wake support. Full raw logs, the device-checksummed runtime
+DTB, original firmware copies and REA evidence are indexed by
+`Work/sc2-android-adb/baseline-20261020-223848/manifest.json` at workspace root.
+Stock debugfs and an existing MMC utility were unavailable; no mount, raw
+ioctl, driver change, Wi-Fi toggle, partition write or reboot was performed.
 
 Kodi and HEVC/AV1 decoding remain absent. Mesa Panfrost, kmscube and glmark2
 provide native DRM/GBM rendering diagnostics; module binding alone is not
@@ -1003,7 +1016,7 @@ logs remain in `Work/sc2-peripheral-smoke-16lejfj4/` at the workspace root.
 | Blue USB3 port | Mode-aware combo-PHY reference sequencing and candidate super-speed cap; original USB2 quirks retained | Owner's earlier boot failure remains ground truth; no distinct PHY failure or post-change SuperSpeed transfer established |
 | Native TF slot | SD_EMMC_B, GPIOC_6 active-low detect, 4-bit/50 MHz, no 1.8 V switching | Current mmc0 is bound but detect is high and no native MMC card is present; USB card-reader storage is not this slot |
 | eMMC | Controller C, 8-bit/52 MHz, early type-MMC force_ro policy | Identity/capacity/partition inventory only after verified block RO; raw ioctls are not protected |
-| WiFi/Bluetooth | rtw88 SDIO, native H5/btrtl, shared PWM_E LPO and unmodified upstream firmware | ROM identity, RF/coexistence, calibrated LPO and paired input pending |
+| WiFi/Bluetooth | Existing rtw88/H5/btrtl candidate is based on a disproven RTL8821CS identity; shared PWM_E LPO remains unmeasured | Stock BCM4339 rev1 and SDIO `02d0:4339` observed; native-driver cutover, RF/coexistence, Bluetooth transport/ROM/paired input and calibrated LPO remain unverified |
 | GPU/CEC | Native SC2 Panfrost match and clocked CECB/notifier | Binding is not rendering, CEC interoperability or TCL cold-boot persistence |
 | CPU/thermal | Exact stock OPP/PWM_J rail, checked CPU/DSU sequencing, calibrated CPU/DDR zones | Inherited waveform/clock topology, trim accuracy, full transitions and cooling remain physical gates |
 
