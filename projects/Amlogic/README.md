@@ -24,7 +24,8 @@ PR. Preserve unfinished items across sessions; an investigation or a driver
 fix is not hardware acceptance. The workspace `skill.md` sections 1.1/1.2
 hold the persistent phase gates and acceptance ledger.
 
-Current CPUFreq remains disabled. This SC2 build has no internal installer:
+Distributed boot entries retain a CPUFreq hold; opt-in acceptance is below.
+This SC2 build has no internal installer:
 its two-partition removable image must not be written over the factory eMMC.
 Factory Android logs describe 29 private-layout partitions, including a
 user-area bootloader at offset zero; the current native kernel enumerates
@@ -32,7 +33,7 @@ the eMMC but no partitions. Internal payload placement, partition access,
 firmware/environment preservation, backup, boot, update and recovery still
 need implementation and physical acceptance. Independent TF/USB3 media can
 be tested without installing internally, but never remove the active root
-medium; internal deployment is the owner's current priority.
+medium; CPU completion remains the owner's current priority.
 
 The owner reports red and blue status LEDs, blue currently lit, a blank
 front display, untested IR, available TF/USB3 test devices, and no optical
@@ -155,6 +156,8 @@ Use the corresponding existing filename, in order:
 49. `0049-meson-sc2-park-cpu-dsu.patch`
 50. `0050-meson-sc2-autonomous-thermal-reset.patch`
 51. `0051-regulator-kunit-description.patch`
+52. `0052-meson-sc2-cpu-idle-state.patch`
+53. `0053-meson-sc2-firmware-wake-timer.patch`
 
 `Work/sc2-kernel-series.json` records the initial five exports;
 `Work/sc2-peripheral-verification.json` records the later source commits,
@@ -1695,4 +1698,77 @@ owner before reboot. Default distributed boot files retain the CPUFreq hold
 until physical acceptance; opt-in testing must not write eMMC or save the
 U-Boot environment. Evidence is under workspace-root
 `Work/sc2-cpu-completion-20261020T193047Z/`.
+
+#### Active CPU acceptance on the real board
+
+The complete build from LE `ab0dc7a7b6d6` and Linux `e4b11a34bdf9` produced
+`LibreELEC-SC2.aarch64-12.2-devel-20261021041747-ab0dc7a`. Actual image FAT
+readback matches the TAR's KERNEL/SYSTEM/DTB, both uImage CRCs pass, its
+embedded configuration matches the build, and the full DTB schema passes.
+All eight changed source/document files in the applied LE kernel match the
+native source. Normal/live distributed entries still retain the hold.
+
+After advance UART notification, a separately staged
+`/flash/sc2-cpu-ab0dc7a7/` selected active DVFS with the userspace governor.
+Pinned-key SSH returned after 24.3 seconds with boot ID
+`4ebf4ecf-4f1a-492e-8e55-c9ef8a7fa5ec`. The actual cmdline has no
+`cpufreq.off=1`, loop0 uses that directory's SYSTEM, and all candidate
+payload hashes match. The original root payloads/uEnv remain unchanged;
+only the selector changed. The host and device eight-file backup has
+SHA-256 `56889e9a16d497ebe1ee3094ab5594f87e365dd78706d9a07dd827dc28052192`.
+The byte-identical original selector is retained as
+`sc2-cpu-ab0dc7a7/s905_autoscript.recovery`; it is a manual recovery entry,
+not an automatic rollback monitor or a recovery boot already exercised.
+
+Real-board observations for this exact candidate:
+
+* All thirteen stock OPPs, ascending/descending and 169 ordered pairs:
+  365 CPU/DSU, regulator-selector and requested/actual PWM observations
+  pass in 12.849 seconds. Fixed-clock low OPPs read slightly below nominal
+  (667 MHz reads 664666664 Hz); PLL OPPs above 1 GHz read exactly.
+* Eight MiB of golden SHA-256 input per CPU at every OPP: 416 MiB across
+  four pinned CPUs passes; sampled CPU/DDR peaks are 56.2/59.1 C.
+* Schedutil changes 100 -> 2004 -> 100 MHz around four five-second SHA-256
+  workers; CPU/DDR peaks are 67.6/69.7 C. This is finite correctness/load
+  smoke, not sustained-load or electrical rail acceptance.
+* Temporarily lowering only the passive CPU hot trip from 95000 to
+  46100 mC makes the real ADC temperature trigger cooling state 1,
+  policy max 1908 MHz and actual CPU 1908 MHz. Restoring 95000 releases
+  the cap to 2004 MHz/state 0. No temperature emulation or heating to
+  95 C; the critical 105 C and hardware reset thresholds stay unchanged.
+* CPU1..3 offline/online, frequency change with only CPU0 online, and
+  pinned golden computation on each returned CPU pass. Final state is
+  userspace/1608 MHz, all four CPUs online, passive/critical trips
+  95000/105000 mC and cooling state 0. CPU/DDR CFG2 read `c0ff2a20`.
+
+Evidence files include `after-boot-identity.json`, `board-opp-transitions.json`,
+`board-loaded-opps.json`, `board-schedutil.json`, `board-cooling.json` and
+`board-hotplug.json` in the CPU session directory above. PWM and regulator
+readback are not a voltmeter or oscilloscope measurement. Cold-power,
+long stress, idle-state entry and whole-system suspend/resume remain separate.
+
+#### CPU idle and finite-wake prerequisites
+
+The current runtime lacks cpuidle state nodes and RTC class devices.
+Patch 0052 describes the exact stock/CE SC2 CPU power-down state with PSCI
+`0x10000`, timer-stop and 4000/5000/10000 us entry/exit/residency, using the
+native `entry-method = "psci"` binding. All CPUs reference it. The synthetic
+vendor system-sleep state is omitted. Existing `bc_hrtimer` broadcast keeps
+its required timer owner out of timer-stopping idle, so no guessed Meson6
+timer driver or simultaneous all-core power-down claim is introduced.
+Expected sysfs wake latency is entry+exit, 9000 us, not just exit latency.
+
+Patch 0053 describes the four-byte SC2 firmware countdown register at
+`0xfe010288`, corroborated by the exact stock DT and SC2 native-style donor,
+using the existing built-in meson-vrtc driver. It is a firmware wake interface,
+not an independent battery-backed clock. No incompatible SC2 FIFO mailbox,
+vendor PM scratch-register writer or guessed wake IRQ is copied.
+
+Native DTB compilation and full schema validation pass. These declarations
+do not prove PSCI state entry, firmware interrupt wake or alarm delivery.
+Before any system suspend, establish firmware/CPU/DSU/PWM retention and
+reconciliation, bounded thermal/timekeeping restoration, an independent
+recovery/wake path, and genuinely RAM-independent roots or proven USB-root
+preservation. Both deep and s2idle suspend devices; native s2idle lacks the
+vendor AO mailbox freeze handshake. Advertised `mem` is not acceptance.
 
