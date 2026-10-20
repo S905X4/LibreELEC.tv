@@ -126,6 +126,8 @@ Use the corresponding existing filename, in order:
 42. `0042-hk1-rbox-x4-broadcom-wireless.patch`
 43. `0043-hk1-rbox-x4-remote-semantics.patch`
 44. `0044-meson-mmc-first-irq-error.patch`
+45. `0045-meson-sc2-mmc-hs-sampling.patch`
+46. `0046-fd6551-probe-stage-errors.patch`
 
 `Work/sc2-kernel-series.json` records the initial five exports;
 `Work/sc2-peripheral-verification.json` records the later source commits,
@@ -1413,3 +1415,52 @@ SD-slot operation, USB3, cold-boot Ethernet reliability, and memory-reservation
 compatibility remain unverified. Those observations used the earlier headless
 image; the later native-peripheral build and its still-pending hardware acceptance
 are recorded separately above.
+
+### Live failure follow-up: MMC sampling, panel ACK and Broadcom firmware
+
+Evidence is under workspace-root `Work/sc2-live-adaptation-20261021/`.
+These observations used boot ID `611c54ce-56e8-473c-a8b3-9a08e1ce9db1`;
+the box was not rebooted and its removable boot payloads were not replaced.
+`/flash` remained read-only; `/storage` is the existing writable USB ext4
+partition, not RAM. Local firmware overrides therefore persist there.
+
+* **MMC:** stock `meson_mmc_set_ios` at `0xffffffc01097ee08..ee18`
+  clears ADJUST bits 21:16 and sets bit 13 for timing 1 (`MMC_HS`). CE and
+  Khadas agree. The SC2-specific match now enables that zero-delay sampler;
+  AXG fallback and every other timing retain their behavior. Production
+  Image/modules/DTB built successfully, and the extracted production helper
+  passed 139,264 register/timing/transition cases. This is an evidence-backed
+  candidate for the observed CMD6 response CRC failure, **not physical eMMC
+  recovery**. A new-kernel boot must still prove enumeration and read-only
+  card access; keep the existing 3.3V/52MHz/CPUFreq-off restrictions.
+* **Panel:** a controlled native bind returned `ENXIO`. Isolated SMBus/I2C
+  tracing stopped at control address `0x24`, payload `[00]`, before any grid
+  transfer. Probe errors now name the stage/address; transport, timing and
+  ACK enforcement are unchanged. The manual specifies a minimum 1us ACK
+  pulse, not a fixed 1us low or a reason to shorten the native 5us delay.
+  CLK/DAT/ACK waveforms and the actual IC marking remain missing. Do not
+  replace this failure with `I2C_M_IGNORE_NAK` or an unverified protocol.
+* **Wi-Fi:** the owner's same-device Android NVRAM was used only as a local
+  `brcmfmac4339-sdio.hk1,rbox-x4.txt` override. Only its template MAC changed
+  to the observed factory WLAN address; calibration and CN38 stayed intact.
+  Native firmware initialized, IWD recognized `wlan0`, and its scan cache
+  contained 27 BSS across 2.4/5GHz. Neighbor identifiers were not retained.
+  No association, DHCP, traffic, regulatory or suspend acceptance is claimed.
+  This private calibration is **not in Git or the image**; redistribution
+  authority for a board-qualified calibration file is still absent.
+* **Bluetooth:** `bcm4335c0-firmware` pins OpenELEC/wlan-firmware commit
+  `35e36956d7707fc86bbb48ed70ddb6289e2bbafd`, installs the unmodified
+  49,348-byte HCD as `brcm/BCM4335C0.hcd`, and includes its accompanying
+  Broadcom license. HCD SHA-256 is
+  `5538cd96516729f7d35d7eecdedb0d8a0c441f9ce6d27aa873eb95d8adb59603`.
+  Native serdev rebinding loaded that patch on the observed ROM
+  `003.001.009/0x6109`: build 0000 became 0268, HCI revision `0x010c`.
+  The reported address became `43:39:00:00:1F:AC`; this is **not authenticated
+  factory address provisioning**. No scan, pairing, ACL/audio or suspend
+  acceptance is claimed, and no address was derived from the WLAN MAC.
+
+After the wireless reloads, the same boot ID remained, shared 32,768Hz LPO
+still had both Wi-Fi and Bluetooth consumers, Ethernet retained its default
+route, SSH/ConnMan/IWD/BlueZ were active, and the system was `running` with
+no failed units. This does not establish cold-boot radio initialization.
+
