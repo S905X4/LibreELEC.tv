@@ -371,6 +371,66 @@ notified, owner-observed diagnostic boot must capture that path before any
 claim of full candidate recovery; no new image was deployed or rebooted
 as part of this PLL probe.
 
+#### Opt-in early-shell diagnostic after the PLL fix
+
+The owner keeps the 921600-baud TTL console on a different host. Do not
+probe this workstation for it. Notify the owner before a remote reboot;
+the owner must interrupt U-Boot autoboot to select this diagnostic.
+
+The corrected production-config build from Linux `c9c7080efcd2` has been
+wrapped as an uncompressed arm64 uImage with load/entry `0x02000000`, and
+staged with its matching board DTB in `/flash/sc2-diag-c9c7080/`. Only that
+new directory was added: normal KERNEL, SYSTEM, board DTB, s905_autoscript
+and uEnv.ini still match the accepted `c17c620` hashes. `/flash` is again
+read-only and `.update` is empty. The existing storage backup TAR also
+matches SHA-256 `9a762a96e8d7ff7b8abb919d9c45f79b49f7ad2dbd173fd77e882c3537ba0cfe`.
+Staging is verified; no physical diagnostic boot result is claimed here.
+
+| Diagnostic file | Bytes | Whole-file CRC32 |
+| --- | ---: | --- |
+| `sc2-diag-c9c7080/KERNEL` | 25346624 | `2aa4829c` |
+| `sc2-diag-c9c7080/board.dtb` | 21527 | `b5f435cd` |
+
+At the owner-operated U-Boot prompt, run the following in order. Stop at
+any load/FDT error, unexpected byte count or CRC mismatch; do not boot
+stale buffers after an error. Check each CRC before the next load/step.
+These are RAM-only environment changes: do not `saveenv`, run the normal
+autoscript again, or issue MMC/firmware writes.
+
+```text
+usb start
+fatload usb 0:1 0x12000000 sc2-diag-c9c7080/KERNEL
+crc32 0x12000000 0x182c240
+fatload usb 0:1 0x20000000 sc2-diag-c9c7080/board.dtb
+crc32 0x20000000 0x5417
+fdt addr 0x20000000
+fdt resize 0x10000
+setenv bootargs "console=ttyAML0,921600n8 earlycon ignore_loglevel loglevel=8 initcall_debug log_buf_len=4M initcall_blacklist=sc2_cpufreq_init cpufreq.off=1 rdinit=/usr/bin/sh"
+setenv fdt_high ffffffffffffffff
+bootm 0x12000000 - 0x20000000
+```
+
+This requests the embedded early shell, not `/init` or the installed
+SYSTEM. No disk UUIDs, SSH/userland options or `toram` are passed as shell
+arguments. CPUFreq stays disabled; unused-clock and domain cleanup are
+not bypassed to hide the stall. Capture the full log from U-Boot until
+the shell, or through at least 60 seconds after the last output. A job-
+control warning at the `#` prompt is expected. Do not exit the PID1 shell
+or start `/init` before the log has been reviewed. If the boot stalls,
+reset/power-cycle without manually selecting this directory to use the
+unchanged baseline again. This is a recovery path, not an automatic
+failure detector; vendor U-Boot may still save its own environment.
+
+Both uImage CRCs, exact Image payload, DTB length, staging/relocation RAM
+windows and uploaded/readback SHA-256 passed. The exact embedded initramfs
+also reached its real early shell under the existing QEMU transport kernel;
+RAM-only proc/sys mounts and `/proc/cmdline` reads worked without disks or
+SYSTEM. The first harness attempt exposed a missing BusyBox echo applet
+and absent mountpoint directories; its log is retained. Shell `printf`
+plus actual BusyBox mkdir/mount passed without changing the boot payload.
+This does not verify SC2 peripheral initialization or reproduce its stall.
+Commands, hashes and raw logs are indexed by `Work/sc2-diag-boot.json`.
+
 #### One combined hardware acceptance round
 
 Commit the complete source and LE integration before the combined image build.
