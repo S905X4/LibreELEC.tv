@@ -1868,15 +1868,61 @@ attempted read-only copying of the existing ED25519 identity from ext4 to
 RAM; no private key was stored on FAT. The normal selector was backed up
 to `/storage/sc2-pre-ram-root-selector-0741cb34.bin`, SHA-256
 `3b4135c0c43c3dfc7bc8e821c1de2a9e4d79aaca0bbe42b61ac48d0fd6861766`.
-SSH returned but rejected the original host-key pin. Do not accept the
-replacement automatically: RAM mounts, boot identity and current health
-are unverified. No system-suspend command or authentication password was
-sent to the mismatching key. Evidence is in the `ram-*.json` records.
+The first SSH return rejected the original host-key pin; at that point RAM
+mounts and identity were unverified. No authentication password or system
+suspend was sent to that mismatching key. The owner subsequently supplied
+the TTL boot identity and configured key-based login. The authenticated
+continuation below resolves the access and temporary-hook obligations.
+The original `ram-*.json` records preserve the earlier rejected attempts.
 
-The owner must verify boot ID, command line and the ED25519 public-key
-fingerprint through the existing TTL console on the other host. After
-trusted access is restored, restore the normal selector and remove the
-temporary hook before further lifecycle work. Keep USB attached meanwhile.
-The hook's `/dev/disk/by-uuid/` dependency was not established in initramfs;
-the exact identity-handoff failure still requires console/runtime evidence.
+#### RAM-root deep return and post-resume CPU acceptance
+
+Key-based SSH with strict host-key checking authenticates the owner-reported
+boot `b0fb8cd5-814a-4ad9-8bdd-f592e475ca1f`, still build `0741cb343f7b`.
+Its log identifies the failed hook operation: the ext4 UUID symlink could
+not be looked up as a block device in initramfs. The normal selector was
+restored with its recorded SHA-256, and the temporary hook was removed.
+No reboot or new payload deployment was needed.
+
+Actual RAM-root checks, not command-line inference:
+
+- `/dev/SYSTEM` matches the delivered 57724928-byte SYSTEM, SHA-256
+  `2703641b7ec267900064aa461fbd3303c8342a4de3c07d85e08333aa57e9f97e`.
+- The root loop is backed by `/dev/SYSTEM`; storage is tmpfs and swap empty.
+- After unmounting `/flash`, all four observed mount namespaces and process
+  fd/cwd/root/maps scans have no USB-device mounts, open files or mappings.
+  Authenticated SSH and a running system remain available.
+
+One deep `mem` request used a 25-second meson-vrtc alarm with readback and
+the wakeup-count handshake. The suspended interval, boottime minus monotonic
+elapsed time, was 25.270 seconds; kernel suspend counters changed from
+success 0/fail 0 to success 1/fail 0. The same boot returned with four CPUs,
+matching 4 MiB retained-RAM SHA-256, unchanged CPU/DSU clock reports,
+requested/actual PWM waveforms and voltage selectors. The entry state was
+1608/1200 MHz and the 879000 uV selector; this is not a rail measurement.
+Alarm timing is consistent with VRTC wake, but no independent firmware
+wake-reason code was captured.
+
+After return, all thirteen OPPs passed pinned fixed-SHA256 calculation on
+all four CPUs, totaling 416 MiB, with clock/DSU/PWM/selector checks around
+each load. The maximum sample was 57.6 C. Final state is userspace/1608 MHz,
+CPUs 0-3, running, no failed units, taint 0 and an empty wakealarm.
+
+Peripheral recovery is not accepted: xHCI logged USBSTS 0x401 and controller
+reinitialization, followed by a SuperSpeed-device reset; Bluetooth hci0
+timed out on opcode 0x0c01 with -110. Keep these findings for the deferred
+peripheral-lifecycle stage. Do not infer that an active USB root survives
+from this isolated RAM run, or enable s2idle from this result.
+
+The six candidate boot files and restored normal selector were rechecked
+through a temporary read-only flash mount after wake, then flash was
+unmounted again. Remote diagnostic scratch files were removed. This boot
+remains RAM/live: storage changes are volatile; the next normal boot uses
+the persistent storage and its SSH identity. No eMMC writes occurred.
+
+Evidence: `Work/sc2-ram-pm-20261020T215722Z/acceptance-summary.json`,
+`deep-result.json`, `deep-kernel.log`, `after-deep-loaded-opps.json` and
+`after-deep-final-health.json`. One baseline-state deep cycle does not
+close sustained 2004 MHz, physical cold-power, voltage/transient or complete
+peripheral-recovery acceptance. CPU completion remains open.
 
