@@ -1567,3 +1567,61 @@ reset failure, repeated initialization and G12A/PCIe ownership. Analog
 I/O is stubbed in this temporary host exercise, not physical USB3 proof.
 The record is `Work/sc2-peripheral-followup-20261020T184813Z/`.
 
+### Peripheral candidate 9acbb9a: standard update and optical PCM
+
+`LibreELEC-SC2.aarch64-12.2-devel-20261021025953-9acbb9a` includes native
+Linux `e385f754bb85` through patch 0047. The standard image build applied
+the patch and recompiled the PHY; the integrated PHY source matches the
+native tree byte for byte. Delivery files are under `target/`:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `.img.gz` | `d922b5bfef4309c2d428db56ed90a900f62401b7505148a0b082096645265ce1` |
+| `.tar` | `dd11579d63b141945c9bcd2860307a735b06c575fbfc5ba090c9e8ee1d37c9d3` |
+
+Both delivery SHA-256 sidecars, image gzip integrity, TAR KERNEL/SYSTEM
+payload identity and package MD5, and uImage header/data CRC passed.
+Load/entry remain `0x02000000`, below the existing kernel-size bound.
+The local checkpatch result still has two commit-metadata errors:
+Gerrit Change-Id and missing Signed-off-by. This is not an upstream-ready
+submission claim.
+
+Before deployment, the eight current boot files were backed up on both
+host and box; backup SHA-256 is
+`6dab20375fb637b7ea0edb4171f471effb3f96ee200f42ee8a8da84f49444ff4`.
+The standard `.update` path returned pinned-key SSH with boot ID
+`d01e2e9e-775e-43e0-bc29-7c6bc1b2d439`. Installed KERNEL/SYSTEM match
+the candidate, `.update` is empty, loop0 uses `/flash/SYSTEM`, and
+`uEnv.ini`/`uEnv.live.ini` retain their pre-update bytes and CPUFreq hold.
+`/flash` is read-only USB vfat; `/storage` is persistent USB ext4.
+No eMMC or bootloader-environment write operation was issued; this is
+not an observation of every vendor U-Boot operation. Host UART was
+unavailable for this reboot, so the runtime evidence is SSH/journal.
+
+The upstream updater checks MD5 files inside the update package but does
+not replace `/flash/KERNEL.md5` or `/flash/SYSTEM.md5`. Those installed
+sidecars remain historical and do not match the new payloads. They were
+retained unchanged, not used as installed-payload authority; package MD5
+and independently computed installed SHA-256 are recorded separately.
+
+| Peripheral | Observed result and remaining acceptance |
+| --- | --- |
+| USB2 | Boot storage enumerates at 480 Mb/s; new KERNEL/SYSTEM hashes read back correctly. |
+| USB3 | 5000 Mb/s root hub only; no external SuperSpeed endpoint or integrity transfer. Enabled CCF PCIe PLL nodes report rate 0, not measured PLL lock/frequency. Do not infer working SuperSpeed or invent tuning/supplies. |
+| Ethernet | Carrier up, 1000 Mb/s, full duplex; authenticated SSH returns. |
+| Native TF | `fe08a000/mmc0` registered, no card present. Insertion, detection, transfer and removal remain untested. Stock vendor `get_cd` inverts the GPIO result; its GPIO flag cannot be copied without that driver context. |
+| IR / status LED | NEC map and input registered; status LED reports brightness 1. Handset events, wake and visible LED lifecycle remain unverified. |
+| Front display | First control write at `0x24` still returns ENXIO; active `hk1-panel` is not display acceptance. IC marking, supply and CLK/DAT/ACK waveform remain prerequisites. |
+| Optical S/PDIF | Real four-second, approximately -40 dBFS, hardware S16_LE/stereo/48 kHz playback exits 0; DMA pointers advance 23936 → 51072 → 78080. All changed mixer controls restore, PCM closes, output clocks release and temporary WAV is removed. Receiver lock, audible output and L/R assignment remain unverified. |
+| HDMI / analog audio | No new sink/audio/TCL acceptance. Analog links remain disabled pending actual AVDD and differential-output/jack wiring evidence. |
+
+Final system state is `running`, no failed units, taint 0. This does **not**
+mean an error-free kernel log: retained errors include the panel NACK,
+RME version, duplicate VPU debugfs entries, disabled CPUFreq registration,
+SDIO discovery timeout and missing Mali regulator. No cold-power, new
+GPU rendering or radio RF/pairing acceptance is claimed.
+Evidence is `Work/sc2-peripheral-followup-20261020T184813Z/`, particularly
+`physical-update.json`, `candidate-artifacts.json`, `final-health.json`,
+`after-update-kernel.log` and `after-update-spdif-smoke.json`. Temporary
+host callback harnesses are removed; their identities and results remain.
+
