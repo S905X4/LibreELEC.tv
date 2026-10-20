@@ -17,6 +17,28 @@ This project is for Amlogic SoC devices
 
 ## SC2 / HK1 RBOX X4 minimal bring-up
 
+The project sequence is CPU/board foundations, safe internal eMMC deployment,
+then complete board/peripheral acceptance, followed by decoding and the full
+player, multi-vendor TV compatibility, and finally a LibreELEC device-support
+PR. Preserve unfinished items across sessions; an investigation or a driver
+fix is not hardware acceptance. The workspace `skill.md` sections 1.1/1.2
+hold the persistent phase gates and acceptance ledger.
+
+Current CPUFreq remains disabled. This SC2 build has no internal installer:
+its two-partition removable image must not be written over the factory eMMC.
+Factory Android logs describe 29 private-layout partitions, including a
+user-area bootloader at offset zero; the current native kernel enumerates
+the eMMC but no partitions. Internal payload placement, partition access,
+firmware/environment preservation, backup, boot, update and recovery still
+need implementation and physical acceptance. Independent TF/USB3 media can
+be tested without installing internally, but never remove the active root
+medium; internal deployment is the owner's current priority.
+
+The owner reports red and blue status LEDs, blue currently lit, a blank
+front display, untested IR, available TF/USB3 test devices, and no optical
+S/PDIF receiver path. Retain these acceptance limits rather than repeating
+receiver tests without the equipment or claiming all peripherals work.
+
 Build from the LibreELEC root as a non-root user with the normal LE host
 dependencies and GCC 12 available on `PATH`:
 
@@ -819,8 +841,9 @@ panel, actual IR keys, WiFi scanning and Bluetooth input in the same session.
 Record receiver-visible/audio results separately from counters and registration.
 Exercise actual Panfrost rendering with the installed kmscube/glmark2 DRM/GBM
 tools, verify the reported renderer is Mali rather than a software fallback,
-and observe displayed output. TCL direct cold-boot picture persistence is a
-separate physical scenario; CEC registration alone does not prove it.
+and observe displayed output. Multi-vendor TV testing, including TCL direct
+cold-boot picture persistence, starts only after hardware, decoding and full
+player acceptance; CEC registration alone does not prove compatibility.
 
 The SC2-only early udev policy sets force_ro=1 for eMMC user/boot/GP disks by
 MMC ancestor type, never by mmcblk numbering alone. Before inventory, settle
