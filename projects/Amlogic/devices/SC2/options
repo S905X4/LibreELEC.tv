@@ -52,6 +52,6 @@ OEM_SUPPORT="no"
 SFTP_SERVER="yes"
 
 # Native kernel modules and a small firmware set; no AMLGX out-of-tree drivers.
-FIRMWARE="kernel-firmware"
+FIRMWARE="kernel-firmware bcm4335c0-firmware"
 ADDITIONAL_DRIVERS=""
 ADDITIONAL_PACKAGES="dtc ethtool pciutils usbutils strace memtester nano v4l-utils alsa-utils libdrm kmscube glmark2 hk1-panel"

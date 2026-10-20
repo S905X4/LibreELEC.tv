@@ -4,7 +4,7 @@ brcm/brcmfmac4339-sdio.bin
 # with established redistribution rights is available; do not use another board's
 # calibration or import the investigation-only Android nvram_ap6335.txt.
 # No external CLM is selected: the stock external path was explicitly ignored.
-# Broadcom H4 Bluetooth patch selection awaits exact ROM identity and a licensed
-# matching HCD source; do not alias the Android bcm4339a0.hcd or global BCM.hcd.
+# Bluetooth ROM 003.001.009/0x6109 requests BCM4335C0.hcd, supplied with its
+# Broadcom license by bcm4335c0-firmware; no Android or global BCM.hcd alias.
 # USB Ethernet fallback firmware (upstream r8152 module).
 rtl_nic/rtl8153a-3.fw
