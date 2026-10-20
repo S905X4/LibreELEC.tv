@@ -116,6 +116,8 @@ Use the corresponding existing filename, in order:
 32. `0032-meson-sc2-inverted-pwm-roundtrip.patch`
 33. `0033-hk1-rbox-x4-rc-map-binding.patch`
 34. `0034-meson-sc2-inverted-duty-rounding.patch`
+35. `0035-meson-sc2-secure-pll-output.patch`
+36. `0036-meson-sc2-sdio-functional-clock.patch`
 
 `Work/sc2-kernel-series.json` records the initial five exports;
 `Work/sc2-peripheral-verification.json` records the later source commits,
@@ -125,6 +127,41 @@ with the corresponding recorded values. Copy each complete generated file to
 `LibreELEC.tv/projects/Amlogic/devices/SC2/patches/linux/`; do not hand-edit its
 diff or regenerate it from a donor branch. Git may normalize diff context and
 hunk layout when exporting; the applied source payload must stay unchanged.
+
+#### Stock-guided SDIO functional clock correction
+
+Offline REA disassembly of stock Linux 5.4.125 confirms that the controller's
+local divider consumes the external functional gate (`mux1`), while the
+external mux (`mux0`) selects XTAL for identification. The stock Image SHA-256
+is `8917da481e7db4cd172b85006f6a3496cf9f0a2787d334ecf4e9c129849db52d`.
+Recovered kallsyms supply address labels, not original source or DWARF.
+The exact-byte analysis carrier and mapping are in `Work/sc2-stock-native/`;
+the principal REA observation is
+`ev_175d9f627e236c6c415bd4a00f74998f46e191ef2aa1f519eb463811a7b31228`.
+
+Patch 0036 connects SDIO A's `clkin0` to `CLKID_SD_EMMC_A_CLK`, rather than
+direct XTAL, and assigns its external mux to XTAL and its functional clock
+to 24 MHz. This makes CCF own the functional gate and removes dependence on
+its inherited mux/divider settings. CE, Khadas and hkallweit model the same
+chain. No private rescan suppression, PWM alternation API, raw register clear,
+async-policy change, voltage change or capability increase is imported.
+The downstream raw resource `0xfe000164` is not silently equated with the
+clock provider's SD_EMMC control register at `0xfe00016c`.
+
+The production-config DTB builds. Actual `fdtget` reads distinguish the old
+direct-XTAL contract from the corrected functional-clock contract, verify
+24 MHz defaults, and retain B/C clocks plus A's reset, IRQ and board policy.
+Complete DTB schema validation returns zero with no diagnostics, using the
+existing complete repository/core schema cache because bindings are unchanged.
+All 36 exported kernel patches also replay in order against their exact pinned
+upstream preimages in an isolated temporary repository; all 86 touched result
+files match the development kernel byte-for-byte. Replay records are in
+`Work/sc2-stock-native/series-replay.json`; temporary preimages were removed.
+The resulting 21,595-byte DTB SHA-256 is
+`3faeb4823fbee9d861024aeecb158a8e6a1d47a4b50e61c80f7e2e6dedb76f25`.
+These are compiled-DT checks, not an SC2 boot or measured gate/LPO waveform.
+The independent pre-userspace stall remains unverified; no new complete image
+was built, installed or booted, and the owner-operated diagnostic hold remains.
 
 ### Consolidated peripheral candidate
 
