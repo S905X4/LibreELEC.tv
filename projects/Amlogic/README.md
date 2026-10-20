@@ -1464,3 +1464,23 @@ still had both Wi-Fi and Bluetooth consumers, Ethernet retained its default
 route, SSH/ConnMan/IWD/BlueZ were active, and the system was `running` with
 no failed units. This does not establish cold-boot radio initialization.
 
+The standard `make image` build completed for
+`LibreELEC-SC2.aarch64-12.2-devel-20261021021053-c58b4ca` (build commit
+`c58b4ca2e064`, Linux `3e214359327e`). Artifacts are under `target/`:
+
+| Artifact | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `.img.gz` | 68,684,914 | `2f8e276c9d3906c9af18f3d2da7dde6953a36e0ee6779b335435013f8bf9ff2b` |
+| `.tar` | 83,681,280 | `eca0d6527313ce063ad435a9ffc18c8a70bdc2abdd94ae89aad2bc629772ce60` |
+
+`artifact-verification.json` records image/TAR payload equality, uImage
+header/payload CRCs, complete shipped-DTB schema validation, the three SC2
+MMC matches and unchanged CPUFreq-off boot arguments. The four changed
+kernel/binding files in LE's actual applied build tree match `linux/`.
+The shipped HCD and license exactly match the public source bytes used in
+the physical Bluetooth load; private calibration and global `BCM.hcd` are
+absent. This candidate was not uploaded or booted on the box, and no new
+QEMU acceptance is claimed. Unsuppressed checkpatch reports four local
+Change-Id/missing-sign-off errors and one binding-split warning; the series
+is not an upstream-ready submission.
+
