@@ -18,7 +18,7 @@ initialization and the userspace prompt, on the owner's other host at 921600
 8N1 (console=ttyAML0,921600n8). Preserve every controller's first IRQ error
 block and surrounding command/ios messages, exact KERNEL/DTB/SYSTEM identity,
 cmdline and boot selection. Do not reboot just to run this collector. Keep
-CPUFreq disabled, existing 3.3V declarations and <=52MHz eMMC; do not mount or
+the kernel's default CPUFreq policy, existing 3.3V declarations and <=52MHz eMMC; do not mount or
 write eMMC, enable HS200/HS400, or poke registers. A first probe timeout can be
 expected during protocol discovery: the first-error block alone is not a root
 cause. If enumeration still fails, retain the entire log, not just that block.

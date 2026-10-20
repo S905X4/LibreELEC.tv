@@ -8,8 +8,10 @@ SRCDIR="${SYSTEM_ROOT}/usr/share/bootloader"
 mount -o remount,rw "${BOOT_ROOT}"
 cp -p "${SRCDIR}/meson-sc2-hk1-rbox-x4.dtb" "${BOOT_ROOT}/amlogic/"
 cp -p "${SRCDIR}/s905_autoscript" "${BOOT_ROOT}/"
-# Preserve the boot-acceptance hold until complete DVFS is separately authorized.
-sed -i -E 's/console=ttyAML0,115200n8/console=ttyAML0,921600n8/g; s/(^|[[:space:]])cpufreq\.off=[^[:space:]]+//g; s/$/ cpufreq.off=1/' \
+# Remove the old generated CPUFreq hold instead of carrying it into updates.
+# Regenerate live from the migrated normal entry so neither retains off=1;
+# leave UUIDs and kernel governor policy unchanged.
+sed -i -E 's/console=ttyAML0,115200n8/console=ttyAML0,921600n8/g; s/(^|[[:space:]])cpufreq\.off=[^[:space:]]+//g' \
   "${BOOT_ROOT}/uEnv.ini"
 # A separate live entry frees the card without changing normal storage UUIDs.
 sed -E 's/(^|[[:space:]])disk=[^[:space:]]+//g; s/$/ toram live/' \
