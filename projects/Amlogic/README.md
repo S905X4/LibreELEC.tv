@@ -527,6 +527,82 @@ and all five files read back byte-identically. `dumpimage` accepts the uImage;
 RAM-window checks pass. The temporary FAT image was removed; no physical
 media was opened. Evidence: `Work/sc2-test-0e17edd-package.json`.
 
+#### Accepted normal userspace and explicit MMC voltage capabilities
+
+The owner's complete UART transcript confirms that `sc2-userspace-0e17edd`
+reached native `/init`, systemd and authenticated 921600-baud serial login:
+system state `running`, no failed units, Ethernet `10.0.0.151/24`, read-only
+USB `/flash` and tmpfs `/storage`. This supersedes that package's historical
+physical-boot-pending status; it is not a repeated assistant boot. Subsequent
+authenticated, read-only SSH matched the KERNEL, DTB and `/dev/SYSTEM`
+SHA-256 values to the package. CPUFreq remains explicitly disabled. Evidence:
+`Work/sc2-userspace-0e17edd-owner-observation.json` and
+`Work/sc2-userspace-live-readonly.log`.
+
+That boot still rejected eMMC and Wi-Fi SDIO with `no support for card's
+volts` / `-22`. The runtime DT has no MMC supply or voltage declarations.
+The mainline Meson host obtained no regulator-derived OCR mask and supplied
+no alternative, so `mmc_select_voltage()` rejected the responding cards.
+The CE 5.4.210 reference driver instead initializes `ocr_avail = 0x200080`;
+this source is not evidence of a measured rail or of the stock 5.4.125
+binary's exact implementation.
+
+Linux commits `fb49ce891214`, `0049fc975bbd` and `b5a3ca554b71`, exported as
+SC2 patches 0037--0039, describe and parse the existing `voltage-ranges`
+convention only when no regulator-derived OCR mask exists. The three board
+hosts explicitly declare nominal 3300 mV card-power capability. Standard
+conversion includes both boundary bins, producing `0x00300000`, not the
+reference driver's mask; no 1.8 V capability is advertised. This does not
+create a regulator, guess a GPIO, control bus IO voltage, increase existing
+50/50/52 MHz limits or enable HS200/HS400. Physical supply voltage remains
+unmeasured. Existing regulator-backed boards retain precedence, and boards
+without either declaration retain their previous behavior.
+
+The manual candidate is `Work/sc2-mmc-voltage/sc2-mmc-b5a3ca5.zip`,
+78,101,478 bytes, SHA-256
+`d02ee260d6f5dcfe2d90525969089c759c0183befc208671516efbb7e8595c3a`.
+It contains an independent `sc2-mmc-b5a3ca5/` directory with KERNEL, board.dtb,
+the unchanged previously authenticated SYSTEM, checksums and Chinese
+operation/rollback instructions. It is not a complete disk image or update
+TAR. With the box properly powered off, copy that whole directory to the
+original USB FAT root without changing its defaults or formatting it.
+At the next owner-operated U-Boot session, execute its `BOOT.txt` line by
+line. KERNEL must load 25,346,624 bytes (`0x182c240`), CRC32 `8beb121a`;
+the DTB must load 21,670 bytes (`0x54a6`), CRC32 `e22e55b0`. Stop on any
+mismatch; do not reuse the old DTB length or either old CRC.
+
+The commands preserve the original USB boot UUID `1910-5516`, UART 921600,
+normal `/init`, `toram live`, `nofsck`, CPUFreq hold and full three-argument
+`bootm`. No extra TF insertion, cable reconnection or peripheral action is
+required. Capture UART from `bootm` through login; check eMMC block-device
+and SDIO-function enumeration and preserve any subsequent timeout, tuning,
+CRC or firmware error. Do not mount, format, write or stress-test internal
+eMMC. Enumeration does not prove Wi-Fi association, storage writes or DVFS.
+Do not run `saveenv`, an installer or `.update`; vendor automatic STORAGE
+environment saves remain outside a whole-boot zero-write guarantee.
+The candidate has not been uploaded or physically booted. No default
+boot file, physical media or running MMC state was changed, and no reboot
+was requested by the assistant. Not selecting the directory retains the
+accepted default boot files.
+
+Production `Image dtbs modules` compilation, binding validation and full
+DT schema validation passed. A throwaway C smoke executed the actual
+production voltage conversion with values from the delivered DTB, including
+boundary/invalid ranges and card-OCR intersection. All 66 shipped modules'
+4,084 imported symbol CRCs match the new kernel. The initramfs has the same
+54 paths, contents, modes, owners and link counts; 30 regenerated mtimes
+change its compressed bytes. The exported three-patch series was actually
+applied to its pre-series source and reproduced all three production files.
+uImage header/data CRCs, exact Image payload and RAM windows passed; the
+actual ZIP was extracted, copied through a private FAT image and all six
+files read back byte-identically. That image was removed; no physical USB
+was opened. This is host proof, not HK1 MMC acceptance. Strict checkpatch
+reports six local-policy conflicts: three required Change-Id trailers and
+three intentionally absent Signed-off-by trailers; no warnings or checks.
+The series is not upstream-submission-ready. Evidence:
+`Work/sc2-mmc-voltage/verification.json`.
+
+
 
 #### One combined hardware acceptance round
 
