@@ -162,6 +162,7 @@ Use the corresponding existing filename, in order:
 52. `0052-meson-sc2-cpu-idle-state.patch`
 53. `0053-meson-sc2-firmware-wake-timer.patch`
 54. `0054-arm64-sc2-suspend-hash-affinity.patch`
+55. `0055-fd6551-write-without-ack.patch`
 
 `Work/sc2-kernel-series.json` records the initial five exports;
 `Work/sc2-peripheral-verification.json` records the later source commits,
@@ -2020,6 +2021,112 @@ timeout or proof that CPU thermal policy is broken.
 Evidence: `Work/sc2-emmc-20261020T221512Z/production-image-smoke.json`,
 `production-external-deployment-completed.json`,
 `production-default-boot-health.json`, `production-selector-restored.json`
-and `current-disposition.json` in the same directory. Physical IR input
-acceptance remains pending the owner-operated capture window.
+and `current-disposition.json` in the same directory. The subsequent IR
+acceptance uses the owner's explicitly narrowed RAW-reception scope below.
+
+#### Owner-accepted RAW infrared reception
+
+The owner used a non-original remote and explicitly accepts physical RAW
+reception only. The meson-ir/LIRC MODE2 capture contains 2,091 records:
+1,017 pulses, 1,040 spaces and 34 timeout markers, totaling 8,364 bytes.
+The raw file was copied and SHA-256 checked at both ends:
+`2e1ace9b206b202df4192eba6f822929ff8f34632d0194c0781d080139248cbb`.
+There were no NEC decoded scancodes or evdev key events; neither remote
+protocol nor stock key mapping, repeat/release, power or wake behavior is
+claimed passed. No guessed mapping changes were made. The capture exited
+successfully and released its exclusive IR input grab. FD6551 is next.
+
+Evidence: `Work/sc2-ir-20261020T224014Z/acceptance-summary.json`,
+`owner-accepted-raw-result.json`, `events.jsonl` and `raw-mode2.bin`.
+
+#### FD6551 timing and address-drive diagnostics
+
+The exact-model OpenVFD profile selects FD6551 and grid order `0,4,3,2,1`.
+The native linedisp/LED driver does not consume OpenVFD configuration files.
+A single-property DTB trial increased the panel delay from 5 to 25 us; the
+native probe still failed at its first control address, `0x24`, with ENXIO.
+The unproven timing change was not retained.
+
+An exclusive GPIOA_14/DAT and GPIOA_15/CLK observer then transmitted only
+the `0x48` address byte, with no display payload. Three drive variants were
+observed: both lines open-drain, driven CLK with open-drain DAT, and driven
+CLK/address bits with DAT explicitly released throughout ACK. None of the
+57, 58 and 55 respective input-register samples observed DAT low while CLK
+was high during the approximately 25 us ACK windows. The last variant's
+eight address-bit input readings match `0x48`.
+
+These are SoC digital samples, not board-side voltage or waveform captures.
+Power, physical continuity and nonconforming ACK behavior remain unresolved;
+characters, indicators and brightness have not passed. Stock/OpenVFD code
+omits ACK checking and the donor driver uses `I2C_M_IGNORE_NAK`, but those
+implementations do not establish physical ACK. No ignore-NAK workaround was
+installed. A separate factory-protocol display trial without ACK checking
+requires an explicit owner decision and would not count as ACK acceptance.
+
+The original DTB was restored and soft-rebooted successfully. Runtime delay
+is again 5 us; schedutil, four online CPUs, running state, zero failed units,
+taint 0, read-only flash and read-only unmounted eMMC were preserved. The
+temporary observer was removed and the native GPIO parent owns both lines.
+
+Evidence: `Work/sc2-panel-20261020T225011Z/current-disposition.json`,
+`timing-trial-result.json`, `ack-observer-result.json`,
+`ack-factory-observer-result.json` and `production-restored-health.json`.
+
+#### CE 21 driver-chain comparison and bounded display trial
+
+The owner requested further comparison with CE's working VFD support.
+CE 21 tree `15970b8e469b8e299a8947b1751593bdaf53ed82` builds an external
+OpenVFD module from `arthur-liberman/linux_openvfd` commit
+`3118dda3aeb5b2f02b0ac0b5d30cbef58947a805`, not this native linedisp driver.
+Its `openvfd-start` sources `/storage/.config/vfd.conf`, passes the pin,
+layout and controller parameters to `modprobe openvfd`, and starts
+`OpenVFDService`. The exact-model profile's controller 6 selects FD6551.
+
+That fixed module's FD6551 path initializes software I2C with clock-stretch
+support disabled. Its ACK routine consequently does not sample DAT and
+does not stop payload transmission on NACK. High GPIO levels are released
+to input for the profile's zero flags. Therefore missing ACK alone cannot
+establish a physical fault or justify ending software compatibility work.
+These are inspected CE sources, not a claim that CE was booted in this trial.
+
+A separately authored, temporary emitter reproduced the protocol facts
+without copying the GPLv3 module into the GPL-2.0-only native driver. Seven
+fixed frames set icons clear, digits `1234` and middle brightness. All 14
+bytes matched their SoC input-register readback; all 14 ACK-slot samples
+had CLK and DAT high. Transmission continued as CE does. The owner then
+confirmed the physical panel displayed `1234`; this is not inferred from
+process success. Icon mapping, brightness steps and native-driver operation
+were not accepted by that observation.
+
+The emitter completed and released its GPIO handles. To preserve the
+latched pattern until the native candidate boots, the panel GPIO parent
+remains temporarily unbound and `hk1-panel.service` is stopped. No observer
+process remains. The existing boot image and DTB are unchanged; the system
+remains running with schedutil, taint 0 and read-only eMMC. Restore details
+and the previous service state are in `pattern-result.json`. HDMI/Kodi has
+not been advanced.
+
+Sources: [CE module package](https://github.com/CoreELEC/CoreELEC/blob/15970b8e469b8e299a8947b1751593bdaf53ed82/projects/Amlogic-ce/packages/linux-drivers/openvfd-driver/package.mk),
+[CE startup](https://github.com/CoreELEC/CoreELEC/blob/15970b8e469b8e299a8947b1751593bdaf53ed82/projects/Amlogic-ce/packages/linux-drivers/openvfd-driver/scripts/openvfd-start),
+[fixed FD controller](https://github.com/arthur-liberman/linux_openvfd/blob/3118dda3aeb5b2f02b0ac0b5d30cbef58947a805/driver/controllers/fd650.c),
+[fixed software bus](https://github.com/arthur-liberman/linux_openvfd/blob/3118dda3aeb5b2f02b0ac0b5d30cbef58947a805/driver/protocols/i2c_sw.c).
+
+Evidence: `Work/sc2-panel-20261020T225011Z/ce-vfd/` contains
+`ce-driver-comparison.json`, `pattern-build.json`, `pattern-result.json`
+and `after-pattern-health.json`.
+
+#### Native FD6551 no-ACK write integration
+
+Linux `2965edc26bb9` is exported as patch 0055. The control and all grid
+writes use raw `i2c_transfer()` with `I2C_M_IGNORE_NAK`; probe requires
+`I2C_FUNC_I2C | I2C_FUNC_PROTOCOL_MANGLING`. This sends complete payloads to
+the panel that the owner observed working without ACK. Adapter-reported
+errors remain errors and incomplete message transfers return `-EIO`.
+There is no GPIO-level ACK fabrication, OpenVFD module, Android service or
+second configuration ABI. Native linedisp and LED classes remain the sole
+userspace interfaces; the existing `hk1-panel` clock policy is unchanged.
+
+The changed AArch64 driver object compiled successfully. This alone does
+not establish native probe, visible characters, icon layout, brightness or
+automatic-clock acceptance; those require the new image and physical panel.
 
