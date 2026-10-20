@@ -1833,11 +1833,50 @@ previous accepted active-DVFS directory. Physical checks on this boot:
   70 C stop condition. The highest sampled temperature was 67.5 C. This
   is not indefinite peak-frequency stress or thermal-equilibrium acceptance.
 
-The final state is userspace/1608 MHz, CPUs 0-3 online, system running,
-no failed units, taint 0, `/flash` read-only and USB ext4 `/storage`.
+The last authenticated normal-boot state was userspace/1608 MHz, CPUs 0-3
+online, system running, no failed units, taint 0, read-only `/flash` and USB
+ext4 `/storage`. The RAM-root attempt below has not been authenticated.
 No eMMC writes, whole-system suspend or cold-power test occurred. RTC0 and
 wakealarm registration do not prove firmware alarm delivery. Keep the
 whole-system retention, independent-root/wake prerequisites and electrical
 voltage/transient acceptance open. Evidence is in the `hash-*` records under
 `Work/sc2-cpu-completion-20261020T193047Z/`.
+
+#### Peak-load stop and RAM-root identity boundary
+
+A requested ten-minute, four-core pinned fixed-SHA256 run at 2004 MHz
+stopped at the 85 C guard after 89.593 seconds: CPU 83.2 C, DDR 85.1 C.
+Sampled CPU/DSU rates remained 2004/1500 MHz with the 1019000 uV selector
+and expected PWM state. This does not pass sustained peak-frequency or
+complete computation acceptance: no successful worker totals were returned.
+After termination, 1608/1200 MHz and the 879000 uV selector were restored;
+authenticated health remained running, all four CPUs online, no failed units
+and taint 0. Thermal trips were not changed; do not repeat the same stress
+without resolving its cooling/continuous-power acceptance conditions.
+See `hash-board-peak-load.json` and `after-peak-health.json`.
+
+Source comparison establishes the same native/vendor deep PSCI entry and
+VRTC MMIO countdown protocol, not actual firmware retention or alarm wake.
+No mandatory missing deep handshake or unconditional CPU/DSU/PWM recovery
+defect was established. Cached clock/regulator requests are not evidence
+that firmware preserved the hardware. Native s2idle remains distinct and
+lacks the vendor AO freeze exchange; it was not attempted.
+
+Following advance notification, the same payload was selected with
+`toram live` to isolate USB-root risk. A temporary `/flash/post-sysroot.sh`
+attempted read-only copying of the existing ED25519 identity from ext4 to
+RAM; no private key was stored on FAT. The normal selector was backed up
+to `/storage/sc2-pre-ram-root-selector-0741cb34.bin`, SHA-256
+`3b4135c0c43c3dfc7bc8e821c1de2a9e4d79aaca0bbe42b61ac48d0fd6861766`.
+SSH returned but rejected the original host-key pin. Do not accept the
+replacement automatically: RAM mounts, boot identity and current health
+are unverified. No system-suspend command or authentication password was
+sent to the mismatching key. Evidence is in the `ram-*.json` records.
+
+The owner must verify boot ID, command line and the ED25519 public-key
+fingerprint through the existing TTL console on the other host. After
+trusted access is restored, restore the normal selector and remove the
+temporary hook before further lifecycle work. Keep USB attached meanwhile.
+The hook's `/dev/disk/by-uuid/` dependency was not established in initramfs;
+the exact identity-handoff failure still requires console/runtime evidence.
 
