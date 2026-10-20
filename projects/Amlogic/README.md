@@ -468,6 +468,66 @@ plus actual BusyBox mkdir/mount passed without changing the boot payload.
 This does not verify SC2 peripheral initialization or reproduce its stall.
 Commands, hashes and raw logs are indexed by `Work/sc2-diag-boot.json`.
 
+#### Copyable USB test for the SDIO clock correction
+
+`Work/sc2-test-0e17edd.zip` is a 10,456,378-byte manual boot package, not a
+complete image or standard update TAR. Its SHA-256 is
+`1307416909b2f5ae172d4446bc4a6253e1f45c971373aed9afe95315f6d79f79`.
+It contains the existing verified `c9c7080` diagnostic KERNEL and the corrected
+`0e17edd` board DTB, plus `README.txt`, `BOOT.txt` and `SHA256SUMS`. The only
+kernel source change between those commits is the DT source; the uImage's
+payload is byte-identical to the already-built production-config Image.
+Do not interpret its unchanged kernel name as an old DTB or a fresh image build.
+
+With the box powered off, copy the complete `sc2-test-0e17edd` directory from
+the ZIP to the existing USB FAT boot partition root, alongside the normal
+KERNEL and SYSTEM. Do not format the disk or overwrite the root KERNEL,
+SYSTEM, board DTB, uEnv.ini, s905_autoscript or old diagnostic directory.
+This package has only been prepared on the host; it has not been uploaded
+to the box. Safely eject the USB, reconnect it, record the existing 921600
+UART on the owner's other host and interrupt autoboot with space.
+
+Run the package's `BOOT.txt` one line at a time at the U-Boot prompt, stopping
+on any error or mismatch. It uses the previously established `usb 0:1`:
+
+```text
+usb start
+fatload usb 0:1 0x12000000 sc2-test-0e17edd/KERNEL
+crc32 0x12000000 0x182c240
+fatload usb 0:1 0x20000000 sc2-test-0e17edd/board.dtb
+crc32 0x20000000 0x545b
+fdt addr 0x20000000
+fdt print /soc/mmc@fe088000 clocks
+fdt print /soc/mmc@fe088000 assigned-clock-rates
+fdt resize 0x10000
+setenv bootargs "console=ttyAML0,921600n8 earlycon ignore_loglevel loglevel=8 initcall_debug log_buf_len=4M initcall_blacklist=sc2_cpufreq_init cpufreq.off=1 rdinit=/usr/bin/sh async.dyndbg=+pmt dd.dyndbg=+pmt meson_gx_mmc.dyndbg=+pmt mmc_core.dyndbg=+pmt"
+setenv fdt_high ffffffffffffffff
+bootm 0x12000000 - 0x20000000
+```
+
+KERNEL must load 25,346,624 bytes and report CRC32 `2aa4829c`. The new DTB
+must load 21,595 bytes and report CRC32 `f9458ddc`; the old `0x5417` DTB
+length/CRC must not be reused. Verify CRC before modifying FDT in RAM.
+The clocks cells are `3 111 3 dc 3 5` in hex, and assigned rates are
+`0 016e3600` in hex (`0 24000000` decimal). Do not manually save the
+environment, run an installer, issue MMC writes or use the `.update` path.
+Automatic vendor U-Boot environment writes remain outside this guarantee.
+
+The requested result is the serial early-shell `#` prompt, not HDMI output,
+SSH or a normal LibreELEC login. CPUFreq stays off. Do not exit PID1 or run
+`/init`; send the complete UART log first. If it stalls, retain at least
+60 seconds after the last output. BREAK/SysRq is not required: the command
+enables the previously exercised automatic async/driver/MMC debug selectors.
+Power-cycle without selecting this directory to use the untouched defaults;
+this is a recovery path, not an automatic rollback monitor.
+
+The real ZIP was extracted, copied by mtools to a disposable 64 MiB FAT image,
+and all five files read back byte-identically. `dumpimage` accepts the uImage;
+`fdtget` reads the corrected clock contract. Header/data CRC, DTB length and
+RAM-window checks pass. The temporary FAT image was removed; no physical
+media was opened. Evidence: `Work/sc2-test-0e17edd-package.json`.
+
+
 #### One combined hardware acceptance round
 
 Commit the complete source and LE integration before the combined image build.
