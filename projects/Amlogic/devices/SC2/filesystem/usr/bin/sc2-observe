@@ -1,0 +1,245 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Passive observations only; stdout is the report. No mounts or hardware writes.
+
+usage()
+{
+	cat <<'EOF'
+Usage: sc2-observe [--root DIR] [--proc-root DIR] [--sys-root DIR]
+                   [--dev-root DIR] [--etc-root DIR] [--help]
+Reads existing interfaces only; never mounts debugfs or changes hardware state.
+Any fixture-root option disables ALL live tool queries (including dmesg).
+Missing, unreadable or failed observations are UNAVAILABLE, never a pass.
+Redirect stdout to an owner-selected location if a saved report is wanted.
+
+Owner UART requirement: capture the complete next explicitly authorized native
+Linux cold boot, starting before power-on/U-Boot and continuing through MMC
+initialization and the userspace prompt, on the owner's other host at 921600
+8N1 (console=ttyAML0,921600n8). Preserve every controller's first IRQ error
+block and surrounding command/ios messages, exact KERNEL/DTB/SYSTEM identity,
+cmdline and boot selection. Do not reboot just to run this collector. Keep
+CPUFreq disabled, existing 3.3V declarations and <=52MHz eMMC; do not mount or
+write eMMC, enable HS200/HS400, or poke registers. A first probe timeout can be
+expected during protocol discovery: the first-error block alone is not a root
+cause. If enumeration still fails, retain the entire log, not just that block.
+
+Manual TCL cold-boot observation (owner-operated, not an automated TV test):
+Use a direct TCL connection, record TV model/firmware, HDMI port/cable, other
+CEC devices and exact bootloader/kernel/DTB/userspace identities. Before each
+separately authorized complete power-off cold boot, record TV picture settings.
+Keep the chain and video mode fixed; note MBOX/OSD-name changes, flashes and
+the stage at which settings change. Compare actual Android/CE/LE CEC device
+type, logical/physical addresses, name, vendor ID and video/HDR state. Change
+one variable at a time (type before name), repeat each case, and record the
+TV's actual retained values after boot. UART timing and owner observations are
+required; kernel state, a restart of Kodi or a matching name is not a pass.
+This collector neither sends CEC messages nor measures HPD, HDMI +5V or pixels.
+EOF
+}
+
+proc=/proc
+sys=/sys
+dev=/dev
+etc=/etc
+fixture=no
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		--help|-h) usage; exit 0 ;;
+		--root|--proc-root|--sys-root|--dev-root|--etc-root)
+			option=$1
+			[ "$#" -ge 2 ] && [ -n "$2" ] || { usage >&2; exit 2; }
+			fixture=yes
+			case "$option" in
+				--root) proc=${2%/}/proc; sys=${2%/}/sys; dev=${2%/}/dev; etc=${2%/}/etc ;;
+				--proc-root) proc=${2%/} ;;
+				--sys-root) sys=${2%/} ;;
+				--dev-root) dev=${2%/} ;;
+				--etc-root) etc=${2%/} ;;
+			esac
+			shift 2 ;;
+		*) usage >&2; exit 2 ;;
+	esac
+done
+
+section()
+{
+	printf '\n=== %s ===\n' "$1"
+}
+
+file()
+{
+	printf '\n--- %s ---\n' "$1"
+	if [ -r "$1" ] && [ -f "$1" ]; then
+		cat "$1" || printf 'UNAVAILABLE: read failed: %s\n' "$1"
+		printf '\n'
+	else
+		printf 'UNAVAILABLE: missing or unreadable: %s\n' "$1"
+	fi
+}
+
+properties()
+{
+	base=$1
+	shift
+	for property do
+		file "$base/$property"
+	done
+}
+
+# No fallback to live tools when fixture data is missing.
+query()
+{
+	printf '\n--- query:'
+	printf ' %s' "$@"
+	printf ' ---\n'
+	if [ "$fixture" = yes ]; then
+		printf 'UNAVAILABLE: live query disabled by fixture roots\n'
+	elif ! command -v "$1" >/dev/null 2>&1; then
+		printf 'UNAVAILABLE: optional tool missing: %s\n' "$1"
+	else
+		"$@"
+		rc=$?
+		[ "$rc" -eq 0 ] || printf 'UNAVAILABLE: query failed (exit %s)\n' "$rc"
+	fi
+}
+
+printf 'SC2 passive observation report; fixture=%s\n' "$fixture"
+printf 'OBSERVATION ONLY: no hardware, TV persistence or functional pass implied.\n'
+printf 'roots: proc=%s sys=%s dev=%s etc=%s\n' "$proc" "$sys" "$dev" "$etc"
+section 'Version and command line'
+properties "$proc" version cmdline uptime modules
+properties "$proc/sys/kernel" osrelease tainted random/boot_id
+properties "$etc" os-release release
+
+section 'Runtime device tree (binary properties are hex, not inferred voltages)'
+dt=$sys/firmware/devicetree/base
+if [ -d "$dt" ]; then
+	for property in model compatible chosen/bootargs chosen/stdout-path aliases/mmc0 aliases/mmc1 aliases/mmc2; do
+		printf '\n--- %s ---\n' "$dt/$property"
+		if [ -r "$dt/$property" ]; then
+			tr '\000' '\n' < "$dt/$property" || printf 'UNAVAILABLE: DT read failed\n'
+		else
+			printf 'UNAVAILABLE: DT property missing or unreadable\n'
+		fi
+	done
+	if command -v find >/dev/null 2>&1 && command -v od >/dev/null 2>&1; then
+		find "$dt" -type d | while IFS= read -r node; do
+			case "${node##*/}" in
+				*mmc*|*sdio*|*gpu*|*hdmi*|*cec*|*sound*)
+					for property in compatible status reg bus-width max-frequency voltage-ranges; do
+						printf '\n--- %s (hex) ---\n' "$node/$property"
+						if [ -r "$node/$property" ]; then
+							od -An -tx1 "$node/$property" || printf 'UNAVAILABLE: DT read failed\n'
+						else
+							printf 'UNAVAILABLE: property absent or unreadable\n'
+						fi
+					done ;;
+			esac
+		done
+	else
+		printf 'UNAVAILABLE: find/od needed for selected binary DT properties\n'
+	fi
+else
+	printf 'UNAVAILABLE: runtime device tree: %s\n' "$dt"
+fi
+
+section 'MMC hosts, cards and SDIO functions'
+found=no
+for host in "$sys"/class/mmc_host/mmc*; do
+	[ -d "$host" ] || continue
+	found=yes
+	properties "$host/device" uevent
+	file "$sys/kernel/debug/${host##*/}/ios"
+done
+[ "$found" = yes ] || printf 'UNAVAILABLE: no MMC host interfaces\n'
+found=no
+for card in "$sys"/bus/mmc/devices/*; do
+	[ -d "$card" ] || continue
+	found=yes
+	properties "$card" uevent type name cid csd ocr manfid oemid serial date fwrev hwrev
+done
+[ "$found" = yes ] || printf 'UNAVAILABLE: no enumerated MMC cards\n'
+found=no
+for sdio in "$sys"/bus/sdio/devices/*; do
+	[ -d "$sdio" ] || continue
+	found=yes
+	properties "$sdio" uevent vendor device class modalias
+done
+[ "$found" = yes ] || printf 'UNAVAILABLE: no enumerated SDIO functions\n'
+
+section 'DRM connectors and existing debug state (no modeset)'
+found=no
+for connector in "$sys"/class/drm/card*-*; do
+	[ -d "$connector" ] || continue
+	found=yes
+	properties "$connector" status enabled dpms modes
+	printf '\n--- %s/edid (hex) ---\n' "$connector"
+	if [ -r "$connector/edid" ] && command -v od >/dev/null 2>&1; then
+		od -An -tx1 "$connector/edid" || printf 'UNAVAILABLE: EDID read failed\n'
+	else
+		printf 'UNAVAILABLE: EDID or od missing/unreadable\n'
+	fi
+done
+[ "$found" = yes ] || printf 'UNAVAILABLE: no DRM connector interfaces\n'
+found=no
+for drm in "$sys"/kernel/debug/dri/*; do
+	[ -d "$drm" ] || continue
+	found=yes
+	properties "$drm" name state
+done
+[ "$found" = yes ] || printf 'UNAVAILABLE: DRM debugfs not exposed; not mounted by collector\n'
+printf 'UNAVAILABLE: HDR/ALLM/SPD details unless present in existing state; no active DRM probe\n'
+
+section 'Panfrost binding and reported device state (no GPU workload)'
+properties "$sys/module/panfrost" version refcnt taint
+found=no
+for gpu in "$sys"/bus/platform/drivers/panfrost/*; do
+	[ -d "$gpu" ] && [ -f "$gpu/uevent" ] || continue
+	found=yes
+	properties "$gpu" uevent power/runtime_status
+done
+[ "$found" = yes ] || printf 'UNAVAILABLE: no bound Panfrost platform device interface\n'
+printf 'UNAVAILABLE: rendering/acceleration acceptance; passive state is not a GPU test\n'
+
+section 'ALSA cards, PCM and ELD (no playback or mixer access)'
+properties "$proc/asound" cards pcm devices version
+found=no
+for card in "$proc"/asound/card*; do
+	[ -d "$card" ] || continue
+	found=yes
+	file "$card/id"
+	found_eld=no
+	for eld in "$card"/eld*; do
+		[ -f "$eld" ] || continue
+		found_eld=yes
+		file "$eld"
+	done
+	[ "$found_eld" = yes ] || printf 'UNAVAILABLE: no HDMI ELD interface for %s\n' "$card"
+done
+[ "$found" = yes ] || printf 'UNAVAILABLE: no ALSA card interfaces\n'
+query aplay -l
+printf 'UNAVAILABLE: audible output and analog jack routing; no audio emitted\n'
+
+section 'CEC adapter identity only (no transmit, monitor or reconfiguration)'
+found=no
+for cec in "$sys"/class/cec/cec*; do
+	[ -d "$cec" ] || continue
+	found=yes
+	properties "$cec" uevent name
+	# With no action options cec-ctl only queries existing adapter identity.
+	if [ -c "$dev/${cec##*/}" ] || [ "$fixture" = yes ]; then
+		query cec-ctl -d "$dev/${cec##*/}"
+	else
+		printf 'UNAVAILABLE: CEC character node: %s\n' "$dev/${cec##*/}"
+	fi
+done
+[ "$found" = yes ] || printf 'UNAVAILABLE: no CEC sysfs adapters\n'
+printf 'UNAVAILABLE: CEC traffic, TV picture retention, HPD/+5V and optical acceptance\n'
+
+section 'Kernel log (includes first MMC error when retained)'
+if [ "$fixture" = yes ]; then
+	file "$proc/dmesg"
+else
+	query dmesg
+fi
+printf '\nReport complete: unavailable observations remain unresolved, not passed.\n'

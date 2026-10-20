@@ -118,6 +118,14 @@ Use the corresponding existing filename, in order:
 34. `0034-meson-sc2-inverted-duty-rounding.patch`
 35. `0035-meson-sc2-secure-pll-output.patch`
 36. `0036-meson-sc2-sdio-functional-clock.patch`
+37. `0037-meson-mmc-voltage-ranges-binding.patch`
+38. `0038-meson-mmc-voltage-ranges.patch`
+39. `0039-hk1-rbox-x4-mmc-voltage-ranges.patch`
+40. `0040-hk1-rbox-x4-667mhz-opp.patch`
+41. `0041-hk1-rbox-x4-panel-brightness.patch`
+42. `0042-hk1-rbox-x4-broadcom-wireless.patch`
+43. `0043-hk1-rbox-x4-remote-semantics.patch`
+44. `0044-meson-mmc-first-irq-error.patch`
 
 `Work/sc2-kernel-series.json` records the initial five exports;
 `Work/sc2-peripheral-verification.json` records the later source commits,
@@ -163,11 +171,89 @@ These are compiled-DT checks, not an SC2 boot or measured gate/LPO waveform.
 The independent pre-userspace stall remains unverified; no new complete image
 was built, installed or booted, and the owner-operated diagnostic hold remains.
 
+### Stock-guided native cutover
+
+The current source replaces the disproven onboard Realtek selection with
+brcmfmac SDIO and native Broadcom H4/serdev. Android runtime UART ownership
+and compiled H4 startup selection are resolved in workspace
+`Work/sc2-android-adb/adaptation-20261020-231410/wireless/report.json`;
+SDIO function 3's separate `btsdio` binding is not the active Android route.
+UART_E retains 115200 startup, 1500000 maximum, 8N1/RTS-CTS and shared LPO.
+GPIOX_17 is active-high `shutdown-gpios`: low off, high on. GPIOX_19 keeps
+stock's compiled output-high state in a GPIO hog, including suspend ownership;
+its module-side pad role is unknown and it is not modeled as a wake IRQ.
+The obsolete local H5 LPO extension is removed by patch 0042.
+
+`kernel-firmware.dat` selects upstream `brcm/brcmfmac4339-sdio.bin` and
+retains the RTL8153 USB Ethernet fallback. Packaging preserves the actual
+`LICENCE.cypress` and Realtek license. Cypress's IC-use scope still requires
+release review; it grants no rights to extracted Android NVRAM or HCD.
+No board-correct, redistributable
+`brcm/brcmfmac4339-sdio.hk1,rbox-x4.txt` or authenticated matching Bluetooth
+patch is available. Neither is replaced with another board's data, a shared
+MAC, empty CLM, global `BCM.hcd` alias or missing-NVRAM bypass. Wi-Fi firmware
+initialization and Bluetooth ROM/patch identity remain unresolved; driver
+selection and module loading are not RF or pairing acceptance.
+
+`hk1-panel.service` starts the native `hk1-panel` policy only for the exact
+HK1 board/controller identity. It writes four `HHMM` ASCII glyphs, a separate
+half-second colon toggle, operational physical LAN/WLAN state and nonempty
+USB mass-storage media presence. The boot USB medium counts; hubs, empty
+readers and USB network/HID devices do not. Default format is 24-hour;
+`--format 12` preserves stock midnight `00`/noon `12` without an invented AM/PM
+indicator. Local time is recomputed each tick. Two-second discovery handles
+late devices; SIGTERM/SIGINT clears owned outputs. Identical write failures
+are bounded per output, never bypassed. Native brightness eight matches
+stock's enabled control byte `0x01`; ACK, actual segment/artwork, visible
+brightness and native-off `0x00` versus stock-off `0x80` remain physical gates.
+Run the host transition fixture with a freshly built binary and fresh root:
+
+```sh
+sh packages/sysutils/hk1-panel/tests/fixture.sh /absolute/path/hk1-panel Work/fresh-panel-root
+```
+
+The NEC map now applies the active Android `.kl` semantics to all 41 mapped
+stock `map_0` entries and omits ten entries absent from that layout. This is
+not evidence that this handset selects `map_0`; physical IR input and future
+Kodi navigation remain separate gates. The stock OPP is **667 MHz / 799 mV**,
+not the previous incorrect 666 MHz decode; CPUFreq stays disabled for boot
+acceptance until separately authorized scaling tests.
+
+Patch 0044 captures one immutable first CRC/timeout IRQ error per MMC host,
+before acknowledgement and descriptor stop. It reports opcode/argument,
+errors, raw response registers, ios and requested/actual clock plus safe
+controller registers from the existing threaded handler. A normal protocol
+discovery timeout can consume this strict one-shot. It does not filter
+opcodes, retry, reset the latch, change timing/voltage or fix eMMC `-84`.
+Capture the **entire** next separately authorized native cold boot on the
+owner's other UART host at 921600 8N1, from before power-on/U-Boot through
+userspace. Do not reboot merely to collect it; preserve CPUFreq-off,
+3.3 V, eMMC <=52 MHz and read-only policy. No HS200/HS400 or raw ioctls.
+
+`sc2-observe --help` describes passive collection and manual TCL cold-boot
+comparison. `sc2-observe` prints existing version/DT/MMC/SDIO/DRM/Panfrost/
+ALSA/CEC evidence; missing interfaces are `UNAVAILABLE`, not passes. Any
+fixture-root option disables all live queries. It never mounts debugfs,
+modesets, transmits CEC, changes a mixer/radio/GPIO or reboots. Save stdout
+only to an owner-selected location. TCL picture retention requires a direct
+TV chain and repeated, one-variable-at-a-time full cold boots with recorded
+CEC type/address/name/vendor and video/HDR state; kernel state cannot prove it.
+
+Host production Image/modules/DTB build, current full-schema DTB validation,
+registered rc-map semantic execution, panel transition fixture, original MMC
+IRQ/capture/report execution and passive collector fixture passed. Logs are
+under workspace `Work/sc2-native-cutover-20261021/`. These are not physical
+panel, wireless, eMMC, DRM/audio, CEC or TCL acceptance. Kodi is not enabled;
+HEVC/AV1 Request/context contracts, matching AV1 FFmpeg backend and applicable
+firmware/TA redistribution authority are still missing. No unused loader or
+fake decoder is registered to conceal these blockers.
+
 ### Consolidated peripheral candidate
 
-This candidate adds native Panfrost matching for SC2 Mali-G31, CECB with its
-external 32 kHz clock, the stock map_0 NEC keymap, RTL8821CS SDIO and H5 serdev,
-calibrated CPU/DDR thermal zones, shared CPU/DSU DVFS and real PWM_J voltage
+The earlier candidate added native Panfrost matching for SC2 Mali-G31, CECB
+with its external 32 kHz clock and the stock map_0 NEC keymap. Its obsolete
+RTL8821CS/H5 assumption is superseded above. It also added calibrated CPU/DDR
+thermal zones, shared CPU/DSU DVFS and real PWM_J voltage
 control. The front-panel GPIO translation is corrected to GPIOA_14 DAT and
 GPIOA_15 CLK; GPIOB_0/1 are eMMC data lines. The TF path gains its stock drive,
 detect and gated-clock pin states. eMMC C is enabled conservatively at 52 MHz
@@ -176,8 +262,8 @@ lane before enabling the reference PLL; USB3 is a candidate capability, not a
 physical pass. Existing USB2 boot quirks and the 921600 console stay unchanged.
 
 CPU policy uses all thirteen exact stock OPPs, 100..2004 MHz and 779..1019 mV,
-not CE's generic multi-table/fuse policies. BSP's initial 667000 kHz floor is
-not the table's 666000 kHz OPP; this candidate uses normal cpufreq-dt policy.
+not CE's generic multi-table/fuse policies. Stock shipped/runtime DT and the
+live policy confirm the corrected 667000 kHz entry; normal cpufreq-dt uses it.
 The provider temporarily parks CPU dynamic changes on the existing 24 MHz
 crystal branch, below every OPP, rather than transiently using 1 GHz at the
 low OPPs' 779 mV. Secure mux/divider rates are read from hardware, not merely
@@ -195,16 +281,13 @@ Thermal trim validity is mandatory; invalid trim is not replaced by zero.
 Polling, CPU cooling and 105 C critical shutdown are described; the stock
 autonomous 110 C reboot is not newly programmed. Do not run unmonitored stress.
 
-The candidate's existing rtw88 and native H5/btrtl configuration was based on
-an incorrect RTL8821CS identity assumption. Authorized read-only stock Android
-capture identifies this physical unit as BCM4339 rev1: SDIO functions 1/2/3
-report `02d0:4339`, DHD reads chip `0x4339` revision 1 and loads
-`/vendor/etc/wifi/6335/fw_bcm4339a0_ag.bin` with `nvram_ap6335.txt`.
-The AP6335 path and SP4339S NVRAM comment do not identify a physical module
-marking. Function 3 binds `btsdio`; neither that binding nor the stock UART_E
-declaration proves the Android Bluetooth transport or a working HCI device.
-Do not treat the Realtek configuration or its three included firmware files
-as support for this box. No native driver/firmware cutover was made here.
+The earlier rtw88/H5/btrtl candidate assumed RTL8821CS incorrectly. Authorized
+stock Android capture identifies BCM4339 rev1, SDIO `02d0:4339`, and DHD
+loads `/vendor/etc/wifi/6335/fw_bcm4339a0_ag.bin` with `nvram_ap6335.txt`.
+AP6335 paths and SP4339S comments do not identify a physical module marking.
+Later runtime ownership and compiled protocol evidence establish Broadcom H4
+on UART_E, independently of function 3's `btsdio`. Current native selection
+and unresolved calibration/ROM/licensing/physical gates are detailed above.
 
 Stock boot logs show eMMC CKTM4R at HS400/8-bit and SDIO at SDR104/4-bit,
 both reporting 199999997 Hz. This does not validate mainline timing, supplies,
@@ -1006,9 +1089,9 @@ logs remain in `Work/sc2-peripheral-smoke-16lejfj4/` at the workspace root.
 
 | Item | Implemented path | Physical acceptance boundary |
 | --- | --- | --- |
-| IR | Native SC2 IR clock/GPIOD_5, NEC decoder and all 51 stock map_0 keys | Requires actual reception from the bundled handset; map_0 is a stock selection, not observed handset identity |
+| IR | Native SC2 IR/GPIOD_5, NEC and 41 stock map_0 entries translated through the active Android layout | Requires handset reception and map selection; host semantic equality is not input acceptance |
 | Status LED | GPIOD_11 active high, standard GPIO LED | On/off visibility not observed with the new kernel |
-| Front panel | Native FD6551 over GPIOA_14 DAT/GPIOA_15 CLK, standard linedisp/LED APIs | Corrected controller-relative pin translation; physical IC/segment/brightness acceptance pending |
+| Front panel | Native FD6551 plus hk1-panel HHMM/colon/LAN/WLAN/USB policy | Host transitions pass; ACK, IC/segments/artwork/brightness and visible output remain unaccepted |
 | HDMI video | Native SC2 VPU, actual CLKCTRL/ANACTRL/PWRCTRL, DWC `fe300000`, TOP `fe308000`; corrected by patch 0015, CMA in 0016 | Production image boots with 256 MiB CMA, native 8,294,400-byte framebuffer and 1080p60 page flips. Actual HDMI pixels and TCL direct connection remain unverified |
 | Digital audio | Powered domain 10, FRDDR A to optical SPDIF on H4; FRDDR B to TDM-C and real DW-HDMI codec | Requires DMA/IRQ growth, 48 kHz stereo receiver/channel checks and repeated start/stop; HDMI ELD/hotplug separately |
 | 3.5mm AV audio | Native SC2 analog glue implemented, board analog path not activated | T9015 AVDD rail identity and actual positive/negative output-to-jack wiring are absent from stock data; no invented supply or headphone amplifier |
@@ -1016,7 +1099,7 @@ logs remain in `Work/sc2-peripheral-smoke-16lejfj4/` at the workspace root.
 | Blue USB3 port | Mode-aware combo-PHY reference sequencing and candidate super-speed cap; original USB2 quirks retained | Owner's earlier boot failure remains ground truth; no distinct PHY failure or post-change SuperSpeed transfer established |
 | Native TF slot | SD_EMMC_B, GPIOC_6 active-low detect, 4-bit/50 MHz, no 1.8 V switching | Current mmc0 is bound but detect is high and no native MMC card is present; USB card-reader storage is not this slot |
 | eMMC | Controller C, 8-bit/52 MHz, early type-MMC force_ro policy | Identity/capacity/partition inventory only after verified block RO; raw ioctls are not protected |
-| WiFi/Bluetooth | Existing rtw88/H5/btrtl candidate is based on a disproven RTL8821CS identity; shared PWM_E LPO remains unmeasured | Stock BCM4339 rev1 and SDIO `02d0:4339` observed; native-driver cutover, RF/coexistence, Bluetooth transport/ROM/paired input and calibrated LPO remain unverified |
+| WiFi/Bluetooth | brcmfmac SDIO and Broadcom H4/serdev replace obsolete Realtek selection; shared PWM_E LPO retained | Board calibration, BT ROM/patch, RF/coexistence, pairing, LPO/electrical and suspend acceptance remain unresolved |
 | GPU/CEC | Native SC2 Panfrost match and clocked CECB/notifier | Binding is not rendering, CEC interoperability or TCL cold-boot persistence |
 | CPU/thermal | Exact stock OPP/PWM_J rail, checked CPU/DSU sequencing, calibrated CPU/DDR zones | Inherited waveform/clock topology, trim accuracy, full transitions and cooling remain physical gates |
 
