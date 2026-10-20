@@ -151,6 +151,10 @@ Use the corresponding existing filename, in order:
 45. `0045-meson-sc2-mmc-hs-sampling.patch`
 46. `0046-fd6551-probe-stage-errors.patch`
 47. `0047-meson-sc2-usb3-bandgap-lifetime.patch`
+48. `0048-regulator-voltage-step-semantics.patch`
+49. `0049-meson-sc2-park-cpu-dsu.patch`
+50. `0050-meson-sc2-autonomous-thermal-reset.patch`
+51. `0051-regulator-kunit-description.patch`
 
 `Work/sc2-kernel-series.json` records the initial five exports;
 `Work/sc2-peripheral-verification.json` records the later source commits,
@@ -334,9 +338,10 @@ The provider temporarily parks CPU dynamic changes on the existing 24 MHz
 crystal branch, below every OPP, rather than transiently using 1 GHz at the
 low OPPs' 779 mV. Secure mux/divider rates are read from hardware, not merely
 the requested CCF topology. CPU/DSU errors latch further voltage/clock changes
-off and retain the old/raised voltage. GP1's inherited output/divider topology
-may still prevent one of the requested 1.2/1.5 GHz DSU rates; exact readback
-must pass before accepting any corresponding CPU transition.
+off and retain the old/raised voltage. The output-rate PLL ABI correction
+passed parked-consumer physical readback at GP1 1.2/1.5 GHz; the CPU callback
+now parks both consumers before changing either PLL. Full DVFS remains a
+separate acceptance gate.
 
 PWM handover identifies a unique exact hardware-quantized voltage-table
 selector **before** probe-time adjustment or enable. Disabled, unrecognized,
@@ -344,8 +349,10 @@ ambiguous, blinking or secondary waveforms fail without rewriting the rail.
 The actual PWM_J parent is inherited; CPU policy rejects mutable video-PLL
 ancestry. No guessed GPIO, voltage tolerance or nearest selector is used.
 Thermal trim validity is mandatory; invalid trim is not replaced by zero.
-Polling, CPU cooling and 105 C critical shutdown are described; the stock
-autonomous 110 C reboot is not newly programmed. Do not run unmonitored stress.
+Polling, CPU cooling and 105 C critical shutdown are described. The driver
+now also programs the stock nominal 110 C autonomous reset, checks the
+register readback and re-arms on resume. This is not a physical hot-reset
+test or permission for unmonitored stress.
 
 The earlier rtw88/H5/btrtl candidate assumed RTL8821CS incorrectly. Authorized
 stock Android capture identifies BCM4339 rev1, SDIO `02d0:4339`, and DHD
@@ -1647,4 +1654,45 @@ Evidence is `Work/sc2-peripheral-followup-20261020T184813Z/`, particularly
 `physical-update.json`, `candidate-artifacts.json`, `final-health.json`,
 `after-update-kernel.log` and `after-update-spdif-smoke.json`. Temporary
 host callback harnesses are removed; their identities and results remain.
+
+### CPU takeover and voltage-step correction
+
+The protected boot `3619c180-e5d3-44be-b293-6b98e82a6435` still has
+`cpufreq.off=1`, no policy, inherited PWM_J 24 MHz with 459/1500 ns duty,
+and a software-decoded 939 mV rail. CPU/DDR temperatures are readable;
+their autonomous-reset registers both read zero. These are not measured
+rail voltage, active DVFS or thermal-throttling results.
+
+Patches 0048..0051 address three independent blockers:
+
+* Regulator voltage stepping could reject the first downward step, treat
+  a valid short final step as stalled, or leave a failed consumer request
+  installed. Intermediate request ranges now remain valid, errors restore
+  request state, and a same-range retry checks the actual remaining delta.
+* The CPU callback previously changed GP1 while the DSU could still consume
+  it. Both consumers now park at or below both transition endpoints before
+  either PLL changes. Supply errors also latch DVFS off; no triplet-helper
+  retry conceals a partially completed voltage request.
+* SC2 CPU/DDR sensors now arm the BSP's calibrated autonomous reset policy,
+  with preserved unrelated bits and checked register readback. The observed
+  trim `fa0080be` maps to CFG2 `c0ff2a20`; its quantized code boundary decodes
+  to 109600 mC, not an exactly measured 110 C trigger.
+
+The real regulator core/public API ran in QEMU with an isolated software
+regulator: all four behavioral cases fail before the fix and pass afterward.
+The production CPU callback smoke covers 169 OPP pairs and 1924 injected
+before/after-write clock failures. The production thermal function matches
+4001 signed trim vectors against the independently extracted BSP inverse;
+register preservation and read/write/readback errors are exercised.
+Production Image, modules and board DTB build successfully. These checks do
+not prove actual voltage, settling, loaded transitions or a hot reset.
+
+The owner has authorized a controlled reboot and is operating the 921600
+UART/recovery host. Keep the root known-good boot files and verified host
+backup; stage any active-DVFS candidate in its own directory. Publish no
+selector until every payload and recovery path is verified, and notify the
+owner before reboot. Default distributed boot files retain the CPUFreq hold
+until physical acceptance; opt-in testing must not write eMMC or save the
+U-Boot environment. Evidence is under workspace-root
+`Work/sc2-cpu-completion-20261020T193047Z/`.
 

@@ -1,0 +1,404 @@
+From a83db054a01095ba2193bb439301ac3e7ae2d393 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Wed, 21 Oct 2026 04:10:51 +0800
+Subject: [PATCH] regulator: Preserve voltage stepping and failed request
+ semantics
+
+Keep intermediate voltage ranges valid while descending toward exact
+consumer requests. Stop on balancing errors, restore request state on all
+error paths, and reject same-range no-ops when a failed stepped change
+left hardware outside the previous request. Accept converging final steps.
+
+Add isolated public-API KUnit coverage for inherited voltage takeover,
+short final steps, failure/retry behavior and stock OPP voltage pairs.
+All four cases fail on the previous core and pass after the fix in QEMU.
+This does not prove physical CPU rail voltage or settling.
+
+Change-Id: I0bcb4e654f299cbec7382ad12ccf0242a229f336
+---
+ Documentation/power/regulator/consumer.rst |   7 +
+ drivers/regulator/Kconfig                  |   8 +
+ drivers/regulator/Makefile                 |   1 +
+ drivers/regulator/core-test.c              | 211 +++++++++++++++++++++
+ drivers/regulator/core.c                   |  47 +++--
+ 5 files changed, 257 insertions(+), 17 deletions(-)
+ create mode 100644 drivers/regulator/core-test.c
+
+diff --git a/Documentation/power/regulator/consumer.rst b/Documentation/power/regulator/consumer.rst
+index c01675b25a90..9386f6a7a45f 100644
+--- a/Documentation/power/regulator/consumer.rst
++++ b/Documentation/power/regulator/consumer.rst
+@@ -111,6 +111,13 @@ when enabled, then the voltage changes instantly, otherwise the voltage
+ configuration changes and the voltage is physically set when the regulator is
+ next enabled.
+ 
++With a maximum voltage step constraint, an enabled regulator may need several
++intermediate settings before reaching the requested range. The call waits for
++each step's settling delay. If a step fails, the consumer's previous request
++is restored, but completed hardware steps are not automatically reversed.
++Consumers must handle the error before changing dependent clocks; an error
++does not mean that the physical voltage returned to its previous value.
++
+ The regulators configured voltage output can be found by calling::
+ 
+ 	int regulator_get_voltage(regulator);
+diff --git a/drivers/regulator/Kconfig b/drivers/regulator/Kconfig
+index d84f3d054c59..203e062a5c67 100644
+--- a/drivers/regulator/Kconfig
++++ b/drivers/regulator/Kconfig
+@@ -30,6 +30,14 @@ config REGULATOR_DEBUG
+ 	help
+ 	  Say yes here to enable debugging support.
+ 
++config REGULATOR_KUNIT_TEST
++	tristate "Regulator voltage stepping tests" if !KUNIT_ALL_TESTS
++	depends on KUNIT
++	default KUNIT_ALL_TESTS
++	help
++	  Exercise voltage stepping and failed consumer requests through the
++	  regulator API using an isolated software regulator, without hardware.
++
+ config REGULATOR_FIXED_VOLTAGE
+ 	tristate "Fixed voltage regulator support"
+ 	help
+diff --git a/drivers/regulator/Makefile b/drivers/regulator/Makefile
+index b3101376029d..ba1dbc3a9ea1 100644
+--- a/drivers/regulator/Makefile
++++ b/drivers/regulator/Makefile
+@@ -6,6 +6,7 @@
+ 
+ obj-$(CONFIG_REGULATOR) += core.o dummy.o fixed-helper.o helpers.o devres.o irq_helpers.o
+ obj-$(CONFIG_REGULATOR_NETLINK_EVENTS) += event.o
++obj-$(CONFIG_REGULATOR_KUNIT_TEST) += core-test.o
+ obj-$(CONFIG_OF) += of_regulator.o
+ obj-$(CONFIG_REGULATOR_FIXED_VOLTAGE) += fixed.o
+ obj-$(CONFIG_REGULATOR_VIRTUAL_CONSUMER) += virtual.o
+diff --git a/drivers/regulator/core-test.c b/drivers/regulator/core-test.c
+new file mode 100644
+index 000000000000..c1d3e1fe3ebc
+--- /dev/null
++++ b/drivers/regulator/core-test.c
+@@ -0,0 +1,211 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Consumer-visible voltage stepping and failure semantics. */
++#include <kunit/device.h>
++#include <kunit/test.h>
++#include <linux/err.h>
++#include <linux/module.h>
++#include <linux/regulator/consumer.h>
++#include <linux/regulator/driver.h>
++#include <linux/regulator/machine.h>
++
++struct voltage_step_test {
++	struct regulator *consumer;
++	unsigned int selector;
++	unsigned int calls;
++	unsigned int fail_at;
++	int lower_bound;
++	int upper_bound;
++	bool invalid_step;
++};
++
++static int voltage_step_get_selector(struct regulator_dev *rdev)
++{
++	struct voltage_step_test *ctx = rdev_get_drvdata(rdev);
++
++	return ctx->selector;
++}
++
++static int voltage_step_set_selector(struct regulator_dev *rdev,
++				     unsigned int selector)
++{
++	struct voltage_step_test *ctx = rdev_get_drvdata(rdev);
++	int old_uV = 689000 + ctx->selector * 10000;
++	int new_uV = 689000 + selector * 10000;
++
++	ctx->calls++;
++	if (ctx->fail_at && ctx->calls >= ctx->fail_at)
++		return -EIO;
++
++	if (abs(new_uV - old_uV) > 30000 ||
++	    new_uV < ctx->lower_bound || new_uV > ctx->upper_bound)
++		ctx->invalid_step = true;
++	ctx->selector = selector;
++	return 0;
++}
++
++static int voltage_step_is_enabled(struct regulator_dev *rdev)
++{
++	return 1;
++}
++
++static const struct regulator_ops voltage_step_ops = {
++	.list_voltage = regulator_list_voltage_linear,
++	.map_voltage = regulator_map_voltage_linear,
++	.get_voltage_sel = voltage_step_get_selector,
++	.set_voltage_sel = voltage_step_set_selector,
++	.is_enabled = voltage_step_is_enabled,
++};
++
++static const struct regulator_desc voltage_step_desc = {
++	.name = "voltage-step-test",
++	.type = REGULATOR_VOLTAGE,
++	.owner = THIS_MODULE,
++	.ops = &voltage_step_ops,
++	.n_voltages = 37,
++	.min_uV = 689000,
++	.uV_step = 10000,
++};
++
++static int voltage_step_test_init(struct kunit *test)
++{
++	struct voltage_step_test *ctx;
++	struct regulator_init_data init_data = {
++		.constraints = {
++			.min_uV = 689000,
++			.max_uV = 1049000,
++			.max_uV_step = 30000,
++			.settling_time = 200,
++			.valid_ops_mask = REGULATOR_CHANGE_VOLTAGE,
++			.always_on = true,
++		},
++	};
++	struct regulator_consumer_supply supply = { .supply = "cpu" };
++	struct regulator_config config = { .init_data = &init_data };
++	struct regulator_dev *rdev;
++	struct device *dev;
++
++	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
++	if (!ctx)
++		return -ENOMEM;
++	test->priv = ctx;
++	ctx->selector = 25; /* Inherited 939 mV, no consumer request yet. */
++	ctx->lower_bound = 689000;
++	ctx->upper_bound = 1049000;
++	dev = kunit_device_register(test, "voltage-step-test");
++	if (IS_ERR(dev))
++		return PTR_ERR(dev);
++
++	supply.dev_name = dev_name(dev);
++	init_data.consumer_supplies = &supply;
++	init_data.num_consumer_supplies = 1;
++	config.dev = dev;
++	config.driver_data = ctx;
++	rdev = devm_regulator_register(dev, &voltage_step_desc, &config);
++	if (IS_ERR(rdev))
++		return PTR_ERR(rdev);
++
++	ctx->consumer = devm_regulator_get(dev, "cpu");
++	return PTR_ERR_OR_ZERO(ctx->consumer);
++}
++
++static void voltage_step_set_bounds(struct voltage_step_test *ctx, int target)
++{
++	int current_uV = regulator_get_voltage(ctx->consumer);
++
++	ctx->lower_bound = min(current_uV, target);
++	ctx->upper_bound = max(current_uV, target);
++	ctx->calls = 0;
++	ctx->invalid_step = false;
++}
++
++static void voltage_step_initial_down_test(struct kunit *test)
++{
++	struct voltage_step_test *ctx = test->priv;
++	int ret;
++
++	voltage_step_set_bounds(ctx, 779000);
++	ret = regulator_set_voltage_triplet(ctx->consumer, 779000, 779000, 779000);
++	KUNIT_EXPECT_EQ(test, ret, 0);
++	KUNIT_EXPECT_EQ(test, regulator_get_voltage(ctx->consumer), 779000);
++	KUNIT_EXPECT_FALSE(test, ctx->invalid_step);
++}
++
++static void voltage_step_short_final_step_test(struct kunit *test)
++{
++	struct voltage_step_test *ctx = test->priv;
++	int ret;
++
++	voltage_step_set_bounds(ctx, 779000);
++	KUNIT_ASSERT_EQ(test, regulator_set_voltage(ctx->consumer, 779000, 779000), 0);
++	voltage_step_set_bounds(ctx, 819000);
++	ret = regulator_set_voltage(ctx->consumer, 819000, 819000);
++	KUNIT_EXPECT_EQ(test, ret, 0);
++	KUNIT_EXPECT_EQ(test, regulator_get_voltage(ctx->consumer), 819000);
++	KUNIT_EXPECT_FALSE(test, ctx->invalid_step);
++}
++
++static void voltage_step_failure_retry_test(struct kunit *test)
++{
++	struct voltage_step_test *ctx = test->priv;
++	unsigned int fail_at;
++	int ret, stopped_uV;
++
++	for (fail_at = 1; fail_at <= 6; fail_at++) {
++		ctx->fail_at = 0;
++		voltage_step_set_bounds(ctx, 939000);
++		KUNIT_ASSERT_EQ(test, regulator_set_voltage(ctx->consumer, 939000, 939000), 0);
++		voltage_step_set_bounds(ctx, 779000);
++		ctx->fail_at = fail_at;
++		ret = regulator_set_voltage(ctx->consumer, 779000, 779000);
++		KUNIT_EXPECT_EQ(test, ret, -EIO);
++		stopped_uV = regulator_get_voltage(ctx->consumer);
++		KUNIT_EXPECT_EQ(test, stopped_uV, 939000 - (fail_at - 1) * 30000);
++		KUNIT_EXPECT_FALSE(test, ctx->invalid_step);
++
++		/* The helper's same-range retry must not report false success. */
++		ret = regulator_set_voltage_triplet(ctx->consumer, 779000, 779000, 779000);
++		KUNIT_EXPECT_EQ(test, ret, -EIO);
++		KUNIT_EXPECT_EQ(test, regulator_get_voltage(ctx->consumer), stopped_uV);
++	}
++}
++
++static void voltage_step_opp_pairs_test(struct kunit *test)
++{
++	static const int voltages[] = {
++		779000, 799000, 809000, 839000, 849000,
++		879000, 919000, 959000, 989000, 1019000,
++	};
++	struct voltage_step_test *ctx = test->priv;
++	unsigned int i, j;
++
++	for (i = 0; i < ARRAY_SIZE(voltages); i++) {
++		for (j = 0; j < ARRAY_SIZE(voltages); j++) {
++			voltage_step_set_bounds(ctx, voltages[i]);
++			KUNIT_ASSERT_EQ(test, regulator_set_voltage(ctx->consumer,
++					voltages[i], voltages[i]), 0);
++			voltage_step_set_bounds(ctx, voltages[j]);
++			KUNIT_ASSERT_EQ(test, regulator_set_voltage(ctx->consumer,
++					voltages[j], voltages[j]), 0);
++			KUNIT_EXPECT_EQ(test, regulator_get_voltage(ctx->consumer), voltages[j]);
++			KUNIT_EXPECT_FALSE(test, ctx->invalid_step);
++		}
++	}
++}
++
++static struct kunit_case voltage_step_test_cases[] = {
++	KUNIT_CASE(voltage_step_initial_down_test),
++	KUNIT_CASE(voltage_step_short_final_step_test),
++	KUNIT_CASE(voltage_step_failure_retry_test),
++	KUNIT_CASE(voltage_step_opp_pairs_test),
++	{}
++};
++
++static struct kunit_suite voltage_step_test_suite = {
++	.name = "regulator-voltage-step",
++	.init = voltage_step_test_init,
++	.test_cases = voltage_step_test_cases,
++};
++kunit_test_suite(voltage_step_test_suite);
++
++MODULE_DESCRIPTION("Regulator voltage step consumer tests");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/regulator/core.c b/drivers/regulator/core.c
+index eae756c82c26..cd41b4136e9b 100644
+--- a/drivers/regulator/core.c
++++ b/drivers/regulator/core.c
+@@ -3831,14 +3831,15 @@ static int _regulator_do_set_suspend_voltage(struct regulator_dev *rdev,
+ 	return 0;
+ }
+ 
+-static int regulator_get_voltage_delta(struct regulator_dev *rdev, int uV)
++static int regulator_get_voltage_delta(struct regulator_dev *rdev,
++				       int min_uV, int max_uV)
+ {
+ 	int current_uV = regulator_get_voltage_rdev(rdev);
+ 
+ 	if (current_uV < 0)
+ 		return current_uV;
+ 
+-	return abs(current_uV - uV);
++	return abs(current_uV - clamp(current_uV, min_uV, max_uV));
+ }
+ 
+ static int regulator_set_voltage_unlocked(struct regulator *regulator,
+@@ -3855,8 +3856,13 @@ static int regulator_set_voltage_unlocked(struct regulator *regulator,
+ 	 * should be a noop (some cpufreq implementations use the same
+ 	 * voltage for multiple frequencies, for example).
+ 	 */
+-	if (voltage->min_uV == min_uV && voltage->max_uV == max_uV)
+-		goto out;
++	if (voltage->min_uV == min_uV && voltage->max_uV == max_uV) {
++		if (!rdev->constraints->max_uV_step)
++			goto out;
++		ret = regulator_get_voltage_delta(rdev, min_uV, max_uV);
++		if (ret <= 0)
++			goto out;
++	}
+ 
+ 	/* If we're trying to set a range that overlaps the current voltage,
+ 	 * return successfully even though the regulator does not support
+@@ -3891,41 +3897,45 @@ static int regulator_set_voltage_unlocked(struct regulator *regulator,
+ 
+ 	/* for not coupled regulators this will just set the voltage */
+ 	ret = regulator_balance_voltage(rdev, state);
+-	if (ret < 0) {
+-		voltage->min_uV = old_min_uV;
+-		voltage->max_uV = old_max_uV;
+-	}
++	if (ret < 0)
++		goto restore_voltage;
+ 
+ 	if (rdev->constraints->max_uV_step > 0) {
+ 		/* For regulators with a maximum voltage step, reaching the desired
+ 		 * voltage might take a few retries.
+ 		 */
+-		ret = regulator_get_voltage_delta(rdev, min_uV);
++		ret = regulator_get_voltage_delta(rdev, min_uV, max_uV);
+ 		if (ret < 0)
+-			goto out;
++			goto restore_voltage;
+ 
+ 		delta = ret;
+ 
+ 		while (delta > 0) {
+ 			ret = regulator_balance_voltage(rdev, state);
+ 			if (ret < 0)
+-				goto out;
++				goto restore_voltage;
+ 
+-			ret = regulator_get_voltage_delta(rdev, min_uV);
++			ret = regulator_get_voltage_delta(rdev, min_uV, max_uV);
+ 			if (ret < 0)
+-				goto out;
++				goto restore_voltage;
+ 
+ 			new_delta = ret;
+ 
+-			/* check that voltage is converging quickly enough */
+-			if (delta - new_delta < rdev->constraints->max_uV_step) {
++			/* A shorter final step or discrete selector still makes progress. */
++			if (new_delta >= delta) {
+ 				ret = -EWOULDBLOCK;
+-				goto out;
++				goto restore_voltage;
+ 			}
+ 
+ 			delta = new_delta;
+ 		}
+ 	}
++	goto out;
++
++restore_voltage:
++	/* Do not let an incomplete request become a successful same-range noop. */
++	voltage->min_uV = old_min_uV;
++	voltage->max_uV = old_max_uV;
+ 
+ out:
+ 	return ret;
+@@ -4150,8 +4160,11 @@ static int regulator_get_optimal_voltage(struct regulator_dev *rdev,
+ 		if (ret < 0)
+ 			return ret;
+ 
+-		if (ret == 0)
++		if (ret == 0) {
++			/* This is an intermediate step, not the final consumer range. */
++			desired_max_uV = desired_min_uV;
+ 			done = false;
++		}
+ 	}
+ 
+ 	/* Set current_uV if wasn't done earlier in the code and if necessary */
+-- 
+2.47.3
+
