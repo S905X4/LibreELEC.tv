@@ -2098,13 +2098,12 @@ confirmed the physical panel displayed `1234`; this is not inferred from
 process success. Icon mapping, brightness steps and native-driver operation
 were not accepted by that observation.
 
-The emitter completed and released its GPIO handles. To preserve the
-latched pattern until the native candidate boots, the panel GPIO parent
-remains temporarily unbound and `hk1-panel.service` is stopped. No observer
-process remains. The existing boot image and DTB are unchanged; the system
-remains running with schedutil, taint 0 and read-only eMMC. Restore details
-and the previous service state are in `pattern-result.json`. HDMI/Kodi has
-not been advanced.
+The emitter completed and released its GPIO handles. Before native cutover,
+the panel GPIO parent was temporarily unbound and `hk1-panel.service` was
+stopped to preserve that pattern. The native-image reboot below restored
+normal GPIO ownership and the automatic service; no emitter remains. The
+original trial's restore details are retained in `pattern-result.json`.
+HDMI/Kodi has not been advanced.
 
 Sources: [CE module package](https://github.com/CoreELEC/CoreELEC/blob/15970b8e469b8e299a8947b1751593bdaf53ed82/projects/Amlogic-ce/packages/linux-drivers/openvfd-driver/package.mk),
 [CE startup](https://github.com/CoreELEC/CoreELEC/blob/15970b8e469b8e299a8947b1751593bdaf53ed82/projects/Amlogic-ce/packages/linux-drivers/openvfd-driver/scripts/openvfd-start),
@@ -2126,7 +2125,41 @@ There is no GPIO-level ACK fabrication, OpenVFD module, Android service or
 second configuration ABI. Native linedisp and LED classes remain the sole
 userspace interfaces; the existing `hk1-panel` clock policy is unchanged.
 
-The changed AArch64 driver object compiled successfully. This alone does
-not establish native probe, visible characters, icon layout, brightness or
-automatic-clock acceptance; those require the new image and physical panel.
+Full candidate `LibreELEC-SC2.aarch64-12.2-devel-20261021073839-0013f79`
+was built with patch 0055. The applied driver source matches the Linux
+development tree byte-for-byte. The image and standard update TAR contain
+identical payloads; uImage header/payload CRCs pass. DTB and boot selector
+are unchanged. Checkpatch reports only the two existing local-policy
+conflicts (Change-Id and missing sign-off), not upstream/DCO readiness.
+
+Eight external-boot files were backed up on host and device before standard
+update and a notified soft reboot. The 83,118,080-byte backup SHA-256 is
+`cda9c727f699d0a7a8423c7b4d42a342ab7199119bd46a0e97ea0861635fd9e4`.
+New boot ID `7a4e98bc-f32a-4ec4-a2f5-f428fbdcf61c` was authenticated with
+the pinned SSH host key. Running KERNEL/SYSTEM/DTB match the package;
+`uEnv.ini`/live and the selector retain their pre-update hashes. The normal
+SYSTEM loop backend is `/flash/SYSTEM`, not a diagnostic RAM root.
+
+Native `0-0024` now binds to `fd6551` and exports `linedisp.0` plus display
+and all seven icon LED classes. A bounded real-board run wrote `1234`,
+brightness off/levels 1--8, and each isolated icon. All 80 traced writes
+used flags `0x1000`; all 80 transfer results were one complete message.
+The digit payloads and middle-brightness byte `0x09` match the previously
+owner-visible CE-protocol trial. These results prove actual native bus
+transactions, not ACK assertion or optical icon/brightness acceptance.
+
+After restarting the unmodified clock service, message readback crossed
+`2343` to `2344` automatically and the colon alternated 0/1. The service
+remains active; normal policy selects LAN/USB on, WLAN/alarm/play/pause off,
+display level 8 and a blinking colon. The trace instance was removed.
+Final state: running, zero failed units, taint 0, schedutil, four CPUs,
+USB ext4 storage, read-only flash and read-only/unmounted eMMC. No deployment
+command wrote eMMC; this does not assert that vendor U-Boot never saves its
+own environment. Native physical glyphs, icon positions and visible
+brightness steps still require the owner's observation before advancing.
+
+Evidence: `Work/sc2-fd6551-native-20261020T233650Z/` contains
+`artifact-verification.json`, `boot-backup.json`, `native-probe.json`,
+`native-runtime.json`, `native-runtime-summary.json`, `final-health.json`
+and `final-service-and-cleanup.json`.
 
