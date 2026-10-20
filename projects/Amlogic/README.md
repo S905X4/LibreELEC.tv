@@ -580,10 +580,10 @@ CRC or firmware error. Do not mount, format, write or stress-test internal
 eMMC. Enumeration does not prove Wi-Fi association, storage writes or DVFS.
 Do not run `saveenv`, an installer or `.update`; vendor automatic STORAGE
 environment saves remain outside a whole-boot zero-write guarantee.
-The candidate has not been uploaded or physically booted. No default
-boot file, physical media or running MMC state was changed, and no reboot
-was requested by the assistant. Not selecting the directory retains the
-accepted default boot files.
+At package creation, the candidate had not been uploaded or physically
+booted, and no default file or running MMC state had been changed. The
+subsequent authorized online deployment and its actual hardware results
+are recorded below; the package-creation status is not the current state.
 
 Production `Image dtbs modules` compilation, binding validation and full
 DT schema validation passed. A throwaway C smoke executed the actual
@@ -601,6 +601,67 @@ reports six local-policy conflicts: three required Change-Id trailers and
 three intentionally absent Signed-off-by trailers; no warnings or checks.
 The series is not upstream-submission-ready. Evidence:
 `Work/sc2-mmc-voltage/verification.json`.
+
+#### Authorized online deployment and observed MMC result
+
+The owner subsequently requested remote installation without manual USB
+or U-Boot operation. The assistant authenticated the existing host, saved
+`Work/sc2-mmc-deployment/sc2-pre-mmc-b5a3ca5.tar`, and verified its seven
+members against the running device. The archive is 69,661,696 bytes,
+SHA-256 `19c7cfea310d8d3279109ea83e560cd368f8c38ffdc67d9c25a3e66567d42ab3`.
+It preserves the actual pre-deployment files, not an assumed image version.
+
+Inspection found a mixed root set: `/flash/KERNEL` has the `c9c7080` payload
+hash, while root SYSTEM/DTB differ from the physically accepted independent
+live set. Historical MD5 sidecars are not recovery authority. Consequently,
+the known-working recovery target is `sc2-userspace-0e17edd/`, whose three
+payload hashes were reverified, not that mixed root set.
+
+The matching candidate was uploaded into `sc2-mmc-b5a3ca5/`. Its explicit
+uEnv selects that directory's KERNEL/SYSTEM, the original boot UUID, normal
+init, `toram live`, UART 921600, `nofsck` and the CPUFreq hold. All files
+were hash-checked before publication. Only three literal load paths in the
+authenticated existing boot-script body changed: uEnv, KERNEL and DTB.
+The script's logic and RAM windows stayed unchanged. The final rename of
+`s905_autoscript` selected the complete directory after `sync`; all six root
+payload/config/checksum files stayed byte-identical. `/flash` was restored
+read-only and the update queue was empty. This is a USB boot-selector
+deployment, not eMMC firmware flashing or a standard update TAR.
+
+The active selector SHA-256 is
+`5be34c4081f22ee4e12aa8fa5d5cbc3904a0a98b4e2308068132be7f41e010b4`.
+The candidate directory also retains the original selector and a recovery
+selector targeting the accepted predecessor with a matching nested uEnv.
+From an already working recovery shell, that recovery selector can replace
+`/flash/s905_autoscript` after remounting `/flash` writable, followed by sync
+and a read-only remount. It is not an automatic rollback monitor. The full
+backup also remains on the host; the pre-reboot `/storage` TAR was tmpfs.
+
+After notifying the owner, the assistant requested `sync && systemctl reboot`
+(exit 0). At approximately 25 seconds, authenticated SSH returned on the same
+Ethernet MAC `02:ad:32:01:43:1c` and address `10.0.0.151/24`, with new boot ID
+`44e2f871-0a50-4fae-b66c-a2a6241d54ee`. The actual cmdline selects the new
+directory. KERNEL, DTB, `/dev/SYSTEM` and selector SHA-256 all match; all
+three runtime DT voltage properties read `3300 3300`. Linux reports 6.18.57,
+system state `running`, zero failed units and taint 0. `/flash` is read-only,
+`/storage` remains tmpfs, and no CPUFreq policy directory exists.
+
+The original `no support for card's volts` / `-22` rejection is absent.
+SDIO now reports `mmc1: new high speed SDIO card at address 0001`:
+`fe088000`, type SDIO, OCR `0x00300000`, 4-bit high-speed, requested 50 MHz,
+actual 49.85 MHz. No SDIO function device or wireless network interface was
+observed; Wi-Fi association/traffic has not passed. eMMC `fe08c000` / `mmc2`
+instead reports `error -84 whilst initialising MMC card`, followed by failure
+to initialize the non-removable card; no mmcblk device exists. The errno does
+not establish its hardware root cause. No internal-storage mount/write,
+manual MMIO, voltage experiment, extra reboot or TF insertion followed.
+
+Deployment and normal live boot passed; eMMC storage and Wi-Fi remain
+unaccepted. There is no UART capture of this reboot, no visible-HDMI result
+and no new whole-boot zero-write claim. Complete state, dmesg, availability,
+backup, selection and recovery evidence:
+`Work/sc2-mmc-deployment/deployment.json` and its linked logs.
+
 
 
 
