@@ -1,0 +1,47 @@
+From 9929aa14765b785388f7da8d7a61c6df70a3a0b9 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Wed, 21 Oct 2026 01:06:33 +0800
+Subject: [PATCH] arm64: dts: amlogic: Correct the HK1 RBOX X4 667 MHz OPP
+
+Both the shipped DT and the live Android DT encode 667000000 Hz at
+799000 uV. The previous decimal decode incorrectly declared 666 MHz.
+Correct the node, rate and consumer comment without changing voltage,
+clock rounding tolerance or CPU/DSU sequencing.
+
+Series validation: production Image/modules/DTB build and full DT schema.
+Physical DVFS acceptance is unchanged; deployment keeps CPUFreq disabled.
+
+Change-Id: Ief0af96185791d588af7f9888d845ca47fc5fbc7
+---
+ arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts | 4 ++--
+ drivers/cpufreq/sc2-cpufreq.c                         | 2 +-
+ 2 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts b/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
+index 63c87760582d0bf5ce5479165f45f4bf767026bc..fa08def55fcabd27e45dc5fe5fad9fb5e4227841 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
++++ b/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
+@@ -213,8 +213,8 @@ opp-500000000 {
+ 			opp-hz = /bits/ 64 <500000000>;
+ 			opp-microvolt = <779000>;
+ 		};
+-		opp-666000000 {
+-			opp-hz = /bits/ 64 <666000000>;
++		opp-667000000 {
++			opp-hz = /bits/ 64 <667000000>;
+ 			opp-microvolt = <799000>;
+ 		};
+ 		opp-1000000000 {
+diff --git a/drivers/cpufreq/sc2-cpufreq.c b/drivers/cpufreq/sc2-cpufreq.c
+index 796b37dc4916a8583e4aa01e030ab75855181fe9..498331418977495791a4cc7147b36f58f6dd02a5 100644
+--- a/drivers/cpufreq/sc2-cpufreq.c
++++ b/drivers/cpufreq/sc2-cpufreq.c
+@@ -107,7 +107,7 @@ static int sc2_cpufreq_config_clks(struct device *dev, struct opp_table *table,
+ 	if (ret)
+ 		goto failed;
+ 
+-	/* The fixed 2 GHz / 3 path rounds the stock 666 MHz OPP. */
++	/* The fixed 2 GHz / 3 path rounds the stock 667 MHz OPP. */
+ 	if (abs((long)clk_get_rate(core) - (long)rate) > 10000000) {
+ 		ret = -EIO;
+ 		goto failed;
