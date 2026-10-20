@@ -1778,7 +1778,7 @@ vendor AO mailbox freeze handshake. Advertised `mem` is not acceptance.
 The first idle candidate, LE `2277f051c77c`, panicked before userspace with
 concurrent instruction aborts and stack-canary failure. The owner recovered
 the prior active-DVFS payload; authenticated boot
-`9bd4b2ed-6d44-4444-ab8a-0ed351d357a7` is running with all CPUs online,
+`9bd4b2ed-6d44-4444-ab8a-0ed351d357a7` was running with all CPUs online,
 userspace/1608 MHz, no failed units and taint 0. The persistent selector was
 restored to `sc2-cpu-ab0dc7a7`; the failed payload is not selected again.
 
@@ -1787,8 +1787,8 @@ messages report physical MPIDR affinities 0x100/0x200/0x300. The native
 suspend hash consequently masks Aff0 with 0x3, making every hardware CPU
 publish its saved stack to slot 0. CE and Khadas normalize MT-style MPIDRs
 before both save and restore; the native donor omitted that prerequisite.
-Attribution of the complete panic to this collision remains an inference
-until the corrected candidate passes controlled hardware verification.
+The corrected candidate has since passed controlled boot and the real
+idle/compute checks below, eliminating the observed boot regression.
 
 Patch 0054 corrects the hash descriptor at initialization for SC2 with MT
 set and flattened Aff0 IDs. It retains the proven PSCI CPU_ON/AFFINITY_INFO
@@ -1798,4 +1798,46 @@ Extracted production C plus AArch64 assembly executed under QEMU reproduces
 three collision scenarios before the fix; all seven topology scenarios and
 336 saved-context checks pass afterward. This is not firmware or board
 suspend acceptance. Do not enable whole-system suspend from this result.
+
+#### Corrected idle candidate: physical acceptance
+
+The owner authorized direct deployment/reboot with UART retained. Linux
+`f6f4bdd98d6f` and LE build `0741cb343f7b` produced
+`LibreELEC-SC2.aarch64-12.2-devel-20261021050215-0741cb3`.
+The actual image/TAR payloads match; applied setup/DTS sources, embedded
+configuration, uImage CRCs and complete DTB schema pass. Checkpatch retains
+two local Change-Id/missing-signature policy conflicts, not upstream readiness.
+The eight-file host/device backup SHA-256 is
+`60f87b95a96b79595fecf85c82829e19e08ee919d35e508d54be84632f32208e`.
+Only the removable-media selector changes; root payloads remain untouched.
+
+Authenticated boot `fad68063-2ef6-48f7-92a8-3fc01ecec983` selects
+`/flash/sc2-cpu-idle-fix-0741cb34/`; the recovery selector still loads the
+previous accepted active-DVFS directory. Physical checks on this boot:
+
+- `psci_idle/menu` accounts successful timer-stopping `cpu-sleep-0` entry
+  and return on all four CPUs. During 30 seconds the usage deltas were
+  1411/102/244/228; residency time also increased. Rejected deltas were
+  31/6/15/23 and remain in the evidence; this is not a zero-rejection claim.
+- 192 pinned idle/compute cycles across four CPUs verify 192 MiB of fixed
+  SHA-256 data after wake. This is not an electrical power-state measurement.
+- CPU1..3 offline/online, CPU0-only frequency change, return to four CPUs
+  and pinned per-CPU computation pass with deep idle enabled.
+- All 13 OPPs pass four-core fixed computation totaling 416 MiB, with real
+  CPU/DSU/PWM/selector checks before and after; highest sampled temperature
+  was 58.8 C.
+- Schedutil again scales 100 -> 2004 -> 100 MHz during finite load/idle;
+  the highest CPU/DDR sample was 69.5 C.
+- A 90-second 1200 MHz four-core pinned workload verifies 172256 MiB of
+  fixed SHA-256 data, with per-second CPU/DSU/PWM/selector checks and a
+  70 C stop condition. The highest sampled temperature was 67.5 C. This
+  is not indefinite peak-frequency stress or thermal-equilibrium acceptance.
+
+The final state is userspace/1608 MHz, CPUs 0-3 online, system running,
+no failed units, taint 0, `/flash` read-only and USB ext4 `/storage`.
+No eMMC writes, whole-system suspend or cold-power test occurred. RTC0 and
+wakealarm registration do not prove firmware alarm delivery. Keep the
+whole-system retention, independent-root/wake prerequisites and electrical
+voltage/transient acceptance open. Evidence is in the `hash-*` records under
+`Work/sc2-cpu-completion-20261020T193047Z/`.
 
