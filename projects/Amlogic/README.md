@@ -17,28 +17,31 @@ This project is for Amlogic SoC devices
 
 ## SC2 / HK1 RBOX X4 minimal bring-up
 
-The project sequence is CPU/board foundations, safe internal eMMC deployment,
-then complete board/peripheral acceptance, followed by decoding and the full
-player, multi-vendor TV compatibility, and finally a LibreELEC device-support
-PR. Preserve unfinished items across sessions; an investigation or a driver
-fix is not hardware acceptance. The workspace `skill.md` sections 1.1/1.2
-hold the persistent phase gates and acceptance ledger.
+The owner's latest sequence is physical IR acceptance, FD6551 panel,
+basic HDMI, then Kodi and decode/playback integration. CPU software is
+accepted under the revised scope below; internal eMMC installation is
+deferred, not a prerequisite for this new sequence. Preserve other
+unfinished hardware facts rather than calling identification a functional
+pass. The workspace `skill.md` sections 1.1/1.2 hold the current sequence
+and acceptance ledger, superseding historical ordering below.
 
-Distributed boot entries retain a CPUFreq hold; opt-in acceptance is below.
-This SC2 build has no internal installer:
-its two-partition removable image must not be written over the factory eMMC.
-Factory Android logs describe 29 private-layout partitions, including a
-user-area bootloader at offset zero; the current native kernel enumerates
-the eMMC but no partitions. Internal payload placement, partition access,
-firmware/environment preservation, backup, boot, update and recovery still
-need implementation and physical acceptance. Independent TF/USB3 media can
-be tested without installing internally, but never remove the active root
-medium; CPU completion remains the owner's current priority.
+CPU software acceptance is complete under the owner's revised scope below.
+Production SC2 entries use the existing kernel schedutil default; updates
+remove the former generated `cpufreq.off` hold without changing explicit
+user governor overrides. Explicit rescue commands remain available.
 
-The owner reports red and blue status LEDs, blue currently lit, a blank
-front display, untested IR, available TF/USB3 test devices, and no optical
-S/PDIF receiver path. Retain these acceptance limits rather than repeating
-receiver tests without the equipment or claiming all peripherals work.
+Internal eMMC integration is deferred and remains incomplete. This build
+does not have an internal installer: never write its two-partition
+removable image over factory eMMC. The original 29-entry MPT, CRC-valid
+boot environment and EXT_CSD have been captured read-only, with verified
+critical-area backups. Placement, internal loading, install/update and
+rollback still require implementation and explicit write-range approval.
+RAM/live independence was exercised, not internal installation.
+
+The owner reports red and blue LEDs, blue lit, a blank front display, an
+available IR remote for real key testing, TF/USB3 test devices, and no
+optical S/PDIF receiver. Runtime peripheral functions remain acceptance
+items; further peripheral suspend/resume testing is explicitly out of scope.
 
 Build from the LibreELEC root as a non-root user with the normal LE host
 dependencies and GCC 12 available on `PATH`:
@@ -1925,4 +1928,98 @@ Evidence: `Work/sc2-ram-pm-20261020T215722Z/acceptance-summary.json`,
 `after-deep-final-health.json`. One baseline-state deep cycle does not
 close sustained 2004 MHz, physical cold-power, voltage/transient or complete
 peripheral-recovery acceptance. CPU completion remains open.
+
+#### Owner-approved CPU acceptance scope and next phase
+
+The owner accepts CPU software completion based on the exercised OPP,
+CPU/DSU/PWM, schedutil, thermal-policy, hotplug, idle and RAM-root deep paths.
+The stock heatsink's sustained-2004-MHz thermal limitation remains recorded;
+the owner is not required to improve cooling and thermal trips stay intact.
+Physical power-cycle, voltage/transient measurement and further peripheral
+sleep/resume testing are explicitly waived, not claimed as passed.
+
+The owner's additional firmware console log reports a 24-second alarm,
+`alarm fired`, `exit_reason=3, rtc`, CPU rail off/on, 1608 MHz restoration and
+DDR resume. It corroborates the observed timed deep return; these messages
+are firmware reports, not instrumented rail measurements. The log is saved
+as `Work/sc2-ram-pm-20261020T215722Z/owner-firmware-deep-resume.log`.
+Keep the xHCI/Bluetooth observations above as known findings, but do not
+use waived peripheral-resume acceptance to hold CPU completion open.
+
+Normal SC2 image options no longer force CPUFreq off. The update hook
+removes old generated holds and preserves UUIDs, console and explicit user
+governor overrides. Three actual file-fixture migrations, including a
+duplicate hold and a second idempotent update, passed; mount operations
+were replaced only inside that temporary smoke fixture. The complete
+image, real external update hook and physical default-policy boot have
+subsequently passed, as recorded below.
+
+The owner has since changed the next phase to IR, FD6551 and basic HDMI,
+then Kodi. An IR remote is available; do not retain the former test-device
+blocker. Internal installation is deferred, not completed. No permission
+to overwrite unidentified factory regions follows from CPU completion.
+Preserve firmware, environment, table, keys and recovery paths.
+
+#### Physical markings and passive radio identity
+
+The owner reports `RTL8211F`, RF-module marking `HK5235F S314439 1912`,
+and an `FD6551` chip underneath. Retain these physical observations;
+do not infer a second GPIO, bus address, calibration or module brand.
+
+Read-only runtime inspection corroborates the RTL8211F with MDIO PHY ID
+`0x001cc916` and its bound Realtek driver. Wi-Fi reports BCM4339 revision 2
+and SDIO ID `02d0:4339`; the recorded HT-clock timeout and unbound functions
+mean association and data transfer remain unaccepted.
+
+The UART Bluetooth controller reports chip ID 86 and ROM name BCM4335C0,
+then loads `brcm/BCM4335C0.hcd` and registers `hci0`. Its firmware name
+mentions AMPAK AP6335i/BCM4339, but that string does not establish the
+physical HK5235F module's manufacturer. BlueZ reports manufacturer 15,
+HCI version 6 and a powered controller. These identify the controller,
+not successful RF operation, pairing or audio transport. No active scan,
+pairing or additional suspend/resume was attempted. FD6551 identification
+does not resolve the existing panel NACK or prove display operation.
+
+Evidence: `Work/sc2-emmc-20261020T221512Z/hardware-identity-update.json`.
+
+#### Production-default boot and latest acceptance sequence
+
+The complete `20261021062143-40274f9` release passed payload comparisons,
+uImage header/data CRC and actual removable-image argument inspection.
+The actual SYSTEM update hook migrated the external boot files after an
+eight-file, double-checked backup. A controlled physical-board soft reboot
+then reached boot ID `b73805e2-e081-4c17-af5e-c307e7d02903` with schedutil
+selected by default, no CPUFreq-off/governor override, 100–2004 MHz range,
+four online CPUs, running system state, zero failed units and taint zero.
+Storage is again the persistent USB ext4 partition, not the earlier RAM
+diagnostic root. This is not the waived physical DC power-cycle test.
+
+A one-time read-only U-Boot probe did not resolve eMMC partition 29.
+Without its console result, the command, initialization and partition
+parser failure modes remain distinct unknowns. It did not establish an
+internal loading path. The normal production selector was restored;
+flash is read-only, eMMC is read-only/unmounted and no eMMC writes occurred.
+The authenticated MPT has 29 entries and vendor checksum `0x96f632c7`;
+that checksum repeats only entry zero and must not be described as CRC or
+as protecting the remaining entries. The captured 64 KiB environment CRC
+is `0x2007e183`. Backups are critical-area backups, not full Android data.
+
+The owner's latest order is IR first, then FD6551, basic HDMI and Kodi.
+Do not advance panel testing before actual IR acceptance. The existing
+OpenVFD conf needs a matching consumer; a configuration file cannot by
+itself configure the separate native FD6551 driver. Other unfinished
+functions stay recorded but do not silently reinstate superseded phase
+gates. Physical markings and controller identification are not RF passes.
+
+In particular, `HT Avail timeout (1000000): clkctl 0x50` means the Broadcom
+driver waited about one second for the Wi-Fi internal HT working clock.
+`0x50` has ALP-ready and HT-request bits but lacks HT-ready; the cause is
+not yet localized. It is an initialization failure, not an SSID/password
+timeout or proof that CPU thermal policy is broken.
+
+Evidence: `Work/sc2-emmc-20261020T221512Z/production-image-smoke.json`,
+`production-external-deployment-completed.json`,
+`production-default-boot-health.json`, `production-selector-restored.json`
+and `current-disposition.json` in the same directory. Physical IR input
+acceptance remains pending the owner-operated capture window.
 
