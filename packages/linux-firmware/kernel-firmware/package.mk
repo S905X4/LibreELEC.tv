@@ -80,7 +80,9 @@ makeinstall_target() {
 
   if [ "${PROJECT}" = "Amlogic" -a "${DEVICE}" = "SC2" ]; then
     mkdir -p "${INSTALL}/usr/share/licenses/kernel-firmware"
-    cp "${PKG_BUILD}/LICENCE.rtlwifi_firmware.txt" \
+    # BCM4339 Wi-Fi and the RTL8153 USB Ethernet fallback use different terms.
+    cp "${PKG_BUILD}/LICENCE.cypress" \
+      "${PKG_BUILD}/LICENCE.rtlwifi_firmware.txt" \
       "${INSTALL}/usr/share/licenses/kernel-firmware/"
   fi
 

@@ -1,8 +1,10 @@
-# RTL8821CS firmware is available for diagnostic SDIO bring-up; this does not
-# assert that the onboard module has been physically identified or validated.
-rtw88/rtw8821c_fw.bin
-# Native Realtek H5/btrtl UART Bluetooth transport.
-rtl_bt/rtl8821cs_fw.bin
-rtl_bt/rtl8821cs_config.bin
+# BCM4339 SDIO firmware from linux-firmware, covered by LICENCE.cypress.
+brcm/brcmfmac4339-sdio.bin
+# Board lookup: brcm/brcmfmac4339-sdio.hk1,rbox-x4.txt. No calibrated NVRAM
+# with established redistribution rights is available; do not use another board's
+# calibration or import the investigation-only Android nvram_ap6335.txt.
+# No external CLM is selected: the stock external path was explicitly ignored.
+# Broadcom H4 Bluetooth patch selection awaits exact ROM identity and a licensed
+# matching HCD source; do not alias the Android bcm4339a0.hcd or global BCM.hcd.
 # USB Ethernet fallback firmware (upstream r8152 module).
 rtl_nic/rtl8153a-3.fw
