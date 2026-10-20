@@ -128,6 +128,7 @@ Use the corresponding existing filename, in order:
 44. `0044-meson-mmc-first-irq-error.patch`
 45. `0045-meson-sc2-mmc-hs-sampling.patch`
 46. `0046-fd6551-probe-stage-errors.patch`
+47. `0047-meson-sc2-usb3-bandgap-lifetime.patch`
 
 `Work/sc2-kernel-series.json` records the initial five exports;
 `Work/sc2-peripheral-verification.json` records the later source commits,
@@ -1547,4 +1548,22 @@ postboot journals and both address-contract reviews preserve the checks
 and their limits. This warm-reboot result is not cold-power, TCL, visible
 front-panel or new HDMI acceptance.
 
+
+### Peripheral continuation: SC2 USB3 bandgap clock lifetime
+
+Linux `e385f754bb85` corrects a remaining ordering hole: the SC2 `bgp`
+gate is parented by `pcie_pll`, so its probe-time enable bypassed the
+mode-aware reference-clock deferral. Both clocks are now acquired without
+enabling during SC2 probe; init selects the USB3 lane, waits, enables the
+reference and then bandgap. Failure and exit release bandgap before the
+reference. G12A managed clocks, PCIe mode, resets, tuning and USB2 boot
+quirks remain unchanged. CE and Khadas USB3-v2 probe ordering corroborate
+this sequence; no guessed supply, GPIO, clock or tuning value is added.
+
+The extracted production probe/init/exit callbacks reproduce the old
+early-parent-enable path. After the fix, 24 clock-tree/error cases and
+66 init cycles pass, covering enable failures, analog-init failure,
+reset failure, repeated initialization and G12A/PCIe ownership. Analog
+I/O is stubbed in this temporary host exercise, not physical USB3 proof.
+The record is `Work/sc2-peripheral-followup-20261020T184813Z/`.
 
