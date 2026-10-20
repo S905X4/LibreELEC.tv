@@ -158,6 +158,7 @@ Use the corresponding existing filename, in order:
 51. `0051-regulator-kunit-description.patch`
 52. `0052-meson-sc2-cpu-idle-state.patch`
 53. `0053-meson-sc2-firmware-wake-timer.patch`
+54. `0054-arm64-sc2-suspend-hash-affinity.patch`
 
 `Work/sc2-kernel-series.json` records the initial five exports;
 `Work/sc2-peripheral-verification.json` records the later source commits,
@@ -1749,7 +1750,7 @@ long stress, idle-state entry and whole-system suspend/resume remain separate.
 
 #### CPU idle and finite-wake prerequisites
 
-The current runtime lacks cpuidle state nodes and RTC class devices.
+The recovered active-DVFS runtime lacks cpuidle state nodes and RTC devices.
 Patch 0052 describes the exact stock/CE SC2 CPU power-down state with PSCI
 `0x10000`, timer-stop and 4000/5000/10000 us entry/exit/residency, using the
 native `entry-method = "psci"` binding. All CPUs reference it. The synthetic
@@ -1771,4 +1772,30 @@ reconciliation, bounded thermal/timekeeping restoration, an independent
 recovery/wake path, and genuinely RAM-independent roots or proven USB-root
 preservation. Both deep and s2idle suspend devices; native s2idle lacks the
 vendor AO mailbox freeze handshake. Advertised `mem` is not acceptance.
+
+#### SC2 suspend-context affinity correction
+
+The first idle candidate, LE `2277f051c77c`, panicked before userspace with
+concurrent instruction aborts and stack-canary failure. The owner recovered
+the prior active-DVFS payload; authenticated boot
+`9bd4b2ed-6d44-4444-ab8a-0ed351d357a7` is running with all CPUs online,
+userspace/1608 MHz, no failed units and taint 0. The persistent selector was
+restored to `sc2-cpu-ab0dc7a7`; the failed payload is not selected again.
+
+The running DT supplies firmware CPU IDs 0/1/2/3, whereas the secondary boot
+messages report physical MPIDR affinities 0x100/0x200/0x300. The native
+suspend hash consequently masks Aff0 with 0x3, making every hardware CPU
+publish its saved stack to slot 0. CE and Khadas normalize MT-style MPIDRs
+before both save and restore; the native donor omitted that prerequisite.
+Attribution of the complete panic to this collision remains an inference
+until the corrected candidate passes controlled hardware verification.
+
+Patch 0054 corrects the hash descriptor at initialization for SC2 with MT
+set and flattened Aff0 IDs. It retains the proven PSCI CPU_ON/AFFINITY_INFO
+arguments and leaves already-physical DT IDs and other platforms unchanged.
+Both original assembly paths then use Aff1 and distinct context slots.
+Extracted production C plus AArch64 assembly executed under QEMU reproduces
+three collision scenarios before the fix; all seven topology scenarios and
+336 saved-context checks pass afterward. This is not firmware or board
+suspend acceptance. Do not enable whole-system suspend from this result.
 
