@@ -1479,8 +1479,72 @@ MMC matches and unchanged CPUFreq-off boot arguments. The four changed
 kernel/binding files in LE's actual applied build tree match `linux/`.
 The shipped HCD and license exactly match the public source bytes used in
 the physical Bluetooth load; private calibration and global `BCM.hcd` are
-absent. This candidate was not uploaded or booted on the box, and no new
-QEMU acceptance is claimed. Unsuppressed checkpatch reports four local
+absent. At that build-verification stage the candidate had not been uploaded
+or booted on the box, and no new QEMU acceptance was claimed. Unsuppressed
+checkpatch reports four local
 Change-Id/missing-sign-off errors and one binding-split warning; the series
 is not an upstream-ready submission.
+
+### Physical update acceptance: eMMC high-speed reads and address provenance
+
+The candidate above subsequently booted through the standard `.update`
+path. Pinned-key authenticated SSH returned with boot ID
+`438a4f86-5c53-4310-a379-bf8f20a95af1`, Linux 6.18.57 and build `c58b4ca`.
+Installed KERNEL/SYSTEM/DTB hashes match the verified delivery. The selector
+and `uEnv.ini` remain byte-identical to the pre-update backup; CPUFreq stays
+disabled. `/flash` is read-only USB vfat, `/storage` is persistent USB ext4,
+and `.update` is empty. In this normal USB boot, loop0 uses `/flash/SYSTEM`;
+the RAM-mode `/dev/SYSTEM` alias does not exist.
+
+Before deployment, all eight boot files were backed up both on the host
+and at `/storage/sc2-pre-c58b4ca-20261020T182046Z.tar`. Both copies have
+SHA-256 `6d58fc3951db731365339c7d2c3d5c030fd759fbd33129aceb1d23484367865f`.
+The host copy and complete transaction are under
+`Work/sc2-physical-followup-20261020T182046Z/`.
+
+* **eMMC passed bounded read acceptance:** `fe08c000/mmc2` now identifies
+  Samsung `CKTM4R`, 62,537,072,640 bytes, in 8-bit MMC high-speed mode,
+  requested 52MHz / actual 49.85MHz. The previous CMD6/`-84` initialization
+  failure did not recur. `mmc-direct-read.json` records two SHA-256-identical
+  O_DIRECT reads of the first 16MiB of the user area and first 1MiB of each
+  boot area. These bypass the page cache; all three areas retained `ro=1`
+  and `force_ro=1`. No eMMC mount, write, RPMB access or raw ioctl was
+  performed, and no MMC2 error appeared in the subsequent kernel journal.
+  This is not full-media integrity, write, HS200/HS400, sustained-load or
+  power-cycle acceptance. Vendor U-Boot's own environment persistence is
+  outside the assistant's no-eMMC-write claim.
+* **Panel remains blocked:** the shipped diagnostic reports
+  `fd6551 0-0024: error -ENXIO: failed to blank control address 0x24`.
+  The client is unbound and no linedisp device exists. The userspace panel
+  service being active is not evidence of a working display. No new bus
+  actuation, timing change or NACK bypass was attempted; IC marking,
+  supply and CLK/DAT/ACK waveform remain the next hardware prerequisites.
+* **Radio initialization survived this reboot:** brcmfmac exposes the
+  owner's WLAN address using the persistent private calibration override;
+  native Bluetooth automatically loads BCM4335C0 build 0268. Shared LPO is
+  32768Hz with both consumers. A passive `iw ... scan dump` query found zero
+  cached BSS in this boot; the previous boot's 27 BSS are not inherited as
+  new scan acceptance. No association, DHCP, Bluetooth RF/pairing or suspend
+  acceptance is claimed.
+* **Factory Bluetooth identity is still unknown:** retained Android HAL
+  instructions select `ro.bt.bdaddr_path`, then `ro.boot.btmacaddr`, then
+  `persist.service.bdroid.bdaddr`. The BCM library can generate and persist
+  a `22:22:xx:xx:xx:xx` fallback, so a persistent property is not factory
+  provenance. Stock declares both efuse `mac_bt` at offset 6 and a distinct
+  normal-storage unifykey `mac_bt`; neither demonstrates the selected source
+  or actual bytes. Do not derive an address from the WLAN MAC or wire an
+  unverified offset-6 cell. The reported `43:39:00:00:1F:AC` remains
+  unauthenticated as a factory identity.
+* **No speculative efuse enablement:** declared SMC read/max/shared-buffer
+  IDs match the existing native Meson interface, but its mandatory efuse
+  clock has no established SC2 mapping. `read-only;` alone also leaves the
+  provider's destructive write callback installed. No provider node, new
+  efuse call or address override was added.
+
+After the read exercise the system remains `running`, with no failed
+units and taint 0. `deployment.json`, `mmc-direct-read.json`, the retained
+postboot journals and both address-contract reviews preserve the checks
+and their limits. This warm-reboot result is not cold-power, TCL, visible
+front-panel or new HDMI acceptance.
+
 
