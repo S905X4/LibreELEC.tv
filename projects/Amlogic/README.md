@@ -248,6 +248,47 @@ HEVC/AV1 Request/context contracts, matching AV1 FFmpeg backend and applicable
 firmware/TA redistribution authority are still missing. No unused loader or
 fake decoder is registered to conceal these blockers.
 
+#### Built native-cutover candidate
+
+Linux source head `9a163067147f538a618b495ca530b20334132817` and LE build
+head `e131ef49be` produced
+`target/LibreELEC-SC2.aarch64-12.2-devel-20261021011719-e131ef4`:
+
+| Artifact | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `.img.gz` | 68646377 | `393b4e59a93fd5bf2c80a98204e1603c2fc4137e06abffce6bff60fa4faf157a` |
+| `.tar` | 83640320 | `a446c7a06809707a647dcf38a9f839ab88defa38474350ee4c9cd09aa302ac53` |
+
+The actual LE-applied six changed kernel/binding sources match `linux/`
+byte-for-byte. Image/TAR KERNEL, SYSTEM, DTB and startup script match;
+uImage CRCs, full packaged-DTB schema and embedded Broadcom configuration
+passed. Fresh and updated normal/live boot arguments retain `cpufreq.off=1`.
+The exact shipped SYSTEM and extracted embedded initramfs ran on private QEMU
+media with the same-source PL011/VirtIO diagnostic kernel: real resize/reboot,
+persistent `/storage`, authenticated loopback SSH, 1 MiB SFTP readback, native
+brcmfmac/hci_uart/btbcm module loading without ABI errors, 256 MiB CMA and
+ALSA null PCM passed. The **shipped AArch64** panel binary passed its transition
+fixture, and the shipped collector ran both passively and with isolated roots.
+System state reached `running`, no failed units, kernel taint zero. The
+unmasked console service uses a VM-only RAM udev alias, not a product change.
+The `toram live` path retained SSH/ConnMan and the exact RAM SYSTEM hash after
+unmounting `/flash`, with tmpfs storage and no card partitions or swap mounted.
+
+Poweroff exited zero; its log still reports a busy shutdown mount/finalization
+warning, so no clean-final-unmount claim is made. Initial host build attempts
+needed the existing project-local GCC 12 PATH and Parse::Yapp PERL5LIB; no
+host installation was performed. SSH readiness probes emitted transient
+pre-banner errors before actual authentication; final exercised checks passed.
+The five new kernel patches have zero checkpatch errors and two warnings
+(binding/source split and British spelling), explicitly excluding the local
+Change-Id/no-signoff conflict. This is not an upstream/DCO-ready series.
+
+Logs, commit identities and all remaining gates are indexed by
+`Work/sc2-native-cutover-20261021/verification.json`; exact-image results are
+in its `runtime/result.json`. No candidate was uploaded or booted on the box,
+no active reboot was requested, and eMMC `-84`, wireless/panel electrical
+acceptance, HEVC/AV1/Kodi and direct TCL cold-boot retention remain unresolved.
+
 ### Consolidated peripheral candidate
 
 The earlier candidate added native Panfrost matching for SC2 Mali-G31, CECB
