@@ -2703,3 +2703,33 @@ Evidence: `Work/sc2-decode-reference-20261022/{preload-build,startup-input-smoke
 kernel build output `artifact://2579`; UART observation
 `ev_0014afd9eab6087e2262153d254103bb0df4b1ada4b03bbcf81284b0d74f9c01`.
 
+
+#### Final candidate and runtime closure
+
+The committed-source candidate
+`LibreELEC-SC2.aarch64-12.2-devel-20261022025300-ffd8726` built successfully
+from LE `ffd8726bc98667b07a5282e61d1590b8deb9f268`; the complete native
+kernel source tip is `cff7ed8862e5474c71db71f93b346ac691f55a10`.
+Both `.img.gz` and update `.tar` remain host artifacts, **not deployed**.
+Their sidecar SHA-256 values match; extracted KERNEL, SYSTEM, DTB and selector
+are identical across the image and TAR. Kernel header/data CRCs, load/entry
+`0x02000000` and uncompressed AArch64 uImage type check. The packaged binary
+and unit match their installation sources; the Kodi wants-link exists, and
+neither private original asset is shipped. See `candidate-delivery.json`.
+
+The isolated QEMU attempt did **not** validate the notification guard. Its
+guest raised Undefined instruction at `__arm_smccc_smc` during the initial
+`meson_sm_map_shmem`, before reaching the attribute scenario. QEMU exited 0
+after the guest panic with `-no-reboot`; that exit is not success. No monitor
+return was fabricated and no production SMC was suppressed. See
+`vm-startup-{smoke,limit}.json`; physical once/error/concurrency coverage stays open.
+
+Final physical observation still has the original boot ID, running systemd,
+no failed units, active Kodi/panel/console and all three eMMC areas read-only.
+The console restart count is now **1**, not zero: its journal records an
+invalid login, successful deactivation and restart. Kodi and panel remain
+at zero. This neither proves a driver failure nor gives the execution
+environment access to the host TTL device. The final strict zero-restarts
+closure assertion consequently failed; its diagnostic is preserved rather
+than reset or hidden in `final-board-health-diagnostic.json`.
+
