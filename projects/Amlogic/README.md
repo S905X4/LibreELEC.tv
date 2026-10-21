@@ -2215,7 +2215,8 @@ Using the actual revised soundconfig and isolated ALSA configuration on the
 board, two HDMI opens and one default-device open completed S16_LE/48kHz
 stereo playback, with PCM1 RUNNING and PCM0 closed. Streams closed normally,
 IEC958 preservation remained enabled and temporary files/routes were restored.
-This is source smoke evidence, not yet installed-image or audible-sink acceptance.
+The source smoke was followed by a verified full-image deployment below;
+neither software run alone establishes audible-sink acceptance.
 
 Evidence: `Work/sc2-hardware-20261021T023839Z/` retains the failing-open
 trace, before/after profile runs, real GPU mode states, owner confirmation,
@@ -2225,4 +2226,24 @@ No Wi-Fi association or Bluetooth pairing was attempted. The current USB3
 reader endpoint is 5000 Mb/s; 32MiB fsync and three fresh hash readbacks
 matched before the owner explicitly closed further USB3 testing. No native
 TF, status LED, peripheral suspend or eMMC write test was performed.
+
+The full image `LibreELEC-SC2.aarch64-12.2-devel-20261021105313-a79d3f4`
+has now been deployed by the standard update after an eight-file backup
+verified on host and box. Backup SHA-256:
+`913e85d11b295441c5bdf5be73c157c5d1daf3f8e0df66ef58f440bc99d552fe`.
+The new boot ID is `00f1d6d7-578a-440a-92b9-81b6d0f2737f`. Image/TAR/live
+payload hashes match; both installed audio files match the committed source.
+The route is configured automatically after boot without manual mixer writes.
+Two HDMI runs and one default run advanced the PCM1 hardware pointer during
+48kHz stereo tones. Additional 32/44.1kHz S16 and 48kHz S24 runs succeeded.
+Afterward every PCM was closed, IEC958 and routing controls retained their
+values, the temporary audio files were gone and no new kernel messages appeared.
+
+Final state: running, no failed units, taint0, schedutil, four CPUs, native
+panel service active, fb0 unblanked, USB ext4 storage, read-only flash and
+read-only/unmounted eMMC. Selector and live parameters are unchanged. No
+deployment command wrote eMMC; vendor U-Boot's own writes are not covered
+by that statement. Wi-Fi and Bluetooth devices remain registered after boot.
+Actual sink audio/channel observation and a responding CEC peer still remain.
+The earlier USB3, TF, LED, radio-connection and suspend scope limits still apply.
 
