@@ -130,6 +130,15 @@ else
 
 # Amlogic audio devices
   case $(dtsoc) in
+    amlogic,sc2)
+      # HK1 RBOX X4 uses FRDDR_B and TDMOUT_C for HDMI.
+      # DPCM needs this route before the playback PCM can be opened.
+      mixer "$card" 'FRDDR_B SINK 2 SEL' 'OUT 2'
+      mixer "$card" 'TDMOUT_C SRC SEL' 'IN 1'
+      mixer "$card" 'I2S SRC' 'I2S C'
+      mixer "$card" 'FRDDR_B SRC 2 EN' on
+      mixer "$card" 'I2S OUT EN' on
+      ;;
     amlogic,g12*|amlogic,sm1)
       # AXG HDMI // Logic assumes TDMOUT_A is not present in device-tree when TDMOUT_B is used
       TDMOUT=$(awk '/TDMOUT/ && $2=="OUT" {print substr($1,length($1),1)}' /sys/firmware/devicetree/base/sound/audio-routing | sort | head -n 1)

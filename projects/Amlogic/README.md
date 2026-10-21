@@ -17,13 +17,13 @@ This project is for Amlogic SoC devices
 
 ## SC2 / HK1 RBOX X4 minimal bring-up
 
-The owner's latest sequence is physical IR acceptance, FD6551 panel,
-basic HDMI, then Kodi and decode/playback integration. CPU software is
-accepted under the revised scope below; internal eMMC installation is
-deferred, not a prerequisite for this new sequence. Preserve other
-unfinished hardware facts rather than calling identification a functional
-pass. The workspace `skill.md` sections 1.1/1.2 hold the current sequence
-and acceptance ledger, superseding historical ordering below.
+The owner has accepted IR RAW reception and the native FD6551 display.
+The current sequence is HDMI identification, CEC and audio, then remaining
+peripheral adaptation, and finally Kodi and chip decode integration.
+USB3 needs no further testing; status LEDs are not to be exercised now;
+native TF testing is deferred to eMMC installation. Wireless acceptance
+currently means Wi-Fi/Bluetooth discovery only, not association or pairing.
+The workspace `skill.md` sections 1.1/1.2 preserve the full acceptance ledger.
 
 CPU software acceptance is complete under the owner's revised scope below.
 Production SC2 entries use the existing kernel schedutil default; updates
@@ -38,10 +38,9 @@ critical-area backups. Placement, internal loading, install/update and
 rollback still require implementation and explicit write-range approval.
 RAM/live independence was exercised, not internal installation.
 
-The owner reports red and blue LEDs, blue lit, a blank front display, an
-available IR remote for real key testing, TF/USB3 test devices, and no
-optical S/PDIF receiver. Runtime peripheral functions remain acceptance
-items; further peripheral suspend/resume testing is explicitly out of scope.
+The owner reports red and blue LEDs, blue lit, and has accepted the native
+front display. Native TF remains deferred and there is no optical S/PDIF
+receiver. Further peripheral suspend/resume testing is explicitly out of scope.
 
 Build from the LibreELEC root as a non-root user with the normal LE host
 dependencies and GCC 12 available on `PATH`:
@@ -2178,4 +2177,52 @@ Use the owner's physical confirmation above; no mapping, GPIO, driver or
 policy change is warranted. Previously inspected source profiles remain
 protocol references, not substitutes for the working device.
 
+
+### Basic HDMI rendering and native ALSA routing
+
+The owner confirmed a visible coloured kmscube with a supplied image.
+The device reports `Mali-G31 (Panfrost)`, OpenGL ES 3.1, Mesa 25.1.9.
+Finite atomic runs rendered 179/149/179 frames at 720p60/1080p50/1080p60
+and restored fb44 and the 1080p60 console. Keep stdin open during kmscube:
+SSH stdin EOF makes it exit before rendering, despite successful EGL setup
+and exit status zero. Explicitly unblank fb0 after restoring the console.
+
+glmark2 rendered its build and texture scenes. Its DRM validation is not a
+reliable texture oracle here: main requests 800x600 validation, but the DRM
+backend forces the largest advertised mode, 3840x2160, even offscreen.
+The retained texture validation failure is not a diagnosed GPU defect.
+
+The current receiver is `HD TO USB`; both 128-byte EDID checksums are valid.
+Its LPCM ELD advertises stereo, 32/44.1/48 kHz and 16/20/24 bits. CECB obtains
+physical address 1.0.0.0 and playback logical address 4. TV polling returns
+NACK and topology discovery finds only this box. This does not prove whether
+the capture chain passes CEC or whether a TV would interoperate. The temporary
+logical address was cleared; no standby, wake or input-switch command was sent.
+
+Advertised `hdmi:CARD=X4,DEV=0` originally failed with `EINVAL`. The generic
+AXG profile selects PCM0, whereas this board uses FRDDR_B/PCM1 for HDMI.
+Even a corrected PCM1 profile cannot open until the DPCM route exists:
+`openat(pcmC0D1p)` fails before ALSA's HW_PARAMS control hooks can run.
+
+Extend the existing udev `soundconfig` SC2 branch to select FRDDR_B OUT2,
+TDMOUT_C IN1 and I2S C and enable their two routing switches before opening
+PCM1. The SC2-only AXG card overlay selects that PCM and the actual backend
+IEC958 control at PCM device5. Its default softvol/plug path delegates to
+the same HDMI definition; other Amlogic device profiles are unchanged.
+The existing saved `sound.conf` override remains authoritative.
+
+Using the actual revised soundconfig and isolated ALSA configuration on the
+board, two HDMI opens and one default-device open completed S16_LE/48kHz
+stereo playback, with PCM1 RUNNING and PCM0 closed. Streams closed normally,
+IEC958 preservation remained enabled and temporary files/routes were restored.
+This is source smoke evidence, not yet installed-image or audible-sink acceptance.
+
+Evidence: `Work/sc2-hardware-20261021T023839Z/` retains the failing-open
+trace, before/after profile runs, real GPU mode states, owner confirmation,
+CEC transactions and radio results. Wi-Fi discovery found 14 BSS across
+2.4/5GHz; Bluetooth discovery found 10 devices and stopped cleanly.
+No Wi-Fi association or Bluetooth pairing was attempted. The current USB3
+reader endpoint is 5000 Mb/s; 32MiB fsync and three fresh hash readbacks
+matched before the owner explicitly closed further USB3 testing. No native
+TF, status LED, peripheral suspend or eMMC write test was performed.
 
