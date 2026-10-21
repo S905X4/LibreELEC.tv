@@ -162,6 +162,7 @@ Use the corresponding existing filename, in order:
 53. `0053-meson-sc2-firmware-wake-timer.patch`
 54. `0054-arm64-sc2-suspend-hash-affinity.patch`
 55. `0055-fd6551-write-without-ack.patch`
+56. `0056-meson-sc2-audio-power-lifetime.patch`
 
 `Work/sc2-kernel-series.json` records the initial five exports;
 `Work/sc2-peripheral-verification.json` records the later source commits,
@@ -2249,7 +2250,7 @@ tone run. HDMI audio therefore remains failed at the receiver, not accepted
 on the basis of PCM activity. A responding CEC peer also remains unavailable.
 The earlier USB3, TF, LED, radio-connection and suspend scope limits still apply.
 
-### HDMI silence: sender diagnosis
+### HDMI silence: sender diagnosis before the fix
 
 Evidence: `Work/sc2-hdmi-silence-20261021T032410Z/`. During an instrumented
 48kHz/S16 stereo stream, secure MC_CLKDIS changed from 0x6c to 0x64 and
@@ -2260,11 +2261,83 @@ enable/control at 0xfe330b30/0xfe330b34 were zero; lane0 mute was also zero.
 An acknowledged old sampler FIFO-empty event did not recur in the masked
 summary during the next stream; that is not proof of FIFO occupancy.
 
-These observations do not prove nonzero I2S payload or receiver audio, and
-no causal native-driver defect has been established. The BSP's post-enable
-sampler reset/N re-latch and atomic-N setting are being discriminated with
-a transient, bounded runtime experiment, not installed as a speculative
-kernel fix. Test audio is automatically stopped and its temporary files and
-N3 setting restored. Receiver audio-meter/monitoring observation is required;
-the development host exposes no HDMI capture device for a waveform check.
+These early observations did not prove nonzero I2S payload or receiver audio,
+and did not establish a causal driver defect. Bounded sampler reset/N re-latch,
+gain, DMA-memory, routing, phase and clock-gate experiments did not restore
+ordinary PCM. They did not justify permanent register workarounds. The later
+audio-domain comparison below established the missing power dependency.
+
+### SC2 audio-domain ownership: ordinary HDMI PCM fixed
+
+Linux `4cd5ee56f5fc` and LE patch
+`0056-meson-sc2-audio-power-lifetime.patch` fix the audio clock provider's
+missing runtime-PM ownership. The SC2 audio bus belongs to secure power
+domain 10. Before this fix, the bus was suspended and `SC2_AUDIO` was off
+even with a running FRDDR stream. Working CE had its audio domain on.
+Clock enablement, accessible registers and moving DMA pointers were not
+proof that the audio power dependency was satisfied.
+
+A same-boot off/on/off discriminator isolated the cause without changing
+the native PCM route or its registers. Ordinary S16 stereo was approximately
+-96 dBFS with the bus suspended, reached the OBS capture-card receiver at
+-23.799 to -23.770 dBFS when runtime PM held the bus active, and returned to
+approximately -96 dBFS after restoring automatic PM. Left/right dominant
+frequencies matched the generated 440/880 Hz tones. TDM sample replacement
+was a separate positive control, not the ordinary-PCM result.
+
+The provider now enables runtime PM and acquires a reference before
+initializing clocks/resets. A managed action releases it after their cleanup
+on probe failure or removal. Only the SC2 match enables this behavior;
+AXG/G12A/SM1 matches are unchanged. The provider remains powered while its
+clocks and reset controller are exposed; this does not implement idle
+context save/restore or claim additional suspend/resume acceptance. No
+userspace `power/control=on`, CE register replay or forced sample source is
+installed.
+
+Full candidate `LibreELEC-SC2.aarch64-12.2-devel-20261021201041-80d09c6`
+was built and deployed through the standard update path after notification.
+Image/TAR payloads, uImage CRCs and the build-applied clock source were
+verified. DTB, selector, normal/live parameters and UUIDs are unchanged.
+The existing eight-file host/device backup exactly matched the pre-update
+files; its SHA-256 is
+`223965fc8021c33bbc49ddb5863097e3bed506a6e738faaaf742415b50ab711c`.
+
+Authenticated SSH returned with boot ID
+`c894535c-e0c5-4495-827c-20249e8b2e13`. Installed KERNEL/SYSTEM/DTB/selector
+hashes match the release. Both the audio bus and clock provider are active
+with `power/control=auto`, without a manual PM override. Six ordinary
+playbacks each exited zero and passed receiver-level and left/right tone
+checks, with no PM, mixer or MMIO writes by the smoke scenario:
+
+| PCM case | Receiver sequences | Result |
+| --- | --- | --- |
+| HDMI S16_LE / 48 kHz, MMAP | 19488-19491 | 440 Hz left, 880 Hz right |
+| Default S16_LE / 48 kHz | 19496-19498 | 440 Hz left, 880 Hz right |
+| HDMI S16_LE / 44.1 kHz | 19503-19506 | 440 Hz left, 880 Hz right |
+| HDMI S16_LE / 32 kHz | 19511-19513 | 440 Hz left, 880 Hz right |
+| HDMI S24_LE / 48 kHz | 19518-19521 | 440 Hz left, 880 Hz right |
+| HDMI S32_LE / 48 kHz, MMAP | 19526-19528 | 440 Hz left, 880 Hz right |
+
+The receiver FFT bins include 441/883 Hz; these are measurements of the
+generated tones, not claimed oscillator calibration. `FC_DBGFORCE`, TDM
+replacement value and replacement mask stayed zero. Both PCM devices
+closed after every run. Receiver evidence uses the owner's OBS-only
+capture-card scene, not an independent hardware audio analyzer.
+
+Evidence is retained in `Work/sc2-audio-power-20261021/`:
+`causal-discriminator.json`, `artifact-verification.json`, deployment/health
+records and `production-pcm-smoke.json` (including the exact executed source).
+The long smoke's REA request exceeded the MCP transport's 30-second deadline;
+its complete local result records SSH exit zero and all six receiver checks.
+That transport failure is not presented as a successful REA capture envelope.
+CEC peer response, optical/analog reception, TCL/multi-TV behavior and Kodi
+decode acceptance are not established by this HDMI PCM fix.
+
+Final health was `running`, with no failed units, taint 0 and no new kernel
+messages after the six runs. Panel and 921600 serial-console services remain
+active; schedutil and all four CPUs remain enabled. Flash is read-only,
+storage remains USB ext4, and eMMC user/boot areas remain read-only and
+unmounted. The updater directory is empty. Playback has stopped and receiver
+levels returned to approximately -96 dBFS. Temporary probes were removed;
+their exact source is retained as evidence, not installed as a runtime hook.
 
