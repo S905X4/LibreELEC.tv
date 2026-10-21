@@ -1,0 +1,40 @@
+Subject: [PATCH] drmprime: create media-controller devices for V4L2 Request
+
+The AV1 Request backend exposes DRM PRIME frames through a V4L2REQUEST
+hardware device. Keep the existing HEVC DRM-device branch and do not pass
+a DRM render node to the media-controller backend.
+
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
+@@ -173,7 +173,8 @@
+       continue;
+ 
+     if ((config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) &&
+-        config->device_type == AV_HWDEVICE_TYPE_DRM)
++        (config->device_type == AV_HWDEVICE_TYPE_DRM ||
++         config->device_type == AV_HWDEVICE_TYPE_V4L2REQUEST))
+       return config;
+ 
+     if ((config->methods & AV_CODEC_HW_CONFIG_METHOD_INTERNAL))
+@@ -338,6 +339,21 @@
+       return false;
+     }
+   }
++  else if (pConfig && (pConfig->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) &&
++           pConfig->device_type == AV_HWDEVICE_TYPE_V4L2REQUEST)
++  {
++    // Request devices are media controllers, not DRM render nodes.
++    const int result = av_hwdevice_ctx_create(&m_pCodecContext->hw_device_ctx,
++                                             pConfig->device_type, nullptr, nullptr, 0);
++    if (result < 0)
++    {
++      CLog::Log(LOGERROR,
++                "CDVDVideoCodecDRMPRIME::{} - unable to create V4L2 Request context: {}",
++                __FUNCTION__, result);
++      avcodec_free_context(&m_pCodecContext);
++      return false;
++    }
++  }
+ 
+   m_pCodecContext->pix_fmt = AV_PIX_FMT_DRM_PRIME;
+   m_pCodecContext->opaque = static_cast<void*>(this);

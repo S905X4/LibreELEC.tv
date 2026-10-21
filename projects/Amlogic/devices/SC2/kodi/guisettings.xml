@@ -1,0 +1,3 @@
+<settings version="2">
+  <setting id="audiooutput.audiodevice">ALSA:hdmi:CARD=X4,DEV=0|HK1 RBOX X4</setting>
+</settings>

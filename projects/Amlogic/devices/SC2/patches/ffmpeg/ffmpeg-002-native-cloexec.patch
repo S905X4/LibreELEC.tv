@@ -1,0 +1,25 @@
+Subject: [PATCH] avutil: use the existing close-on-exec open wrapper
+
+FFmpeg 6 uses POSIX.1-2001 feature selection in this configuration, so
+O_CLOEXEC need not be visible. avpriv_open retains close-on-exec using
+the existing atomic flag or fcntl fallback instead of dropping it.
+
+--- a/libavutil/hwcontext_v4l2request.c
++++ b/libavutil/hwcontext_v4l2request.c
+@@ -31,6 +31,7 @@
+ #include <libudev.h>
+ 
+ #include "avassert.h"
++#include "file_open.h"
+ #include "hwcontext_drm.h"
+ #include "hwcontext_internal.h"
+ #include "hwcontext_v4l2request_internal.h"
+@@ -210,7 +211,7 @@
+ 
+     if (device && *device) {
+         struct media_device_info info;
+-        int fd = open(device, O_RDWR | O_CLOEXEC);
++        int fd = avpriv_open(device, O_RDWR);
+         if (fd < 0)
+             return AVERROR(errno);
+         ret = ioctl(fd, MEDIA_IOC_DEVICE_INFO, &info) < 0 ? AVERROR(errno) : 0;

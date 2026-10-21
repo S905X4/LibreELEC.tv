@@ -17,12 +17,20 @@ This project is for Amlogic SoC devices
 
 ## SC2 / HK1 RBOX X4 minimal bring-up
 
-The owner has accepted IR RAW reception and the native FD6551 display.
-The current sequence is HDMI identification, CEC and audio, then remaining
-peripheral adaptation, and finally Kodi and chip decode integration.
-USB3 needs no further testing; status LEDs are not to be exercised now;
-native TF testing is deferred to eMMC installation. Wireless acceptance
-currently means Wi-Fi/Bluetooth discovery only, not association or pairing.
+The owner has accepted IR RAW, the native FD6551 layout, GPU output and
+ordinary HDMI PCM, and now explicitly authorizes Kodi and codec integration.
+CEC awaits a real TV (the owner estimates about 15 hours); optical audio has
+no receiver and the analog headphones are broken. These external conditions
+do not block media development. The owner recalls visible panel-brightness
+changes, without quantified level differences. USB3 needs no further testing;
+status LEDs remain out of scope and native TF awaits eMMC installation.
+Wireless discovery is accepted; association/pairing remain separate.
+Local firmware/TA research proceeds independently of unresolved public
+redistribution grants, which are not implied by the owner's instruction.
+When implementation is unclear or a native run fails, the owner authorizes
+returning to the working CE environment for same-board observation, then
+adapting the evidenced success path to LE. CE remains a reference, not the
+product kernel; retain backups, notification and a verified LE return path.
 The workspace `skill.md` sections 1.1/1.2 preserve the full acceptance ledger.
 
 CPU software acceptance is complete under the owner's revised scope below.
@@ -50,9 +58,9 @@ LOCAL_CC=gcc-12 LOCAL_CXX=g++-12 PROJECT=Amlogic DEVICE=SC2 ARCH=aarch64 make im
 ```
 
 This selects `LINUX=amlogic-sc2`, Cortex-A55, and the pinned Linux 6.18.57
-recipe. It selects Mesa's Panfrost GLES path and DRM/GBM render diagnostics,
-not Kodi, skins, the settings addon, FFmpeg, PulseAudio or PipeWire. The
-independent `AMLGX` device is unchanged.
+recipe, Mesa's Panfrost GLES path, Kodi/Estuary, the settings addon and
+FFmpeg. Kodi uses native DRM/GBM and ALSA; PulseAudio and PipeWire remain
+disabled. The independent `AMLGX` device is unchanged.
 The kernel includes its gzip-compressed initramfs inside an **uncompressed
 legacy uImage**; there is no separate initrd to load. SD, USB host/storage,
 the serial console, and wired-network drivers are built in. Optional native
@@ -163,6 +171,11 @@ Use the corresponding existing filename, in order:
 54. `0054-arm64-sc2-suspend-hash-affinity.patch`
 55. `0055-fd6551-write-without-ack.patch`
 56. `0056-meson-sc2-audio-power-lifetime.patch`
+57. `0057-meson-sc2-native-optee.patch`
+58. `0058-meson-sc2-rdma-v2.patch`
+59. `0059-optee-sc2-reserved-command-pool.patch`
+60. `0060-meson-sc2-video-firmware-startup.patch`
+61. `0061-meson-sc2-secure-monitor-video-abi.patch`
 
 `Work/sc2-kernel-series.json` records the initial five exports;
 `Work/sc2-peripheral-verification.json` records the later source commits,
@@ -2340,4 +2353,353 @@ storage remains USB ext4, and eMMC user/boot areas remain read-only and
 unmounted. The updater directory is empty. Playback has stopped and receiver
 levels returned to approximately -96 dBFS. Temporary probes were removed;
 their exact source is retained as evidence, not installed as a runtime hook.
+
+### SC2 native OP-TEE and verified local video initialization
+
+SC2 patch `0057-meson-sc2-native-optee.patch` exports Linux commit
+`8b2e33a78622`: the native binding, DTS and function-15 collision fix together.
+The older `Work/sc2-kodi-20261021/optee-native-kernel.patch` is historical
+material for the same change, not another patch to apply. The sibling Linux
+tree already contains it. Patch 0059 separately exports `cff7ed8862e5`, the
+previously exercised reserved-command-pool preference. Only the exact
+`amlogic,meson-sc2-optee-tz`, `linaro,optee-tz` compatible suppresses the
+optional thread-count query that collides with video-load. Normal UID/API
+checks, capability negotiation, RPC and unknown-thread-count handling remain.
+The SC2 config enables TEE/OPTEE and leaves RPMB and insecure BL32 loading
+disabled. Generated configuration and hardware probe acceptance remain
+separate parent-owned checks.
+
+`sc2-optee-preload` is included with a conditional oneshot service ordered
+before Kodi. The service does nothing when either owner-supplied original
+asset is absent; this is a condition skip, not successful initialization.
+Its package pins OP-TEE client commit
+`9d6f69844ff60ec0966cf3659abcc38eda8b31ea` and compiles only the ordinary
+client API source together with the constrained provider. Upstream
+`tee-supplicant`, persistent logging, filesystem/RPMB handlers, plugins,
+socket support and profiling output are not built or installed. No original
+TA/package is embedded: local research does not establish redistribution rights.
+
+Runtime inputs are an explicit `/dev/teepriv0` through `/dev/teepriv9`, an
+absolute real TA directory, and an absolute package filename. Only the exact
+filename `526fc4fc-7ee6-4a12-96e3-83da9565bce8.ta` is opened relative to that
+directory; there is no alternate UUID, search path or unverified fallback.
+Final input components must not be symlinks, and assets must be regular
+files. Both files are snapshotted and length/SHA-256 checked **before any
+boot notification or privileged TEE operation**; subsequent replacement or
+modification cannot change the bytes used by either child:
+
+| Input | Bytes | SHA-256 |
+| --- | ---: | --- |
+| Original TA | 67776 | `5bf59144076af78c612bd04b51a92215e3c15ab1b8d8eeb0131c2e0336697568` |
+| Original video package | 1871104 | `032b96c498cee371c3eb37d60b1eae0f25e32c0b9695a1d91735408662306ce4` |
+
+The provider validates the privileged native OP-TEE/TZ device before signalling
+readiness. The loader uses normal libteec initialization and rejects selection
+of a client device other than the matching `/dev/teeN` before opening the TA.
+OpenSession uses PUBLIC login, VALUE_INPUT(total package bytes),
+VALUE_INPUT(0x100), NONE, NONE. Command 0 streams input-memref chunks of
+0x20000 bytes (last chunk shorter). Intermediate SUCCESS or BUSY permits
+the next chunk; the final result must be SUCCESS. Final BUSY and every
+other error fail. Each actual result and origin is printed.
+The historical `probe-stock-preload.c` in Work is evidence, not the
+packaged runtime entry point.
+
+Denied-RPC invariants are deliberately fail-closed:
+
+- Only RPC 0 (LOAD_TA for the exact UUID), 6 (transient SHM_ALLOC) and 7
+  (SHM_FREE) are implemented. Unknown TA UUIDs return ITEM_NOT_FOUND;
+  malformed known requests/unknown SHM IDs return BAD_PARAMETERS.
+- RPC 1 (legacy RPMB), 2 (all filesystem operations, including reads, creates,
+  enumeration and writes), reserved SQL filesystem RPC 8, and native RPMB
+  probe-reset/probe-next/frames RPCs 22/23/24 always return ACCESS_DENIED
+  (`0xffff0001`) through TEE_IOC_SUPPL_SEND. They do not call storage handlers
+  or fabricate successful empty responses. With CONFIG_RPMB disabled the
+  native kernel forwards these extended RPMB commands rather than routing
+  them to in-kernel devices.
+- Every other command returns NOT_SUPPORTED (`0xffff000a`), including plugin,
+  socket, profiling, tracing and vendor/raw-MMC extensions. The provider does
+  not open any MMC/RPMB device, issue a raw MMC ioctl, create storage files or
+  delegate to another supplicant. Kernel-handled time/wait RPC is unchanged.
+- Transient memory uses native SHM_REGISTER when REG_MEM is advertised,
+  otherwise SHM_ALLOC+mmap; handles and offset/length bounds are checked.
+  There are at most 32 live RPC allocations and 16 MiB total. Resource
+  exhaustion returns OUT_OF_MEMORY, not a successful fake buffer. LOAD_TA
+  implements null-buffer size queries and SHORT_BUFFER without partial copies.
+- The synchronous provider has no detached threads. The supervisor waits for
+  readiness, monitors both children, stops the peer on failure, handles
+  INT/TERM/HUP, and reaps them. Children request parent-death SIGTERM. Normal
+  completion closes the client session/context before stopping the provider;
+  the provider drops its device, mappings, SHM descriptors and registered
+  allocations. On abnormal shutdown TERM is followed by KILL after five
+  seconds per child. Kernel/secure-world uninterruptible hangs cannot be made
+  safe or reliably time-bounded by userspace signal handling.
+
+Build commands, from the LE root with the existing project-local
+compiler/cache environment:
+
+```sh
+PROJECT=Amlogic DEVICE=SC2 ARCH=aarch64 scripts/build sc2-optee-preload
+# The normal SC2 image build includes the tool and patch 0057.
+LOCAL_CC=gcc-12 LOCAL_CXX=g++-12 PROJECT=Amlogic DEVICE=SC2 ARCH=aarch64 make image
+```
+
+For an isolated smoke with assets supplied locally by their owner, the target
+command is explicitly bounded by the parent (paths are examples, not shipped
+assets or a deployment instruction):
+
+```sh
+/usr/sbin/sc2-optee-preload \
+  /dev/teepriv0 /run/sc2-local-ta /run/sc2-local-input/video_ucode.bin
+```
+
+Do not run an unrestricted tee-supplicant alongside this tool. A competing
+privileged-device owner must make startup fail, not trigger a fallback. Retain
+eMMC user/boot read-only state and do not provision, reset, read or write RPMB.
+Parent acceptance must distinguish kernel probe, original TA load/open,
+complete package acceptance and actual HEVC/AV1 hardware decoding. The last
+is not supplied or proven by a preload success.
+
+Source/evidence boundaries: `optee-native-evidence.json` records the real
+function-15 ABI collision and native probe path; `local-firmware-identities.json`
+records the extracted asset identities. Actual stock UID/API/capability
+returns, usable SHM, TA authentication and storage-independent TA behavior
+still require the native smoke. An advertised ASYNC_NOTIF capability without
+a real interrupt, no usable negotiated SHM, or TA dependence on denied
+storage is a genuine failure, not permission to invent ABI data or relax the
+RPC policy. Linux `drivers/tee/optee/rpc.c` forwards user-routed storage RPC
+even with RPMB disabled, hence the provider's explicit denials. Autonomous
+secure-world firmware/provisioning/storage actions cannot be constrained by
+this provider or Linux block read-only flags. No claim of zero secure-world
+writes or decode acceptance follows. Actual parent build/runtime results
+are recorded in the following section.
+
+### SC2 historical preload comparison and boot-complete safety boundary
+
+The same hash-verified constrained loader and original inputs were exercised
+on native Linux 6.18.57 and the real CE 5.4.210 driver. Both initialized the
+client successfully, then returned `OpenSession=0xffff0007`, origin 3, before
+any TA-load RPC. CE's secure logger identified the failing stage:
+
+```text
+ta_open:202 ree system is not ready, ta can not be loaded.
+init_elf:259 sys_open_ta_bin(526fc4fc-7ee6-4a12-96e3-83da9565bce8)
+init_with_ldelf:229 ldelf failed with res: 0xffff0007
+```
+
+This is a demonstrated REE-readiness gate, not evidence that TA signatures,
+package contents or normal-world IMEM DMA were rejected. The native reserved
+command-pool change in patch `0059-optee-sc2-reserved-command-pool.patch`
+does not supply this separate readiness handshake. Firmware capability and
+SHM queries reported capability mask 5 and reserved SHM at `0x07b00000`,
+size `0x00800000`, cached. These observations do not establish TA acceptance.
+
+The shipped CE supplicant calls `set_sys_boot_complete()` before opening its
+TEE device. Its compiled helper writes two bytes to
+`/sys/class/tee_info/sys_boot_complete`; the actual CE kernel's compiled
+setter issues SMC `0xb200e060` with zero argument registers. The getter uses
+`0xb200e061`. Vendor source explicitly associates the getter's value 1 with
+not needing an anti-rollback eFuse update. The actual sysfs read printed 0,
+but the compiled getter maps **every raw SMC result other than 1** to that
+text; the raw return value was not observed.
+
+The setter was **not invoked** in this historical comparison. Its secure-side
+persistent effects were not established. The owner subsequently authorized
+the single trial below and then the integrated continuation described at the
+end of this document. Authorization does not establish safety: denied RPC
+and Linux block read-only flags cannot prevent autonomous secure-world/eFuse
+writes. Neither always-burning nor harmless-readiness semantics are proven;
+the earlier unrestricted CE/Android run did not prove constrained-path success.
+
+Vendor sources also contain a normal-world IMEM loader, and the local stock
+package contains recoverable SC2 HEVC/AV1 CODE payloads. Their existence does
+not prove that those payloads can execute through that path under this board's
+factory BL32. No forced TEE-disable or raw-loader fallback was introduced.
+Neither HEVC nor AV1 has a working native SC2 Request decoder at this point.
+
+The isolated CE comparison ended with a notified soft reboot back into the
+unchanged `LibreELEC-SC2.aarch64-12.2-devel-20261021220337-e1fd09b` candidate,
+boot ID `ea7bc2c8-5a75-427a-abf4-1a77086fef3b`. All eight LE boot files match
+the pre-comparison manifest. Linux is 6.18.57, systemd is running with no failed
+units, taint is 0, and Kodi, panel and serial-console services are active with
+zero restarts. Kodi's real JSON-RPC endpoint answered `JSONRPC.Ping` with
+`pong`. The eMMC user area and both boot areas remain read-only. Temporary CE
+comparison input/tool copies were removed after their identities were checked;
+host evidence and original local assets remain. This is recovery and service
+health evidence, not decoded-video, seek, recovery or A/V-sync acceptance.
+
+Evidence under `Work/sc2-kodi-20261021/`: `ree-readiness-boundary.json`,
+`ce-constrained-preload-execution.json`, `ce-constrained-preload-secure-log.json`,
+`ce-supplicant-main-rea.json`, `ce-supplicant-boot-complete-rea.json`,
+`ce-compiled-boot-complete-rea.json`, `ce-tee-le-return-preflight.json`,
+`ce-tee-le-return-health.json` and `ce-tee-staging-cleanup.json`. The two
+supplicant records and compiled-kernel record carry exact REA Evidence IDs;
+the matched runtime logs and recovery records are direct SSH observations.
+
+### SC2 historical single authorized CE-equivalent LE trial
+
+After the irreversible-effect warning, the owner initially authorized one
+manual notification. A private RAM-only module on native LE boot
+`ea7bc2c8-5a75-427a-abf4-1a77086fef3b` issued `0xb200e060` once with x1
+through x7 zero; raw a0 through a3 were all zero. That initial authorization
+was consumed. This trial added no permanent startup call and did not permit
+unrestricted RPC, a TEE-disable fallback or arbitrary persistent writes.
+The later continuation authorization supersedes the old single-call stop rule.
+
+The existing constrained loader then verified the original TA/package hashes
+and completed the actual native transaction:
+
+```text
+initialize result=00000000
+open result=00000000 origin=4
+allocate result=00000000
+invoke offset=1835008 offered=36096 result=00000000 origin=4
+preload accepted: 1871104 original package bytes offered; not decode acceptance
+PRELOAD_EXIT 0
+```
+
+There were 15 chunks; the first 14 returned SHORT_BUFFER (`ffff000d`), as
+required by the stock streaming contract, and the final chunk returned success.
+The provider accepted only the exact original TA request and transient shared
+memory operations. Its observed RPMB command 1 returned ACCESS_DENIED
+(`ffff0001`); package preload nevertheless completed. This is positive evidence
+for storage-RPC-independent preload in this boot, not proof of no autonomous
+secure-world writes, harmless notification semantics or redistribution rights.
+
+A separate compatibility failure was observed after the provider connected:
+the device-enumeration PTA returned NOT_IMPLEMENTED (`ffff0009`) for
+GET_DEVICES_SUPP, triggering the upstream `optee_bus_scan` WARN at
+`drivers/tee/optee/core.c:68`. Taint became 4608 (4096 out-of-tree module plus
+512 WARN). Do not report a warning-free kernel or a resolved enumeration bug;
+no warning suppression was added. The bounded secure logger start failed
+despite SMC status zero because its control block was empty, and stopped;
+there is no secure-log interpretation of this successful preload.
+
+Systemd remained running without failed units; Kodi, hk1-panel and sc2-console
+were active with zero restarts. All eight boot-file SHA-256 values were
+unchanged. eMMC user, boot0 and boot1 stayed read-only; no preload/supplicant
+process remained and no native video node was present. Firmware-index loading,
+Request decoding, decoded frames, playback, seek, recovery and A/V sync were
+not established. Secure-side persistent semantics remain unknown; later owner
+authorization enables integration, not a claim that those effects are harmless.
+
+The existing TCP JSON-RPC endpoint on port 9090 answered `JSONRPC.Ping`
+with `pong`. The trial module was unloaded (its exit handler is empty), and
+the four hash-verified RAM module/input files were removed. The consumed
+`/run/sc2-ce-once-ea7bc2c8/notification-attempted` interlock was preserved;
+this is why the final `rmdir` returned directory-not-empty. It is not a
+remaining TA/package/module binary and must not be removed to permit a retry.
+Unloading the probe neither clears taint nor undoes secure-world side effects.
+
+Evidence under `Work/sc2-kodi-20261021/`:
+`ce-equivalent-notification-execution-rea.json`
+(`ev_ad38b5c2991d035dbe3ab00d14d8ac5068dbf430be36808ad90d222c44983311`),
+`ce-equivalent-constrained-preload-rea.json`
+(`ev_22c1dc80e35cf79a8fe98b07f3bacdc263990346e1bbdbfd7dd3287b6026d8a1`),
+`ce-equivalent-post-preload-dmesg.json`,
+`ce-equivalent-post-preload-health.json`,
+`ce-equivalent-post-preload-actual-units.json`,
+`ce-equivalent-post-preload-boot-hashes.json`,
+`ce-equivalent-post-preload-kodi-ping.json`,
+`ce-equivalent-trial-ram-cleanup.json`,
+`ce-equivalent-trial-cleanup-final.json` and `owner-boot-complete-decision.json`.
+
+### SC2 Request boundary after successful preload
+
+Successful preload removes the recorded TA-readiness blocker, not the native
+codec implementation boundary. The inspected Meson framework is stateful:
+`drivers/staging/media/meson/vdec/vdec.c:145-187,812-859` schedules ES-parser
+work, permits firmware-selected capture buffers and exposes no Request-control
+or required-request queue contract. Its shared `vdec_hevc.c` is a hardware-core
+driver, not an HEVC Request codec.
+
+The local vendor `vh265.c:10731-10773` reads firmware-produced RPM words and
+`:10970-10987` resumes slice reconstruction; `vav1.c:8495-8549` likewise reads
+firmware-parsed RPM summaries. These are not established writable per-Request
+parameter/context interfaces. Header parsing may remain internal to a correct
+Request implementation, but retained parser state must not override supplied
+controls. The complete controls-authoritative provisioning/restoration and
+reset/context-isolation contracts have not been established. This is not a
+claim that the hardware cannot implement Request semantics.
+
+Vendor reconstruction/MMU/reference/output/IRQ/reset algorithms are mapped in
+`Work/sc2-kodi-20261021/native-request-followthrough.json`. Current local AV1
+FFmpeg/Kodi Request patches already provide userspace integration; the saved
+device smoke does not supply the missing kernel decoder. Main10 capture/import,
+AV1 framing/tile offsets and grain-applied output remain unverified boundaries.
+Do not introduce a nonfunctional backend, guessed RPM writes, a format-only
+registration or software fallback as a completed codec.
+
+The inspected [Amlogic v9 proposal (2026-09-14)](https://lwn.net/Articles/1094261/)
+explicitly supports S805X2/S4 H.264, not SC2 HEVC/AV1. The inspected
+[jefflessard codec build list](https://github.com/jefflessard/meson-vdec/blob/main/drivers/media/platform/amlogic/meson-vdec/Makefile)
+has HEVC commented out and supplies no AV1 codec. Neither is a complete drop-in
+implementation for these goals. Further firmware-interface material or a
+separately authorized legitimate decode observation is needed to establish
+the unresolved context boundary; this research performed no additional live
+secure operation or CE boot. All later acceptance goals remain open.
+
+### SC2 integrated startup continuation and current verification limit
+
+The owner now authorizes the remaining end-to-end implementation and necessary
+controlled reference boots without per-step approval. Backups, advance reboot
+notification, a continuous TTL recovery console, denied storage RPC and no
+unknown eMMC/eFuse/RPMB provisioning remain required. The earlier consumed
+one-shot record is historical and is not erased or relabelled.
+
+Patch 0060 adds the exact `amlogic,meson-sc2-sm` implementation; patch 0061
+selects it in the SC2 DTS while retaining the generic compatible fallback.
+Other SoCs retain their existing secure-monitor command map. Codec clients use
+`meson_sm_call(fw, SM_VIDEO_FW_LOAD, &raw_status, index, core, swap, 0, 0)`;
+SC2 maps this to `0xb200000f`. This API alone does not implement a decoder.
+
+The root-only attribute is
+`/sys/bus/platform/devices/firmware:secure-monitor/boot_complete`. Probe never
+notifies. An explicit write of `1` issues `0xb200e060` with zero arguments
+once per kernel boot. The attempt is consumed before entry, serialized by a
+mutex and retained across reprobe; a modular driver is pinned after entry.
+Later writes return the recorded result without a second call, including
+after failure or lost delivery. Reads return `not-attempted` or
+`attempted a0=... a1=... a2=... a3=...`; nonzero a0 returns EIO on write.
+
+The service expects these private, owner-supplied files:
+
+```text
+/storage/.config/sc2-optee-preload/ta/526fc4fc-7ee6-4a12-96e3-83da9565bce8.ta
+/storage/.config/sc2-optee-preload/video_ucode.bin
+```
+
+It runs the explicit `--boot-complete /sys/bus/platform/devices/firmware:secure-monitor/boot_complete`
+option before the existing three positional arguments. The three-argument
+invocation without that option remains notification-free for an already
+initialized boot. Both original hashes must validate before notification;
+failure is not retried through an unrestricted provider or raw IMEM path.
+
+The real SC2 package and integrated kernel built successfully. On the unchanged
+physical LE boot, the newly built aarch64 program rejected independently
+corrupted TA and package hashes before writing a notification sentinel. With
+both authentic assets, it failed at the absent new sysfs attribute before
+starting TEE. The actual new service, temporarily loaded in RAM, reported
+`ConditionResult=no`, `ActiveState=inactive` and zero ExecMain start time when
+assets were missing. Its `Result=success` is a systemd skip, not preload success.
+RAM inputs/unit were removed; Kodi, panel and console remained active with
+zero restarts, and all three actual mmcblk2 user/boot nodes stayed read-only.
+
+The new secure-monitor schema passed `dt-doc-validate`; the compiled production
+DTB passed the selected secure-monitor binding with its power-controller
+dependency. Exact source commits and integration exports are recorded in
+`kernel-implementation-commits.json`: `eee8e44df515` for the startup API and
+`bc2d785d9827` for the SC2 compatible, plus the preserved TEE prerequisites
+above. Recording those older prerequisites did not change their working bytes.
+
+Current reboot verification is blocked: `/dev/ttyUSB0` in the execution
+environment is an inaccessible mode-000 empty regular file, not a character
+device, also confirmed by the independent REA host-process observation.
+No reference or candidate reboot is performed without the required recovery
+console. Native notification, index-load, decode and playback acceptance
+therefore remain open. The factory enumeration PTA `ffff0009` warning is
+unchanged; no suppression or unsupported success response was introduced.
+
+Evidence: `Work/sc2-decode-reference-20261022/{preload-build,startup-input-smoke,input-manifest,le-mmc-guards}.json`;
+kernel build output `artifact://2579`; UART observation
+`ev_0014afd9eab6087e2262153d254103bb0df4b1ada4b03bbcf81284b0d74f9c01`.
 
