@@ -2244,6 +2244,27 @@ panel service active, fb0 unblanked, USB ext4 storage, read-only flash and
 read-only/unmounted eMMC. Selector and live parameters are unchanged. No
 deployment command wrote eMMC; vendor U-Boot's own writes are not covered
 by that statement. Wi-Fi and Bluetooth devices remain registered after boot.
-Actual sink audio/channel observation and a responding CEC peer still remain.
+The owner subsequently reported no audible sound during a bounded stereo
+tone run. HDMI audio therefore remains failed at the receiver, not accepted
+on the basis of PCM activity. A responding CEC peer also remains unavailable.
 The earlier USB3, TF, LED, radio-connection and suspend scope limits still apply.
+
+### HDMI silence: sender diagnosis
+
+Evidence: `Work/sc2-hdmi-silence-20261021T032410Z/`. During an instrumented
+48kHz/S16 stereo stream, secure MC_CLKDIS changed from 0x6c to 0x64 and
+back, clearing audio-clock-disable bit3 while running. TOP clocks/reset,
+I2S lane0/16-bit/64fs, stereo layout, ACR/audio-infoframe enables and
+N=6144 matched their source-defined settings. SC2's separate TDM-C gain
+enable/control at 0xfe330b30/0xfe330b34 were zero; lane0 mute was also zero.
+An acknowledged old sampler FIFO-empty event did not recur in the masked
+summary during the next stream; that is not proof of FIFO occupancy.
+
+These observations do not prove nonzero I2S payload or receiver audio, and
+no causal native-driver defect has been established. The BSP's post-enable
+sampler reset/N re-latch and atomic-N setting are being discriminated with
+a transient, bounded runtime experiment, not installed as a speculative
+kernel fix. Test audio is automatically stopped and its temporary files and
+N3 setting restored. Receiver audio-meter/monitoring observation is required;
+the development host exposes no HDMI capture device for a waveform check.
 
