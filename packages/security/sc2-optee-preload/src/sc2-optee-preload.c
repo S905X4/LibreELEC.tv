@@ -75,12 +75,10 @@ struct rpc_shm {
 	size_t size;
 	int fd;
 	int id;
-	bool registered;
 };
 
 struct provider {
 	int fd;
-	uint32_t caps;
 	size_t used;
 	struct rpc_shm shms[SHM_SLOTS];
 	const unsigned char *ta;
@@ -177,11 +175,9 @@ static int notify_boot_complete(const char *path)
 
 static void release_shm(struct provider *p, struct rpc_shm *shm)
 {
-	/* Keep the registered allocation alive until its kernel reference closes. */
+	/* Keep the mapping alive until its kernel reference closes. */
 	close(shm->fd);
-	if (shm->registered)
-		free(shm->buffer);
-	else if (munmap(shm->buffer, shm->size))
+	if (munmap(shm->buffer, shm->size))
 		perror("munmap RPC SHM");
 	p->used -= shm->size;
 	memset(shm, 0, sizeof(*shm));
@@ -190,6 +186,7 @@ static void release_shm(struct provider *p, struct rpc_shm *shm)
 static uint32_t allocate_shm(struct provider *p, size_t count,
 			      struct tee_ioctl_param *v)
 {
+	struct tee_ioctl_shm_alloc_data data = { 0 };
 	struct rpc_shm *shm = NULL;
 	size_t size, i;
 
@@ -207,45 +204,28 @@ static uint32_t allocate_shm(struct provider *p, size_t count,
 	}
 	if (!shm)
 		return TEEC_ERROR_OUT_OF_MEMORY;
-	if (p->caps & TEE_GEN_CAP_REG_MEM) {
-		struct tee_ioctl_shm_register_data data = { 0 };
-		long page_size = sysconf(_SC_PAGESIZE);
+	/* Match the SC2 driver's negotiated reserved pool. External registered
+	 * page lists can fail in the factory TA loader with OUT_OF_MEMORY even
+	 * when normal-world allocation succeeds. Allocation failure stays fatal;
+	 * do not retry with a different transport or fabricated RPC response.
+	 */
+	data.size = size;
 
-		if (page_size <= 0 ||
-		    posix_memalign(&shm->buffer, (size_t)page_size, size))
-			return TEEC_ERROR_OUT_OF_MEMORY;
-		memset(shm->buffer, 0, size);
-		data.addr = (uintptr_t)shm->buffer;
-		data.length = size;
-		shm->fd = ioctl(p->fd, TEE_IOC_SHM_REGISTER, &data);
-		if (shm->fd < 0) {
-			perror("register RPC SHM");
-			free(shm->buffer);
-			shm->buffer = NULL;
-			return TEEC_ERROR_OUT_OF_MEMORY;
-		}
-		shm->registered = true;
-		shm->id = data.id;
-	} else {
-		struct tee_ioctl_shm_alloc_data data = { .size = size };
-
-		shm->fd = ioctl(p->fd, TEE_IOC_SHM_ALLOC, &data);
-		if (shm->fd < 0) {
-			perror("allocate RPC SHM");
-			return TEEC_ERROR_OUT_OF_MEMORY;
-		}
-		shm->buffer = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED,
-				   shm->fd, 0);
-		if (shm->buffer == MAP_FAILED) {
-			perror("map RPC SHM");
-			close(shm->fd);
-			shm->buffer = NULL;
-			return TEEC_ERROR_OUT_OF_MEMORY;
-		}
-		memset(shm->buffer, 0, size);
-		shm->registered = false;
-		shm->id = data.id;
+	shm->fd = ioctl(p->fd, TEE_IOC_SHM_ALLOC, &data);
+	if (shm->fd < 0) {
+		perror("allocate RPC SHM");
+		return TEEC_ERROR_OUT_OF_MEMORY;
 	}
+	shm->buffer = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED,
+			   shm->fd, 0);
+	if (shm->buffer == MAP_FAILED) {
+		perror("map RPC SHM");
+		close(shm->fd);
+		shm->buffer = NULL;
+		return TEEC_ERROR_OUT_OF_MEMORY;
+	}
+	memset(shm->buffer, 0, size);
+	shm->id = data.id;
 	shm->size = size;
 	p->used += size;
 	v->c = (uint32_t)shm->id;
@@ -356,7 +336,6 @@ static int serve(const char *device, const unsigned char *ta, int ready_fd)
 		fprintf(stderr, "not a privileged native OP-TEE TZ device\n");
 		goto out;
 	}
-	p.caps = version.gen_caps;
 	if (write(ready_fd, "R", 1) != 1)
 		goto out;
 	close(ready_fd);
@@ -397,7 +376,7 @@ out:
 		close(ready_fd);
 	/* Drop our device and SHM references; optee_release_supp completes queued
 	 * requests with communication errors when the last context ref releases.
-	 * Keep registered memory alive until its individual fd is closed.
+	 * Keep each allocation mapped until its individual fd is closed.
 	 */
 	if (p.fd >= 0)
 		close(p.fd);
@@ -442,6 +421,11 @@ static int preload(const unsigned char *package, const char *priv_device)
 		fprintf(stderr, "libteec selected a different TEE than %s\n", client_device);
 		goto out_context;
 	}
+	/* The pinned client otherwise registers malloc-backed pages. Use the
+	 * same negotiated reserved allocation as RPC for package chunks too;
+	 * do not retry registration failures or change the kernel capabilities.
+	 */
+	context.imp.reg_mem = false;
 	operation.paramTypes = TEEC_PARAM_TYPES(TEEC_VALUE_INPUT, TEEC_VALUE_INPUT,
 					      TEEC_NONE, TEEC_NONE);
 	operation.params[0].value.a = PACKAGE_BYTES;

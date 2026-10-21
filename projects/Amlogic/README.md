@@ -2420,11 +2420,13 @@ Denied-RPC invariants are deliberately fail-closed:
   socket, profiling, tracing and vendor/raw-MMC extensions. The provider does
   not open any MMC/RPMB device, issue a raw MMC ioctl, create storage files or
   delegate to another supplicant. Kernel-handled time/wait RPC is unchanged.
-- Transient memory uses native SHM_REGISTER when REG_MEM is advertised,
-  otherwise SHM_ALLOC+mmap; handles and offset/length bounds are checked.
-  There are at most 32 live RPC allocations and 16 MiB total. Resource
-  exhaustion returns OUT_OF_MEMORY, not a successful fake buffer. LOAD_TA
-  implements null-buffer size queries and SHORT_BUFFER without partial copies.
+- Transient RPC memory uses native SHM_ALLOC+mmap from the SC2 driver's
+  negotiated reserved pool; handles and offset/length bounds are checked.
+  The pinned libteec client uses that allocation path for package chunks too,
+  not malloc-backed SHM_REGISTER. Allocation failures remain fatal, without
+  transport retry. There are at most 32 live RPC allocations and 16 MiB total;
+  the actual reserved pool may exhaust earlier. LOAD_TA implements null-buffer
+  size queries and SHORT_BUFFER without partial copies.
 - The synchronous provider has no detached threads. The supervisor waits for
   readiness, monitors both children, stops the peer on failure, handles
   INT/TERM/HUP, and reaps them. Children request parent-death SIGTERM. Normal
@@ -2691,13 +2693,13 @@ dependency. Exact source commits and integration exports are recorded in
 `bc2d785d9827` for the SC2 compatible, plus the preserved TEE prerequisites
 above. Recording those older prerequisites did not change their working bytes.
 
-Current reboot verification is blocked: `/dev/ttyUSB0` in the execution
-environment is an inaccessible mode-000 empty regular file, not a character
-device, also confirmed by the independent REA host-process observation.
-No reference or candidate reboot is performed without the required recovery
-console. Native notification, index-load, decode and playback acceptance
-therefore remain open. The factory enumeration PTA `ffff0009` warning is
-unchanged; no suppression or unsupported success response was introduced.
+At the initial closure, the execution environment's `/dev/ttyUSB0` was an
+inaccessible mode-000 empty regular file, so that closure did not reboot.
+The owner subsequently clarified that TTL is captured on their separate host;
+no assistant-local serial mapping is required. The later authorized CE/native
+boots and their actual results are recorded below. The factory enumeration PTA
+`ffff0009` warning is unchanged; no suppression or unsupported success response
+was introduced.
 
 Evidence: `Work/sc2-decode-reference-20261022/{preload-build,startup-input-smoke,input-manifest,le-mmc-guards}.json`;
 kernel build output `artifact://2579`; UART observation
@@ -2710,7 +2712,7 @@ The committed-source candidate
 `LibreELEC-SC2.aarch64-12.2-devel-20261022025300-ffd8726` built successfully
 from LE `ffd8726bc98667b07a5282e61d1590b8deb9f268`; the complete native
 kernel source tip is `cff7ed8862e5474c71db71f93b346ac691f55a10`.
-Both `.img.gz` and update `.tar` remain host artifacts, **not deployed**.
+Both `.img.gz` and update `.tar` were host-only at that initial closure.
 Their sidecar SHA-256 values match; extracted KERNEL, SYSTEM, DTB and selector
 are identical across the image and TAR. Kernel header/data CRCs, load/entry
 `0x02000000` and uncompressed AArch64 uImage type check. The packaged binary
@@ -2732,4 +2734,58 @@ at zero. This neither proves a driver failure nor gives the execution
 environment access to the host TTL device. The final strict zero-restarts
 closure assertion consequently failed; its diagnostic is preserved rather
 than reset or hidden in `final-board-health-diagnostic.json`.
+
+### SC2 physical startup and reserved-SHM correction
+
+Evidence in `Work/sc2-decode-reference-20261022/` supersedes the initial
+host-UART blocker above. The owner supplies TTL on their own host. The original
+eight native USB boot files matched their host backup before publication;
+another verified external-storage backup was made. The `ffd8726` candidate
+was deployed only to removable USB. Normal/live arguments and CE recovery
+selectors were retained; no `.update`, internal installer or secure-firmware
+replacement was used. Factory U-Boot reported STORAGE environment saves during
+the CE boot, so this is not a whole-chain no-eMMC-write claim.
+
+Normal CE decoding of the three recorded 320x240 inputs produced actual
+`am-h265`/`am-av1` hardware activity. Scoped kprobes observed HEVC Main/Main10
+using index 17, core 0, and AV1 using index `0x4156314d`, core 2. All 308
+captured index-load calls returned zero; no swap calls or trace loss occurred.
+The probes and tracing instance were removed. This confirms the CE selectors,
+not native LE firmware execution or Request decoding.
+
+The native `ffd8726` image booted Linux 6.18.57. With no private assets, the
+actual service skipped and the notification remained `not-attempted`.
+Invalid writes `0`, `2`, and `1x` returned EINVAL without consuming it. Sixteen
+concurrent valid writes all returned two bytes, produced one kernel notification
+log entry, and retained raw a0-a3 = zero. The harness initially compared
+decimal text to the real `%#lx` output `0x0`, so that capture exited 1 after
+successful delivery; the saved raw report was interpreted without replay.
+Nonzero secure-return retention was not exercised or fabricated.
+
+Installing the two verified original assets on external `/storage` and
+starting the formal service accepted all 15 chunks (1,871,104 bytes), with
+RPC 1 still denied `ffff0001` and no remaining privileged provider. The next
+automatic boot exposed an actual failure before Kodi: TA OpenSession returned
+`ffff000c`, origin 3. This failure is retained, not hidden with a delay/retry.
+Using allocated reserved RPC memory opened the TA; a subsequent production
+smoke exposed the same error in libteec's separate registered package-chunk
+allocation. Both paths now select real reserved allocations before attempting
+the operation. No storage permission or kernel capability is changed.
+
+The rebuilt production binary then opened the TA, allocated the chunk buffer,
+accepted every original chunk and exited zero without another notification.
+The formal fresh-boot check of this allocator correction remains pending at
+this record. References: `ce-normal-fw-trace-{v3-target,summary}.json`,
+`native-startup-{postboot,guard-target,guard-interpretation,service-target}.json`,
+`native-autostart-postboot.json`, and
+`native-reserved-production-v2-summary.json` (Evidence
+`ev_d4b81f8892f1ed6963ed22fc0100827f6328e193a515da1aa72f8fb1517b808c`).
+The bounded secure logger still had an empty control block despite status zero;
+it was stopped and unloaded, and no secure-log explanation is claimed.
+
+Secure-side antirollback/eFuse/RPMB persistence remains unknown: the matched
+stored BL31/BL32 carriers do not supply analyzable matching secure handlers.
+Linux block read-only and denied normal-world RPC cannot prove their absence.
+The missing native HEVC/AV1 Request/context/completion/output implementations
+and real playback/seek/recovery/A/V-sync acceptance remain open.
 
