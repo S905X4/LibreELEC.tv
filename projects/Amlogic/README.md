@@ -2155,11 +2155,27 @@ display level 8 and a blinking colon. The trace instance was removed.
 Final state: running, zero failed units, taint 0, schedutil, four CPUs,
 USB ext4 storage, read-only flash and read-only/unmounted eMMC. No deployment
 command wrote eMMC; this does not assert that vendor U-Boot never saves its
-own environment. Native physical glyphs, icon positions and visible
-brightness steps still require the owner's observation before advancing.
+own environment. The owner subsequently confirmed the native time display
+and identified USB at the lower left and Ethernet at the upper right.
+The owner then explicitly confirmed that the display is correct and asked
+to stop image searches because the external examples do not match. Accept
+the current native display and retain its mapping; do not reopen glyph or
+layout acceptance based on those examples. Brightness-level differentiation
+has not been separately observed; earlier bus and clock evidence is retained.
 
 Evidence: `Work/sc2-fd6551-native-20261020T233650Z/` contains
 `artifact-verification.json`, `boot-backup.json`, `native-probe.json`,
 `native-runtime.json`, `native-runtime-summary.json`, `final-health.json`
 and `final-service-and-cleanup.json`.
+
+The owner's exact reply and source distinctions are saved in
+`owner-native-visible-result.json` in that evidence directory. No new
+hardware operation or reboot was needed to record this confirmation.
+
+External image lookup was stopped at the owner's request. The inspected
+promotional examples are not mapping or acceptance authority for this board.
+Use the owner's physical confirmation above; no mapping, GPIO, driver or
+policy change is warranted. Previously inspected source profiles remain
+protocol references, not substitutes for the working device.
+
 
