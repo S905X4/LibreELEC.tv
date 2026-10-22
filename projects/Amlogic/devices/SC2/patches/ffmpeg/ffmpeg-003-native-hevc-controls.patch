@@ -1,0 +1,418 @@
+Subject: [PATCH] avcodec: submit native HEVC controls in frame mode
+
+Correct DPB index lists, parameter IDs and PPS tool flags. Validate the
+CABAC byte_alignment and escaped offset rather than rounding an RBSP bit
+position. Frame-based decoders exposing slice controls receive their full
+array and packed raw NAL payloads in one request; entry offsets retain the
+native byte-length ABI. Submit decode mode and start-code mode on every
+request, preferring START_CODE_NONE when available. Preserve legacy
+slice-based buffer submission and control layouts.
+
+--- a/libavcodec/v4l2_req_hevc_vx.c
++++ b/libavcodec/v4l2_req_hevc_vx.c
+@@ -210,7 +210,7 @@
+     uint64_t timestamp;
+ 
+     if (!frame)
+-        return 0;
++        return 0xff;
+ 
+     timestamp = frame_capture_dpb(frame->frame);
+ 
+@@ -219,9 +219,10 @@
+             return i;
+     }
+ 
+-    return 0;
+-}
+-
++    return 0xff;
++}
++
++#if HEVC_CTRLS_VERSION <= 3
+ static const uint8_t * ptr_from_index(const uint8_t * b, unsigned int idx)
+ {
+     unsigned int z = 0;
+@@ -239,6 +240,40 @@
+     }
+     return b;
+ }
++#else
++static int raw_payload_offset(const HEVCContext *h, const uint8_t *buffer,
++                              uint32_t size, uint32_t *offset)
++{
++    GetBitContext aligned = h->HEVClc->gb;
++    unsigned int rbsp = 0, raw = 0, zeros = 0, target;
++
++    if (get_bits_left(&aligned) < 1 || get_bits1(&aligned) != 1)
++        return AVERROR_INVALIDDATA;
++    while (get_bits_count(&aligned) & 7) {
++        if (get_bits_left(&aligned) < 1 || get_bits1(&aligned))
++            return AVERROR_INVALIDDATA;
++    }
++    target = get_bits_count(&aligned) / 8;
++    while (rbsp < target) {
++        unsigned int byte;
++        if (raw >= size)
++            return AVERROR_INVALIDDATA;
++        byte = buffer[raw++];
++        if (zeros == 2 && byte == 3) {
++            if (raw >= size || buffer[raw] > 3)
++                return AVERROR_INVALIDDATA;
++            zeros = 0;
++            byte = buffer[raw++];
++        }
++        zeros = byte ? 0 : zeros + 1;
++        rbsp++;
++    }
++    if (raw >= size)
++        return AVERROR_INVALIDDATA;
++    *offset = raw;
++    return 0;
++}
++#endif
+ 
+ static int slice_add(V4L2MediaReqDescriptor * const rd)
+ {
+@@ -275,8 +310,13 @@
+         rd->offsets = p2;
+         rd->alloced_offsets = n2;
+     }
+-    for (size_t i = 0; i != n; ++i)
++    for (size_t i = 0; i != n; ++i) {
++#if HEVC_CTRLS_VERSION >= 4
++        rd->offsets[rd->num_offsets++] = offsets[i];
++#else
+         rd->offsets[rd->num_offsets++] = offsets[i] - 1;
++#endif
++    }
+     return 0;
+ }
+ 
+@@ -420,6 +460,10 @@
+     fill_pred_table(h, &slice_params->pred_weight_table);
+ 
+     slice_params->num_entry_point_offsets = sh->num_entry_point_offsets;
++#if HEVC_CTRLS_VERSION >= 4
++    slice_params->short_term_ref_pic_set_size = sh->short_term_ref_pic_set_size;
++    slice_params->long_term_ref_pic_set_size = sh->long_term_ref_pic_set_size;
++#endif
+ #if HEVC_CTRLS_VERSION <= 3
+     if (slice_params->num_entry_point_offsets > 256) {
+         slice_params->num_entry_point_offsets = 256;
+@@ -446,16 +490,21 @@
+     };
+ 
+     dec->num_active_dpb_entries = fill_dpb_entries(h, dec->dpb);
+-
+-    // The docn does seem to ask that we fit our 32 bit signed POC into
+-    // a U8 so... (To be fair 16 bits would be enough)
+-    // Luckily we (Pi) don't use these fields
++#if HEVC_CTRLS_VERSION >= 4
++    dec->short_term_ref_pic_set_size = h->sh.short_term_ref_pic_set_size;
++    dec->long_term_ref_pic_set_size = h->sh.long_term_ref_pic_set_size;
++#endif
++
++    /* Native controls contain DPB indices, never truncated signed POCs. */
+     for (i = 0; i != h->rps[ST_CURR_BEF].nb_refs; ++i)
+-        dec->poc_st_curr_before[i] = h->rps[ST_CURR_BEF].ref[i]->poc;
++        dec->poc_st_curr_before[i] = get_ref_pic_index(h, h->rps[ST_CURR_BEF].ref[i],
++                                                     dec->dpb, dec->num_active_dpb_entries);
+     for (i = 0; i != h->rps[ST_CURR_AFT].nb_refs; ++i)
+-        dec->poc_st_curr_after[i] = h->rps[ST_CURR_AFT].ref[i]->poc;
++        dec->poc_st_curr_after[i] = get_ref_pic_index(h, h->rps[ST_CURR_AFT].ref[i],
++                                                    dec->dpb, dec->num_active_dpb_entries);
+     for (i = 0; i != h->rps[LT_CURR].nb_refs; ++i)
+-        dec->poc_lt_curr[i] = h->rps[LT_CURR].ref[i]->poc;
++        dec->poc_lt_curr[i] = get_ref_pic_index(h, h->rps[LT_CURR].ref[i],
++                                               dec->dpb, dec->num_active_dpb_entries);
+ 
+     if (IS_IRAP(h))
+         dec->flags |= V4L2_HEVC_DECODE_PARAM_FLAG_IRAP_PIC;
+@@ -471,6 +520,9 @@
+ {
+     /* ISO/IEC 23008-2, ITU-T Rec. H.265: Sequence parameter set */
+     *ctrl = (struct v4l2_ctrl_hevc_sps) {
++#if HEVC_CTRLS_VERSION >= 4
++        .video_parameter_set_id = sps->vps_id,
++#endif
+         .chroma_format_idc = sps->chroma_format_idc,
+         .pic_width_in_luma_samples = sps->width,
+         .pic_height_in_luma_samples = sps->height,
+@@ -607,8 +659,20 @@
+     if (pps->slice_header_extension_present_flag)
+         flags |= V4L2_HEVC_PPS_FLAG_SLICE_SEGMENT_HEADER_EXTENSION_PRESENT;
+ 
++#if HEVC_CTRLS_VERSION >= 3
++    if (pps->deblocking_filter_control_present_flag)
++        flags |= V4L2_HEVC_PPS_FLAG_DEBLOCKING_FILTER_CONTROL_PRESENT;
++
++    if (pps->uniform_spacing_flag)
++        flags |= V4L2_HEVC_PPS_FLAG_UNIFORM_SPACING;
++#endif
++
+     /* ISO/IEC 23008-2, ITU-T Rec. H.265: Picture parameter set */
+     *ctrl = (struct v4l2_ctrl_hevc_pps) {
++#if HEVC_CTRLS_VERSION >= 3
++        .num_ref_idx_l0_default_active_minus1 = pps->num_ref_idx_l0_default_active - 1,
++        .num_ref_idx_l1_default_active_minus1 = pps->num_ref_idx_l1_default_active - 1,
++#endif
+         .num_extra_slice_header_bits = pps->num_extra_slice_header_bits,
+         .init_qp_minus26 = pps->pic_init_qp_minus26,
+         .diff_cu_qp_delta_depth = pps->diff_cu_qp_delta_depth,
+@@ -679,6 +743,7 @@
+     decode_q_add(&ctx->decode_q, &rd->decode_ent);
+ 
+     rd->num_slices = 0;
++    rd->num_offsets = 0;
+     ctx->timestamp++;
+     rd->timestamp = cvt_timestamp_to_dpb(ctx->timestamp);
+ 
+@@ -814,7 +879,7 @@
+     unsigned int n = 2;
+ #endif
+ 
+-    struct v4l2_ext_control control[6] = {
++    struct v4l2_ext_control control[8] = {
+         {
+             .id = V4L2_CID_STATELESS_HEVC_SPS,
+             .ptr = &controls->sps,
+@@ -834,6 +899,15 @@
+ #endif
+     };
+ 
++    control[n++] = (struct v4l2_ext_control) {
++        .id = V4L2_CID_STATELESS_HEVC_DECODE_MODE,
++        .value = ctx->decode_mode,
++    };
++    control[n++] = (struct v4l2_ext_control) {
++        .id = V4L2_CID_STATELESS_HEVC_START_CODE,
++        .value = ctx->start_code,
++    };
++
+     if (slices)
+         control[n++] = (struct v4l2_ext_control) {
+             .id = V4L2_CID_STATELESS_HEVC_SLICE_PARAMS,
+@@ -849,7 +923,7 @@
+         };
+ 
+ #if HEVC_CTRLS_VERSION >= 4
+-    if (offsets)
++    if (offsets && offset_count)
+         control[n++] = (struct v4l2_ext_control) {
+             .id = V4L2_CID_STATELESS_HEVC_ENTRY_POINT_OFFSETS,
+             .ptr = offsets,
+@@ -869,14 +943,25 @@
+     const HEVCContext * const h = avctx->priv_data;
+     V4L2RequestContextHEVC * const ctx = avctx->internal->hwaccel_priv_data;
+     V4L2MediaReqDescriptor * const rd = (V4L2MediaReqDescriptor*)h->ref->frame->data[0];
+-    int bcount = get_bits_count(&h->HEVClc->gb);
+-    uint32_t boff = (ptr_from_index(buffer, bcount/8 + 1) - (buffer + bcount/8 + 1)) * 8 + bcount;
++    uint32_t boff;
+ 
+     const unsigned int n = rd->num_slices;
+     const unsigned int block_start = (n / ctx->max_slices) * ctx->max_slices;
+ 
+     int rv;
+     struct slice_info * si;
++
++#if HEVC_CTRLS_VERSION <= 3
++    {
++        const int bcount = get_bits_count(&h->HEVClc->gb);
++        boff = (ptr_from_index(buffer, bcount / 8 + 1) -
++                (buffer + bcount / 8 + 1)) * 8 + bcount;
++    }
++#else
++    if ((rv = raw_payload_offset(h, buffer, size, &boff)) < 0)
++        return rv;
++    boff *= 8;
++#endif
+ 
+     // This looks dodgy but we know that FFmpeg has parsed this from a buffer
+     // that contains the entire frame including the start code
+@@ -890,16 +975,24 @@
+         }
+     }
+ 
+-    if (ctx->decode_mode == V4L2_STATELESS_HEVC_DECODE_MODE_FRAME_BASED) {
+-        if (rd->slices == NULL) {
+-            if ((rd->slices = av_mallocz(sizeof(*rd->slices))) == NULL)
++    if (ctx->decode_mode == V4L2_STATELESS_HEVC_DECODE_MODE_FRAME_BASED &&
++        !ctx->frame_slice_controls) {
++        if (n == 0) {
++            if (!rd->slices && !(rd->slices = av_mallocz(sizeof(*rd->slices))))
+                 return AVERROR(ENOMEM);
+             rd->slices->ptr = buffer;
+-            rd->num_slices = 1;
++            rd->slices->n_offsets = 0;
++#if HEVC_CTRLS_VERSION >= 2
++            fill_decode_params(h, &rd->dec);
++#endif
+         }
++        rd->num_slices = 1;
+         rd->slices->len = buffer - rd->slices->ptr + size;
+         return 0;
+     }
++
++    if (ctx->frame_slice_controls && n >= ctx->max_slices)
++        return AVERROR_INVALIDDATA;
+ 
+     if ((rv = slice_add(rd)) != 0)
+         return rv;
+@@ -909,14 +1002,13 @@
+     si->len = size;
+     si->n_offsets = rd->num_offsets;
+ 
+-    if (n != block_start) {
++    if (!ctx->frame_slice_controls && n != block_start) {
+         struct slice_info *const si0 = rd->slices + block_start;
+         const size_t offset = (buffer - si0->ptr);
+         boff += offset * 8;
+         size += offset;
+         si0->len = si->len + offset;
+     }
+-
+ #if HEVC_CTRLS_VERSION >= 2
+     if (n == 0)
+         fill_decode_params(h, &rd->dec);
+@@ -924,6 +1016,10 @@
+ #else
+     fill_slice_params(h, rd->slice_params + n, size * 8, boff);
+ #endif
++#if HEVC_CTRLS_VERSION >= 4
++    if (ctx->frame_slice_controls)
++        rd->slice_params[n].data_byte_offset = boff / 8;
++#endif
+     if (ctx->max_offsets != 0 &&
+         (rv = offsets_add(rd, h->sh.num_entry_point_offsets, h->sh.entry_point_offset)) != 0)
+         return rv;
+@@ -953,36 +1049,56 @@
+     V4L2RequestContextHEVC * const ctx = avctx->internal->hwaccel_priv_data;
+ 
+     const int is_last = (j == rd->num_slices);
+-    struct slice_info *const si = rd->slices + i;
+-    struct media_request * req = NULL;
+-    struct qent_src * src = NULL;
++    struct media_request *req = NULL;
++    struct qent_src *src = NULL;
+     MediaBufsStatus stat;
+-    void * offsets = rd->offsets + rd->slices[i].n_offsets;
+-    size_t n_offsets = (is_last ? rd->num_offsets : rd->slices[j].n_offsets) - rd->slices[i].n_offsets;
++    size_t n_offsets = (is_last ? rd->num_offsets : rd->slices[j].n_offsets) -
++                       rd->slices[i].n_offsets;
++    uint32_t *offsets = n_offsets ? rd->offsets + rd->slices[i].n_offsets : NULL;
+ 
+     if ((req = media_request_get(ctx->mpool)) == NULL) {
+         av_log(avctx, AV_LOG_ERROR, "%s: Failed to alloc media request\n", __func__);
+         return AVERROR(ENOMEM);
+     }
++    if ((src = mediabufs_src_qent_get(ctx->mbufs)) == NULL) {
++        av_log(avctx, AV_LOG_ERROR, "%s: Failed to get src buffer\n", __func__);
++        goto fail1;
++    }
++#if HEVC_CTRLS_VERSION >= 4
++    if (ctx->frame_slice_controls) {
++        size_t packed = 0;
++        unsigned int k;
++
++        for (k = i; k < j; k++)
++            packed += rd->slices[k].len;
++        if (qent_src_alloc(src, packed, ctx->dbufs) != 0)
++            goto fail2;
++        packed = 0;
++        for (k = i; k < j; k++) {
++            struct v4l2_ctrl_hevc_slice_params *p = &rd->slice_params[k];
++
++            if (qent_src_data_copy(src, packed, rd->slices[k].ptr,
++                                   rd->slices[k].len, NULL) != 0)
++                goto fail2;
++            p->data_byte_offset += packed;
++            packed += rd->slices[k].len;
++            p->bit_size = packed * 8;
++        }
++    } else
++#endif
++    if (qent_src_data_copy(src, 0, rd->slices[i].ptr,
++                           rd->slices[i].len, ctx->dbufs) != 0)
++        goto fail2;
+ 
+     if (set_req_ctls(ctx, req,
+                      controls,
+ #if HEVC_CTRLS_VERSION >= 2
+                      &rd->dec,
+ #endif
+-                     rd->slice_params + i, j - i,
+-                     offsets, n_offsets)) {
++                     ctx->decode_mode == V4L2_STATELESS_HEVC_DECODE_MODE_SLICE_BASED ||
++                     ctx->frame_slice_controls ? rd->slice_params + i : NULL,
++                     j - i, offsets, n_offsets)) {
+         av_log(avctx, AV_LOG_ERROR, "%s: Failed to set req ctls\n", __func__);
+-        goto fail1;
+-    }
+-
+-    if ((src = mediabufs_src_qent_get(ctx->mbufs)) == NULL) {
+-        av_log(avctx, AV_LOG_ERROR, "%s: Failed to get src buffer\n", __func__);
+-        goto fail1;
+-    }
+-
+-    if (qent_src_data_copy(src, 0, si->ptr, si->len, ctx->dbufs) != 0) {
+-        av_log(avctx, AV_LOG_ERROR, "%s: Failed data copy\n", __func__);
+         goto fail2;
+     }
+ 
+@@ -1035,6 +1151,10 @@
+         rc.tv = cvt_dpb_to_tv(rd->timestamp);
+         fill_sps(&rc.sps, h->ps.sps);
+         fill_pps(&rc.pps, h->ps.pps);
++#if HEVC_CTRLS_VERSION >= 4
++        rc.sps.seq_parameter_set_id = h->ps.pps->sps_id;
++        rc.pps.pic_parameter_set_id = h->sh.pps_id;
++#endif
+         if (sl) {
+             rc.has_scaling = 1;
+             fill_scaling_matrix(sl, &rc.scaling_matrix);
+@@ -1203,6 +1323,9 @@
+         av_log(avctx, AV_LOG_ERROR, "%s: unsupported decode mode\n", __func__);
+         return AVERROR(EINVAL);
+     }
++    ctx->frame_slice_controls =
++        ctx->decode_mode == V4L2_STATELESS_HEVC_DECODE_MODE_FRAME_BASED &&
++        querys[2].type != 0;
+ 
+     if (querys[1].default_value == V4L2_STATELESS_HEVC_START_CODE_NONE ||
+         querys[1].default_value == V4L2_STATELESS_HEVC_START_CODE_ANNEX_B)
+@@ -1216,10 +1339,8 @@
+         return AVERROR(EINVAL);
+     }
+ 
+-    // If we are in slice mode & START_CODE_NONE supported then pick that
+-    // as it doesn't require the slightly dodgy look backwards in our raw buffer
+-    if (ctx->decode_mode == V4L2_STATELESS_HEVC_DECODE_MODE_SLICE_BASED &&
+-        ctrl_valid(querys + 1, V4L2_STATELESS_HEVC_START_CODE_NONE))
++    // Prefer raw NAL payloads whenever supported, including frame mode.
++    if (ctrl_valid(querys + 1, V4L2_STATELESS_HEVC_START_CODE_NONE))
+         ctx->start_code = V4L2_STATELESS_HEVC_START_CODE_NONE;
+ 
+     ctrls[0].value = ctx->decode_mode;
+--- a/libavcodec/v4l2_request_hevc.h
++++ b/libavcodec/v4l2_request_hevc.h
+@@ -66,6 +66,7 @@
+     int start_code;
+     unsigned int max_slices;    // 0 => not wanted (frame mode)
+     unsigned int max_offsets;   // 0 => not wanted
++    int frame_slice_controls; /* frame mode with native slice parameters */
+ 
+     req_decode_q decode_q;
+ 
+--- a/libavcodec/v4l2_req_devscan.c
++++ b/libavcodec/v4l2_req_devscan.c
+@@ -137,8 +137,7 @@
+ 
+ #define REQ_BUF_CAPS (\
+     V4L2_BUF_CAP_SUPPORTS_DMABUF |\
+-    V4L2_BUF_CAP_SUPPORTS_REQUESTS |\
+-    V4L2_BUF_CAP_SUPPORTS_M2M_HOLD_CAPTURE_BUF)
++    V4L2_BUF_CAP_SUPPORTS_REQUESTS)
+ 
+ static void probe_formats(void * const dc,
+               struct devscan *const scan,

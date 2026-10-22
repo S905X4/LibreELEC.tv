@@ -2789,3 +2789,362 @@ Linux block read-only and denied normal-world RPC cannot prove their absence.
 The missing native HEVC/AV1 Request/context/completion/output implementations
 and real playback/seek/recovery/A/V-sync acceptance remain open.
 
+#### Corrected image: automatic startup verified
+
+The allocator fix is committed as LE `35235375eb`. Complete candidate
+`LibreELEC-SC2.aarch64-12.2-devel-20261022040711-3523537` was published through
+the standard `.update` mechanism after advance notification and an eight-file
+backup verified on both the device and host. The running SYSTEM backs the root
+loop device, and FAT had only 42,983,424 bytes free; the existing init updater
+unmounts `/sysroot` before replacing SYSTEM. The SC2 update script touches only
+files on the mounted removable boot partition, not internal boot firmware.
+
+Physical boot `d69f0d58-5d62-404b-987b-e6ff1c6a74a1` verifies the formal automatic
+service without manual notification or preload: it starts at 11.315443 seconds,
+successfully exits at 11.559712 seconds, and Kodi starts at 11.952980 seconds.
+All 1,871,104 original package bytes are accepted. The single notification
+retains a0-a3 = zero; RPC 1 remains denied `ffff0001`. No provider remains,
+no units are failed, and all three mmcblk2 user/boot areas remain read-only.
+The captured HDMI surface shows the real Kodi welcome screen, not video decode.
+
+KERNEL, DTB and selector retain their previous identities. The installed
+preloader SHA-256 is `9996fb7ad56229360f66d3ac18f60b4ba9d0bf8bad874e39d6c5c3184abfb4da`.
+Normal installation stripping changes its whole-file hash from the standalone
+smoke executable; every allocated ELF section is identical to that executable.
+This is not evidence of a stale SYSTEM. References:
+`reserved-rpc-{candidate-delivery,backup,update-published,postboot,acceptance}.json`.
+Native firmware-index execution, HEVC/AV1 Request decoding and playback remain
+unverified; successful startup does not establish secure-world persistence safety.
+
+#### Subsequent index-load diagnostic: target unreachable
+
+The automatic-startup acceptance above remains a real earlier observation;
+it is not the latest runtime health. A temporary RAM-only module was built
+against the exact native kernel to acquire CCF clocks and the HEVC genpd,
+observe stopped processors, and call the CE-observed HEVC selector, then AV1
+only after HEVC completed. It contains no decoder-start or direct IMEM write,
+changes no boot file, and does not issue another boot-complete notification.
+
+The capture produced no output frames and hit its 25-second idle timeout
+(`signal=9`). The target-side report could not be recovered: SSH timed out,
+three pings returned Destination Host Unreachable, and its ARP entry was
+INCOMPLETE. This does not establish where the module stopped, whether it
+entered the SMC, or whether target-side cleanup ran. No index-load success or
+AV1 invocation is claimed. No replay was attempted. The owner was asked for
+the continuous TTL tail before recovery; source and build provenance are
+preserved in `index-smoke-failure.json`, with `index-smoke-{rea,preflight}.json`.
+Capture Evidence: `ev_ecef4e266635a4d4c616536a9d43b652d790df7523adc7a7ca04a2d63e422d98`.
+
+#### Recovery and original firmware provenance
+
+The owner power-cycled successfully. The recovered native boot is
+`e3284de1-db93-43d8-b6a3-51913d52ff0f`: automatic preload exits zero again,
+Kodi/panel/console run, no units are failed, and the temporary module, platform
+device and `/run` file are absent. eMMC user/boot areas remain read-only.
+Actual KERNEL/SYSTEM/DTB/selector and the packaged executable match 3523537.
+The standard updater retained the old adjacent SYSTEM.md5; do not confuse
+this checksum-sidecar discrepancy with an incorrect SYSTEM payload.
+
+The exact previous-boot journal ID has no retained entry and pstore is empty.
+Console log level is 1, so the earlier pr_info checkpoints were not visible
+on TTL. Reference `clkg12.c` also enables DOS_GCLK_EN3 inside the decoder clock
+path; acquiring CCF clocks alone omitted that operation. This is an observed
+source difference, not a proven stopped-instruction diagnosis. The original
+failed setup was not replayed; corrected-prerequisite results follow below.
+
+The current 67,776-byte TA and 1,871,104-byte video package both match the
+original extraction from the same `Stock_ROM/unpacked_img/PARTITION.super`,
+logical `vendor_a`, in HK1 release `11.2023.05.27.01.39`. Original paths are
+`/lib/teetz/526fc4fc-7ee6-4a12-96e3-83da9565bce8.ta` and
+`/lib/firmware/video/video_ucode.bin`. Neither asset was rewritten or compiled
+by this project. The owner-observed TA v0.2/package v0.3 warning therefore
+does not establish mixed source packages or justify replacing secure firmware.
+Extraction Evidence: `ev_e40568b194363156391f4df6a75d786b742c0c54d0526d6045352ec7c2437402`.
+See `factory-firmware-provenance.json` and
+`index-smoke-recovery-{details,acceptance}.json`.
+
+#### Native video index-load accepted with internal clocks enabled
+
+In recovered boot `e3284de1-db93-43d8-b6a3-51913d52ff0f`, the isolated CCF/genpd
+phase and the separate gated-DOS-access phase both exited zero and unloaded.
+Readback establishes DOS_GCLK_EN3 = 0 after domain-on; enabling the reference
+value `0xffffffff` permits stopped-processor and idle-DMA reads. All gates,
+domain membership and the original console level were restored.
+Evidence: `ev_9abd58d79b27fc7ee77dfc0f5fca66bae6cbec1bedd2a4138a4b2fd550617afe`.
+
+After advance notice, the corrected observer enabled those internal clocks,
+required memory power-down/reset/processor/DMA state to be zero, and invoked
+the existing native secure-monitor API with the unchanged factory assets:
+
+| Codec | Index | Core | Transport return | Raw secure return |
+| --- | --- | --- | --- | --- |
+| HEVC | `0x11` | 0 | 0 | `0x0` |
+| AV1 | `0x4156314d` | 2 | 0 | `0x0` |
+
+Both probes exited zero and unloaded. MPSR/CPSR/DMA read zero before and after;
+no processor-start operation was issued. The original boot-complete result was
+unchanged, power-domain summary and console level were restored, no temporary
+module/device/RAM file remains, no units failed, and eMMC stays read-only.
+Kodi, panel and console remain active with zero restarts. The initial hang's
+exact stopped instruction was not retained; the gate omission and corrected
+successful path are evidenced without replaying that unsafe setup.
+
+This establishes acceptance of the native firmware-index ABI, not firmware
+execution, decoded frames or a completed V4L2 Request backend. The next boundary
+is controls-authoritative parser context, reference/CDF state, capture output
+and real picture completion. See `power-probe-{target,acceptance}.json`,
+`index-corrected-{build,target,acceptance,final-health}.json`.
+Corrected-load Evidence: `ev_131e68e726e2c627d5d408e8c4a909ceac7d8011e65679b3b0fd0cd0180a55bb`.
+
+#### Native HEVC Main intra reconstruction: exact pixels
+
+Native Linux 6.18.57 boot `def285df-6836-44e2-85b1-1d7a0140844b` executes
+the unchanged factory HEVC MMU firmware through index 17/core 0. A bounded
+RAM-only experiment receives header-ready `0x08`, programs disjoint owned
+workspace/MMU/reference-header/MV/linear-output buffers, resumes with command
+5 and `AMRISC_MAIN_REQ=0x04`, and receives picture-done `0x0a`. The final CTU
+index is 19 for the 5x4 grid; all 5,953 encoded bytes were consumed.
+
+The complete visible 320x240 NV12 frame (115,200 bytes) is byte-identical to
+independent software decoding of the same encoded input: SHA-256
+`9a3c2e4006e28da144187cd1f647483fe412dbc62d46d482e14d2e61f81c9da4`.
+This is a comparison reference, not software playback presented as hardware.
+Earlier pixel experiments retained their timeout/chroma-corruption evidence.
+The corrected host programming uses `HEVC_DBLK_CFGB=(0x57 << 8)` and converts
+the vendor debug-register word offset `0x350c+4` to byte offset `0xd440`.
+The successful stream-control value is CE-observed `0x0eb14071`; undocumented
+upper fields are not given invented names.
+
+DMA was quiesced before snapshot/free, checked output guard regions were
+unchanged, and clocks/domain/DMC/console were restored. The module, platform
+device and RAM module file were removed; no failed units or new boot-complete
+notification, and all three eMMC block areas remain read-only. No reboot or
+boot-file modification was used for these pixel experiments.
+
+Evidence: `Work/sc2-decode-reference-20261022/pixel-probe-v5-{rea,target,comparison}.json`,
+`ev_77da06e44da72a657466189cb25a3d4113397f179287c26669ecabde270fd77f`.
+This proves one Main 8-bit intra reconstruction only. Multi-frame reference
+state, Main10 full-depth capture/import, AV1 pixels, controls-authoritative
+Request lifetime/isolation and real Kodi playback/seek/recovery/A/V sync
+remain open; the production kernel still has no media decoder node.
+
+
+#### Native HEVC Main I/P/B reconstruction: eight exact pictures
+
+The same native boot now reconstructs eight coded pictures with independent
+compressed headers/body pages, MV storage and NV12 output for every picture.
+Decode-order POCs are `0,4,2,1,3,8,6,5`; all eight visible 320x240 pictures
+match independent software decoding byte for byte, including B pictures with
+multiple L0/L1 references. All 12,798 encoded input bytes were consumed.
+
+The first multi-picture run exposed two incorrect B pictures. Its host code
+mistook RPM word 33 (`sps_num_reorder_pics_0`) for word 34
+(`modification_flag`), duplicating L1 entries. Correcting that field selection
+and the adjacent tiles flag fixes those pictures; failure evidence is retained.
+The output pitch is 320 bytes, not the initial host comparison's assumed 384.
+The v1 raw report's inherited `no_slice_data_resume_requested=true` is stale;
+the comparison report explicitly corrects it. Real command-5 resumes occurred.
+
+The corrected run exits zero and unloads; DMA guards, DMC/domain/console
+restoration, eMMC read-only state and unchanged boot notification are recorded.
+Evidence: `Work/sc2-decode-reference-20261022/sequence-probe-v2-{rea,target,comparison}.json`.
+This remains a bounded RAM experiment, not a V4L2 Request driver or Kodi
+hardware-playback acceptance. Full-depth Main10, AV1 reconstruction and the
+controls-authoritative Request/export/display path remain open.
+
+
+#### Native Main10 reconstruction and AV1 exact first-picture pixels
+
+The Main10 variant reconstructs the same eight coded I/P/B pictures using
+40 owned compressed-body pages per picture and RPM bit-depth `0x22`.
+Every visible NV12 double-write picture matches independent full-depth
+software samples converted with `min(255, (sample + 2) >> 2)`. This validates
+the rounded eight-bit preview, NOT preservation/import of the low two bits.
+Full-depth Amlogic FBC export and direct Meson scanout remain unaccepted.
+Evidence: `sequence-probe-main10-v1-{rea,target,preview-comparison}.json`.
+
+The original AV1M firmware now executes a real first keyframe on native SC2:
+`0xf2` sequence, `0xf4` frame, command 5, then `0xe0` picture completion,
+20 completed superblocks and eight used MMU pages. Host-owned CDF/segmentation,
+MV, compression, deblock/CDEF/upscale and linear DW state are installed at
+the real frame barrier. All 115,200 visible NV12 bytes match the independent
+software decoder exactly; SHA-256
+`ad99cf3e445f92f0f1e6a14062c9ab8b13cbd0a5ada3987ccc06e3a13016a2a2`.
+
+AV1 sequence continuation is status-only, as in the vendor ISR. An inherited
+HEVC-style software CPU interrupt skipped frame parsing; removing it reached
+the frame barrier. Active dimensions come from RPM words 25/26/27, following
+`USE_SCALED_WIDTH_FROM_UCODE`; raw word 24 is not the active width. Raw words
+11/12 are preserved as opaque diagnostics, not validated as booleans; the
+vendor normalizes reference-MV enable from sequence flags. The host has no
+default-CDF initializer: the exact keyframe pixels establish this firmware's
+working first-keyframe path, not a general CDF-context restore contract.
+
+The AV1 run quiesced CPUs/DMA/DMC/write responses, passed DW guards, released
+resources, unloaded and restored power/console state. Evidence:
+`av1-header-probe-pixel-v1-{rea,target}.json` and
+`av1-pixel-probe-v1-comparison.json`,
+`ev_e814a3c05d703b9c2d945b12ce4cfbdc02c9ee196c6f3fc2ce65b2f535463080`.
+AV1 interframes, Request control authority/isolation, full-depth Main10 and
+actual Kodi hardware playback/seek/recovery/synchronization remain open.
+
+
+#### Native AV1 continuous reconstruction: eight exact coded pictures
+
+The RAM experiment now keeps SINGLE mode (`0x80000000`), firmware/parser
+context and CDF/segmentation backing live across eight coded pictures. Eight
+logical reference slots, seven reference types and sixteen physical backing
+slots are separate identities. All eight coded surfaces are retained until
+final CPU/DMA/DMC/write-response quiescence; refresh maps commit only after
+real `0xe0` and 20 completed superblocks.
+
+Decode-order hints are `0,28,14,7,3,1,2,5`. The authentic prefix contains nine
+events but only four presentations (`0,1,2,3`): five coded hidden references
+and one show-existing event reusing coded picture 4/hint 3. This is not eight
+packets or eight displayed frames. Each 115,200-byte coded NV12 record matches
+independent dav1d 1.5.1/API 7.0.0 output byte for byte, including hidden frames;
+the repeated show-existing output matches the retained surface too. dav1d
+returns the original retained coding header for a show-existing output, so
+reference identity uses the authenticated OBU event order and order hint,
+not its returned header's presentation flags.
+
+All guards and strict quiescence pass. The module/device/RAM file are removed,
+power-domain and console state restored, with no unexpected kernel messages,
+failed units, repeated boot notification or eMMC writable region. Evidence:
+`av1-header-probe-sequence-v1-{rea,target}.json`,
+`av1-sequence-probe-v1-comparison.json`,
+`ev_baba0d6e5ba3789e7982d6c91fdfa484eaac83ffa8bc5de2490a7b875beb24ae`.
+Scope remains Main8 320x240 without grain, frame-ID or super-resolution. This
+does not establish Request-authoritative controls, context isolation or Kodi.
+
+#### HEVC control normalization and the SC2 compressed-display blocker
+
+`hevc_request_syntax.c/h` serializes native Request controls into VPS/SPS/PPS
+and rebuilt slice headers while preserving original CABAC EBSP bytes. Real
+parsed controls and resolved DPB/RPL identities were captured in an isolated
+FFmpeg software decoder, then serialized independently per coded picture.
+An independent FFmpeg decode of the normalized eight-picture Main8/Main10
+streams matches all 921,600/1,843,200 reference bytes, respectively, including
+the full ten-bit software samples. This validates normalization, not native
+Request scheduling, hardware POC/reference authority or isolation. Evidence:
+`request-syntax-smoke/software-comparison-v1.json`.
+
+The temporary Main10 exporter successfully imports a YU10 Amlogic scatter
+FBC framebuffer and atomically commits/restores both video and primary planes.
+The real active-interval capture is nevertheless black. Only
+`fbc-probe-v4-live.jpg` is a contemporaneous scanout capture; v1-v3 GUI snapshots
+were taken after restoration and cannot prove appearance. Vendor SC2 selects
+AFBC/MIF banks `0x4840`/`0x4800`, while current DRM still writes G12A fetch
+registers. VD1/AFBC0/scaler memory power masks already cover the vendor fields;
+do not expand unrelated masks. Uncalibrated matrix-probe zeros establish no
+pixel values, and no additional secure-monitor probe-enable call was made.
+Full-depth hardware capture and real native compressed scanout remain open.
+
+#### SC2 compressed scanout now visible in the bounded RAM experiment
+
+The subsequent `fbc-probe-route-v3` experiment displays the actual Main10
+compressed test picture (`fbc-probe-route-v3-live.jpg`, sampled while the
+route and framebuffer were active). The unimplemented G12A AFBC bank reads
+zero even after native DRM writes it. The reversible experiment therefore
+uses the genuine DRM-computed shadow values, verifies ownership of the
+retained compressed allocation, and programs SC2 AFBC0 at `0x4840`.
+
+Three additional format requirements were corrected: extract modifier options
+without including the always-nonzero vendor tag; clear encoder memory-saving
+mode for Main10; and select SC2 DOS unpacking plus the 4:2:0 conversion format.
+Observed AFBC enable/mode are `0x81700`/`0x2308aa00`, with memory route bit 22.
+Native patches `0062` and `0063` apply to the selected kernel tree, and the
+complete Meson DRM directory compiles successfully. These production fixes
+have not yet been deployed; visible scanout is from the reversible experiment.
+
+All eight reconstructed DW8 surfaces still match independent software Main10
+samples converted by clipped `(sample + 2) >> 2`, with zero mismatches. This
+does not establish the low two bits. The active-frame nonsecure matrix probe
+still reads zero at all 18 sampled coordinate/tap combinations; those zeros
+are not pixel evidence. No extra secure-monitor probe-enable call was made.
+VDIN full-depth DMA capture additionally lacks established safe SC2 power and
+drain prerequisites; do not copy its obsolete VDIN1 reset addresses.
+
+Both route experiments complete restoration and unload, with power-domain and
+console state restored, notification unchanged, no failed units, and all
+three eMMC regions read-only. The kernel log ring wrapped: complete new
+message records were followed through `/dev/kmsg`; the old prefix is not
+claimed preserved. Evidence: `fbc-probe-route-v3-{target,process}.json`,
+`fbc-probe-route-v3-dw-comparison.json`, `fbc-probe-route-v4-{target,process}.json`
+and `sc2-video-fetch-build.json` in the existing decoder evidence directory.
+
+#### HEVC normalization: mutable PPS matrices and explicit-RPS boundaries
+
+A genuine eight-picture reference-dependent constant-color stream reproduced
+reference loss when changing resolved PPS matrices rewrote the normalized SPS.
+Keeping the SPS stable and emitting effective matrices in PPS fixes the
+consumer-visible corruption: independent decoding now matches all 921,600
+reference bytes. Existing Main8/Main10 fixtures retain exact 921,600/1,843,200
+byte equivalence. These are software normalization results, not Request-device
+or full-depth hardware acceptance.
+
+Invalid minimum-coding-block dimensions now return `-EINVAL`; explicit RPS
+steps over 32,768 return `-ERANGE`. A larger cumulative distance remains valid
+when each sorted adjacent step is encodable. The fixture adapter reconstructs
+unsigned latency before narrowing, and only checks tile widths when tile
+syntax is enabled. Failing-before and passing-after observations are retained
+in `request-syntax-smoke/review-{before,after}.json`.
+
+
+#### AV1 native-control normalization: independent persistent decoders
+
+The isolated metadata-only FFmpeg parser now captures native sequence/frame,
+tile, grain and resolved reference controls without generating pixel buffers.
+The canonical AV1 serializer reconstructs OBUs from those controls and original
+tile payloads. Two independent persistent dav1d 1.5.1/API 7.0.0 contexts decode
+the original and normalized streams, including invisible frames and applied
+grain when signalled; the metadata parser never supplies comparison samples.
+
+The existing 320x240 Main8 prefix passes all nine event comparisons: eight
+coded pictures, five hidden references and one show-existing presentation of
+coded picture 4. Each event has 115,200 identical visible sample bytes. Evidence:
+`av1-request-syntax-smoke/sequence-comparison-v3/pixel-comparison.jsonl` and
+`events.jsonl` under the existing decoder evidence directory. This fixture has
+no film grain, frame IDs or super-resolution; enabling decoder grain handling
+does not establish grain coverage. This is software normalization evidence,
+not an AV1 kernel Request/context-isolation or Kodi playback result.
+
+#### Native HEVC/AV1 Request: real FFmpeg hardware outputs
+
+On the existing boot, the RAM-loaded native driver now decodes the Main8
+fixtures through the production FFmpeg Request implementations, with software
+pixel-format fallback rejected. HEVC returns eight DRM PRIME presentations;
+AV1 returns four presentations from nine events/eight coded pictures, including
+the show-existing reuse of hidden coded picture 4. Every visible NV12 byte
+matches the independent software references. AV1 requires a V4L2REQUEST
+hardware device with no DRM render-node argument; HEVC uses the DRM device.
+The existing Kodi device-selection patch already distinguishes these paths.
+
+Three simultaneous FFmpeg processes (HEVC and two AV1 contexts) also complete
+successfully: all sixteen presentations, totalling 1,843,200 bytes, match
+their independent references exactly. Evidence is retained under
+`Work/sc2-decode-reference-20261022/request-hardware-smoke/`:
+`ffmpeg-native-hevc-acceptance-v1.json`, `ffmpeg-native-av1-v3.json`,
+`ffmpeg-native-av1-pixel-v1.json`, `ffmpeg-mixed-contexts-v1.json`, and
+`ffmpeg-mixed-contexts-pixels-v1.json`.
+
+This establishes the exercised Main8 caller paths and concurrent context
+separation, not all AV1 hidden capture surfaces, unsupported feature coverage,
+Main10 low-bit preservation, or Kodi playback/seek/audio synchronization.
+Firmware lookahead may advance SHIFT_BYTE_COUNT beyond the unpadded input
+length; the original padded DMA bound is retained, not a stricter unproven
+semantic bound. Intermittent firmware failures during HEVC reopen/abort stress
+remain recorded rather than being relabelled as input-counter violations.
+
+The raw native AV1 consumer also passes all eight coded CAPTURE surfaces,
+including all five hidden references: each 115,200-byte NV12 picture matches
+the independent dav1d reference. Its nine-event manifest resolves
+show-existing to the retained coded-4 surface without submitting a ninth
+decode. A deliberately missing reference completes with a buffer error;
+deliberate cancellation after queuing also fails explicitly. Both subsequent
+fresh opens decode all eight surfaces with exact independent pixel matches.
+See `av1-native-all-coded-v1.json`, `av1-native-all-coded-pixels-v1.json`,
+`av1-native-recovery-v1.json`, and `av1-native-recovery-pixels-v1.json`.
+These cover the existing no-grain, no-frame-ID, no-super-resolution fixture,
+not unexercised AV1 features.
+

@@ -1,0 +1,79 @@
+Subject: [PATCH] avcodec: recover Request capture reuse after failed pictures
+
+Report capture failures for the picture that owns them, not a new picture
+reusing the dequeued buffer. Reject missing AV1 inter references before
+reference-dependent metadata helpers can dereference an empty slot.
+
+--- a/libavcodec/v4l2_request.c
++++ b/libavcodec/v4l2_request.c
+@@ -221,7 +221,8 @@
+     return ret;
+ }
+ 
+-static int v4l2_request_wait_on_capture(V4L2RequestContext *ctx, uint32_t index)
++static int v4l2_request_wait_on_capture(V4L2RequestContext *ctx, uint32_t index,
++                                        bool check_error)
+ {
+     enum v4l2_buf_type type = ctx->fctxi->capture.format.type;
+     struct pollfd pollfd = {
+@@ -246,8 +247,12 @@
+             goto fail;
+     }
+ 
++    if (check_error && (ctx->failed_capture & (UINT64_C(1) << index))) {
++        pthread_mutex_unlock(&ctx->mutex);
++        return AVERROR_INVALIDDATA;
++    }
+     pthread_mutex_unlock(&ctx->mutex);
+-    return ctx->failed_capture & (UINT64_C(1) << index) ? AVERROR_INVALIDDATA : 0;
++    return 0;
+ 
+ fail:
+     pthread_mutex_unlock(&ctx->mutex);
+@@ -378,7 +383,7 @@
+          * FFmpeg may reuse an AVFrame early, i.e. when no output frame was
+          * produced prior time, and a synchronization is necessary.
+          */
+-        ret = v4l2_request_wait_on_capture(ctx, pic->capture_index);
++        ret = v4l2_request_wait_on_capture(ctx, pic->capture_index, false);
+         if (ret < 0)
+             return ret;
+     }
+@@ -505,7 +510,7 @@
+     V4L2RequestContext *ctx = fdd->hwaccel_priv;
+ 
+     // Wait on CAPTURE buffer before returning the frame to application
+-    return v4l2_request_wait_on_capture(ctx, index);
++    return v4l2_request_wait_on_capture(ctx, index, true);
+ }
+ 
+ int ff_v4l2_request_reset_picture(AVCodecContext *avctx, V4L2RequestPictureContext *pic)
+@@ -535,7 +540,7 @@
+         return ret;
+ 
+     // Ensure CAPTURE buffer is dequeued before reuse
+-    ret = v4l2_request_wait_on_capture(ctx, index);
++    ret = v4l2_request_wait_on_capture(ctx, index, false);
+     if (ret)
+         return ret;
+ 
+--- a/libavcodec/av1dec.c
++++ b/libavcodec/av1dec.c
+@@ -1002,6 +1002,17 @@
+         avctx->skip_frame >= AVDISCARD_ALL)
+         return 0;
+ 
++    if (s->raw_frame_header->frame_type == AV1_FRAME_INTER ||
++        s->raw_frame_header->frame_type == AV1_FRAME_SWITCH) {
++        for (int i = 0; i < AV1_REFS_PER_FRAME; i++) {
++            int ref = s->raw_frame_header->ref_frame_idx[i];
++            if (!s->ref[ref].raw_frame_header || !s->ref[ref].f->buf[0]) {
++                av_log(avctx, AV_LOG_ERROR, "Missing reference frame %d.\n", ref);
++                return AVERROR_INVALIDDATA;
++            }
++        }
++    }
++
+     ret = av1_frame_alloc(avctx, &s->cur_frame);
+     if (ret < 0) {
+         av_log(avctx, AV_LOG_ERROR,
