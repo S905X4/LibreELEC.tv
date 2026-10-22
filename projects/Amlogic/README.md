@@ -3148,3 +3148,116 @@ See `av1-native-all-coded-v1.json`, `av1-native-all-coded-pixels-v1.json`,
 These cover the existing no-grain, no-frame-ID, no-super-resolution fixture,
 not unexercised AV1 features.
 
+#### Production Main10 samples and native SDR color initialization
+
+The production Request driver in `32ab95a` exports eight coded Main10
+pictures at each of 320x240 and 1920x1080. Each retained scatter-FBC allocation
+is inspected both before and after STREAMOFF. An independently inspected
+`amlogic_fbc_lib.ko` decoder is executed offline under QEMU user emulation;
+it is neither loaded into either kernel nor included in the image. Its
+decompressed samples are compared against an explicit independent software
+HEVC decode of the original encoded fixtures, not the eight-bit DW preview.
+
+All 32 snapshots match all ten luma/chroma bits, including the low two bits:
+51,609,600 sample comparisons, zero mismatches. This covers sixteen distinct
+coded pictures and their retained-output lifetime, not 32 distinct pictures
+or ten-bit HDMI capture. Evidence under the decoder Work directory:
+`main10-fbc-offline/production-full-depth-comparison-v1.json`,
+`provenance-and-static-audit.json`, and
+`request-hardware-smoke/main10-production-hardware-v1.json`.
+
+The ABI describes the actual exported scatter-header allocation. The nominal
+decoder header register length is not a byte bound for the scatter-header
+addresses consumed by the display or offline decoder; full allocation bytes
+are retained. This clarification does not change the producer's allocation.
+
+Native video initially inherited U-Boot RGB-to-YUV coefficients on a path
+already carrying YUV. A bounded nonsecure VD1 HDR control change from
+`0x1c04f` to `0xc04f` restores the expected red/green/yellow/blue/magenta/cyan
+stripe order; the diagnostic restores the original register afterward.
+Its delayed restored screenshot is not a second visual A/B/A proof.
+Patch `0065` applies the existing OSD initialization pattern to SC2 VD1,
+clearing matrix-only/top-enable mode bits while preserving other controls
+and every non-SC2 path. It does not implement HDR tone mapping.
+
+Full candidate `20261022114641-42f396b` boots as
+`9f771f5a-1446-4a4a-aaf3-8f19886bddc6`; installed kernel/SYSTEM/DTB hashes
+match the authenticated update archive. Kodi actually displays correctly
+colored AV1, HEVC Main8 NV12 and HEVC Main10 FBC test patterns. systemd is
+running without failed units, preload exits zero, and the eMMC user area and
+both boot areas remain read-only. The selector and DTB are unchanged and
+the CE return path remains available. Evidence:
+`video-color-{backup,candidate-delivery,postboot}.json` and
+`kodi-native-smoke/*production-color-v3*`.
+
+Those playback observations alone do not establish seek recovery. Received
+HEVC/Main10 pictures freeze after the first seek despite advancing audio and
+JSON-RPC clock; that acceptance is explicitly withdrawn pending the CRA
+repair. AV1 continues updating across the same sequence. See
+`kodi-native-smoke/hevc-main10-seek-freeze-before.json` and the decoder-only
+`request-hardware-smoke/ffmpeg-hevc-seek-before-v2.json` reproduction.
+
+#### CRA flush authority and production seek repair
+
+The preceding freeze is a recorded failure of `42f396b`, not the current
+result. The first post-flush CRA exposed two authority errors: FFmpeg
+exported parser placeholder DPB entries that had never received a Request
+timestamp, and normalization required the original IRAP no-output bit to
+equal the parser's resolved post-flush decode control. The FFmpeg exporter
+now omits undecoded placeholders; normalization uses the resolved control.
+No Kodi-owned CAPTURE buffer is forcibly recycled, buffer counts are not
+increased, and CRA alone does not unconditionally discard the reference
+epoch. Linux commit `ee5b83664638` and LibreELEC commit `ba135fb623` contain
+the repair; the caller change is `ffmpeg-006-native-hevc-cra-references.patch`.
+
+The same host IRAP fixture fails before the repair with EINVAL and succeeds
+afterward. Independent software decodes of the original and reconstructed
+streams match all 115,200 visible bytes. On the board, the formerly failing
+FFmpeg seek exits zero and returns 330 hardware frames: all 38,016,000
+visible bytes match an independent software decode of the original stream.
+This is actual DRM PRIME output, not a playback-clock or decoder-label check.
+
+Candidate `LibreELEC-SC2.aarch64-12.2-devel-20261022121242-ba135fb` builds
+successfully and boots as `b4ee33ea-c6c1-4ead-8dec-bd7c81d11460`; installed
+payloads match the authenticated update. Production Kodi plays AV1, HEVC
+Main8 and HEVC Main10 through forward/backward seeks and pause/resume.
+An additional HEVC/Main10 observation holds each target frame for fifteen
+seconds to exceed capture latency: received HDMI timecodes move forward,
+backward, then forward again after resuming. Main10 uses the imported
+`YU10` overlay with Amlogic FBC modifier `0xa00000000000002`, not an eight-bit
+DW substitute. These HDMI observations do not replace the separate full
+ten-bit sample comparison above.
+
+Final playback is stopped. systemd is running without failed units; Kodi,
+the panel, console and restricted preload have zero restarts and exit status
+zero. All three eMMC areas remain read-only; DTB, selector and CE return path
+are preserved. Kernel taint is 512 from the existing unsupported vendor
+GET_DEVICES_SUPP PTA enumeration warning, not zero. Startup/add-on errors
+remain in the retained logs, including the unavailable SC2 add-on repository;
+service health is not a claim of an error-free or complete distribution.
+
+Evidence under `Work/sc2-decode-reference-20261022/`:
+
+- `cra-seek-{backup,candidate-delivery,postboot,final-health}.json`;
+- `request-syntax-smoke/cra-control-regression.json`;
+- `request-hardware-smoke/ffmpeg-hevc-seek-{after-v1,pixels-v1}.json`;
+- `kodi-native-smoke/packaged-player-cra-v4.json`;
+- `kodi-native-smoke/{hevc,main10}-held-seek-v1.json` and corresponding
+  `*-held-{forward,backward,resumed}-cra-v1.jpg` received images;
+- `kodi-native-smoke/main10-playing-drm-production-cra-v4.txt`.
+
+Absolute audio/video synchronization remains unaccepted. The same-PTS OBS
+stream now contains real video flashes and audio pulses during startup,
+after both seeks and after resuming, for all three codecs. Measured audio
+minus video is 75.5–108.5 ms at startup, 48.5–98.5 ms for settled post-seek
+or resumed pulses, with 185.5–248.5 ms transition measurements retained.
+Video sampling is 30 Hz and audio windows are 10 ms. The same capture-card
+and OBS configuration has no known-synchronized reference measurement;
+receiver offsets cannot be converted into a box-side compensation. The
+attempted FFV1 software reference failed with send_packet EPERM and is not
+a calibration. No box delay was changed. See
+`kodi-native-smoke/capture-timing-cra-v4.json`; a known synchronized source
+through that exact capture chain, including its audio sync offset setting,
+is still required. This is not a claim of HDR, ten-bit HDMI capture, or
+unexercised AV1 grain/frame-ID/super-resolution support.
+
