@@ -25,6 +25,10 @@ OPENGLES="mesa"
 KODIPLAYER_DRIVER="$OPENGLES"
 VULKAN="no"
 GRAPHIC_DRIVERS="panfrost"
+
+# Share the aarch64 Kodi user-space add-ons, as AMLGX does.
+ADDON_PROJECT="ARMv8"
+
 DISPLAYSERVER="no"
 WINDOWMANAGER="no"
 ALSA_SUPPORT="yes"
