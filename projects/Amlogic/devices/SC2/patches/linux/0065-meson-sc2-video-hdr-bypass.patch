@@ -1,0 +1,75 @@
+From 4f30ff24ae490f41af9315c8e02c2b23a328f95b Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Thu, 22 Oct 2026 11:46:14 +0800
+Subject: [PATCH] drm/meson: bypass inherited SC2 video HDR matrix
+
+The factory U-Boot leaves VD1 HDR matrix-only mode selected with RGB-to-
+YUV coefficients. Native overlay buffers already contain YUV, so the
+inherited transform produces YCbCr-looking RGB colors in both NV12 and
+Main10 FBC scanout.
+
+Apply the existing OSD bypass pattern to SC2 VD1: clear matrix-only and
+top-enable bits, preserving all other controls and non-SC2 behavior.
+A reversible on-board change from 0x1c04f to 0xc04f restores RGB stripes;
+the diagnostic restores the original register afterward. HDR processing
+is not enabled or claimed by this SDR initialization.
+
+Change-Id: I20914090adb0dc8bcfa749ef1d4c73a2cd0bbbd8
+---
+ Documentation/userspace-api/media/v4l/pixfmt-reserved.rst | 8 +++++---
+ drivers/gpu/drm/meson/meson_registers.h                   | 5 +++++
+ drivers/gpu/drm/meson/meson_viu.c                         | 6 ++++++
+ 3 files changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/Documentation/userspace-api/media/v4l/pixfmt-reserved.rst b/Documentation/userspace-api/media/v4l/pixfmt-reserved.rst
+index 1911710ec7cde815e020b352898ce1ee84284db3..d310a5c835e65dd8b4769278a764a027646bed8f 100644
+--- a/Documentation/userspace-api/media/v4l/pixfmt-reserved.rst
++++ b/Documentation/userspace-api/media/v4l/pixfmt-reserved.rst
+@@ -309,9 +309,11 @@ CAPTURE uses the multi-planar API with one memory plane, zero ``bytesperline``
+ The coded rectangle is returned by ``V4L2_SEL_TGT_COMPOSE``. For the returned
+ padded dimensions ``W`` and ``H``, the allocation layout is:
+ 
+-* The FBC header starts at byte zero, with length
+-  ``ceil(W / 128) * ceil(H / 64) * 32`` bytes.
+-* Round that length up to 4096 bytes, then reserve a 4096-byte guard.
++* The scatter-map header starts at byte zero. Allocate
++  ``ALIGN(ceil(W / 64) * ceil(H / 64) * 128, 4096)`` bytes, then reserve
++  a 4096-byte guard. This is distinct from the smaller nominal
++  ``ceil(W / 128) * ceil(H / 64) * 32`` compression-register length;
++  that nominal value must not be used to size the header allocation.
+ * The body starts there and contains ``(W / 64) * (H / 32) * 4096`` bytes,
+   followed by a second 4096-byte guard. ``sizeimage`` includes both guards.
+ * Every 4096-byte body page is in this same allocation. The decoder programs
+diff --git a/drivers/gpu/drm/meson/meson_registers.h b/drivers/gpu/drm/meson/meson_registers.h
+index d99067214d2770debecb1536689ef314d962c91e..9e73c15d59d4e550d446e299d8eeb566ef3105a7 100644
+--- a/drivers/gpu/drm/meson/meson_registers.h
++++ b/drivers/gpu/drm/meson/meson_registers.h
+@@ -657,6 +657,11 @@
+ #define VPP_WRAP_OSD3_MATRIX_PRE_OFFSET2 0x3dbc
+ #define VPP_WRAP_OSD3_MATRIX_EN_CTRL 0x3dbd
+ 
++/* video1 HDR */
++#define VD1_HDR2_CTRL 0x3800
++#define VD1_HDR2_CTRL_TOP_EN                   BIT(13)
++#define VD1_HDR2_CTRL_REG_ONLY_MAT             BIT(16)
++
+ /* osd1 HDR */
+ #define OSD1_HDR2_CTRL 0x38a0
+ #define OSD1_HDR2_CTRL_VDIN0_HDR2_TOP_EN       BIT(13)
+diff --git a/drivers/gpu/drm/meson/meson_viu.c b/drivers/gpu/drm/meson/meson_viu.c
+index a5a305cde1d6f2b7d5d5344b1ec4a37092fa7ece..fa01a066915b54ad9d425811779d3fa4706c4b09 100644
+--- a/drivers/gpu/drm/meson/meson_viu.c
++++ b/drivers/gpu/drm/meson/meson_viu.c
+@@ -447,6 +447,12 @@ void meson_viu_init(struct meson_drm *priv)
+ 		writel_bits_relaxed(OSD1_HDR2_CTRL_REG_ONLY_MAT |
+ 				OSD1_HDR2_CTRL_VDIN0_HDR2_TOP_EN, 0,
+ 				priv->io_base + _REG(OSD1_HDR2_CTRL));
++
++		/* SC2 U-Boot leaves an RGB-to-YUV matrix on the YUV video path. */
++		if (priv->sc2)
++			writel_bits_relaxed(VD1_HDR2_CTRL_REG_ONLY_MAT |
++					    VD1_HDR2_CTRL_TOP_EN, 0,
++					    priv->io_base + _REG(VD1_HDR2_CTRL));
+ 	}
+ 
+ 	/* Initialize OSD1 fifo control register */
