@@ -1,0 +1,201 @@
+Subject: [PATCH] v4l2m2m: register AVS WMV3 MJPEG and preserve native single-stream framing
+
+Keep the standard Annex-L RCV API: SC2 translates RCV to its private
+firmware framing inside the kernel. Compressed packets are not decoded in
+userspace. MPEG4 and VC1 wrappers already exist; expose the missing families
+and seed single-stream decoders with demuxer/parser dimensions.
+
+--- a/configure
++++ b/configure
+@@ -3183,1 +3183,4 @@
+-h263_v4l2m2m_decoder_deps="v4l2_m2m h263_v4l2_m2m"
++cavs_v4l2m2m_decoder_deps="v4l2_m2m"
++mjpeg_v4l2m2m_decoder_deps="v4l2_m2m"
++wmv3_v4l2m2m_decoder_deps="v4l2_m2m vc1_v4l2_m2m"
++h263_v4l2m2m_decoder_deps="v4l2_m2m h263_v4l2_m2m"
+--- a/libavcodec/Makefile
++++ b/libavcodec/Makefile
+@@ -549,1 +549,4 @@
+-OBJS-$(CONFIG_MPEG4_V4L2M2M_DECODER)   += v4l2_m2m_dec.o
++OBJS-$(CONFIG_MPEG4_V4L2M2M_DECODER)   += v4l2_m2m_dec.o
++OBJS-$(CONFIG_CAVS_V4L2M2M_DECODER)    += v4l2_m2m_dec.o
++OBJS-$(CONFIG_MJPEG_V4L2M2M_DECODER)   += v4l2_m2m_dec.o
++OBJS-$(CONFIG_WMV3_V4L2M2M_DECODER)    += v4l2_m2m_dec.o
+--- a/libavcodec/allcodecs.c
++++ b/libavcodec/allcodecs.c
+@@ -78,1 +78,2 @@
+-extern const FFCodec ff_cavs_decoder;
++extern const FFCodec ff_cavs_decoder;
++extern const FFCodec ff_cavs_v4l2m2m_decoder;
+--- a/libavcodec/allcodecs.c
++++ b/libavcodec/allcodecs.c
+@@ -201,1 +201,2 @@
+-extern const FFCodec ff_mjpeg_decoder;
++extern const FFCodec ff_mjpeg_decoder;
++extern const FFCodec ff_mjpeg_v4l2m2m_decoder;
+--- a/libavcodec/allcodecs.c
++++ b/libavcodec/allcodecs.c
+@@ -397,1 +397,2 @@
+-extern const FFCodec ff_wmv3_decoder;
++extern const FFCodec ff_wmv3_decoder;
++extern const FFCodec ff_wmv3_v4l2m2m_decoder;
+--- a/libavcodec/v4l2_fmt.c
++++ b/libavcodec/v4l2_fmt.c
+@@ -115,3 +115,8 @@
+-#ifdef V4L2_PIX_FMT_VC1_ANNEX_G
+-    { AV_FMT(NONE),        AV_CODEC(VC1),         V4L2_FMT(VC1_ANNEX_G) },
+-#endif
++#ifdef V4L2_PIX_FMT_VC1_ANNEX_G
++    { AV_FMT(NONE),        AV_CODEC(VC1),         V4L2_FMT(VC1_ANNEX_G) },
++#endif
++#ifdef V4L2_PIX_FMT_VC1_ANNEX_L
++    { AV_FMT(NONE),        AV_CODEC(WMV3),        V4L2_FMT(VC1_ANNEX_L) },
++#endif
++    { AV_FMT(NONE),        AV_CODEC(CAVS),        v4l2_fourcc('A', 'V', 'S', '0') },
++    { AV_FMT(NONE),        AV_CODEC(MJPEG),       V4L2_FMT(MJPEG) },
+--- a/libavcodec/v4l2_m2m_dec.c
++++ b/libavcodec/v4l2_m2m_dec.c
+@@ -33,1 +33,2 @@
+-#include "libavutil/pixdesc.h"
++#include "libavutil/pixdesc.h"
++#include "libavutil/intreadwrite.h"
+--- a/libavcodec/v4l2_m2m_dec.c
++++ b/libavcodec/v4l2_m2m_dec.c
+@@ -252,4 +252,12 @@
+-    if (avctx->codec_id == AV_CODEC_ID_H264)
+-        len = h264_xd_copy(src_data, src_len, NULL);
+-    else
+-        len = src_len < 0 ? AVERROR(EINVAL) : src_len;
++    if (avctx->codec_id == AV_CODEC_ID_VC1 && src_len > 1) {
++        const uint8_t *p = src_data;
++        /* ASF's WVC1 extradata starts with a size byte, Annex-G does not. */
++        if (src_len >= 5 && AV_RB24(p + 1) == 1) {
++            src_data = p + 1;
++            src_len--;
++        }
++    }
++    if (avctx->codec_id == AV_CODEC_ID_H264)
++        len = h264_xd_copy(src_data, src_len, NULL);
++    else
++        len = src_len < 0 ? AVERROR(EINVAL) : src_len;
+--- a/libavcodec/v4l2_m2m_dec.c
++++ b/libavcodec/v4l2_m2m_dec.c
+@@ -244,1 +244,1 @@
+-               const void * const src_data, const int src_len,
++               const void *src_data, int src_len,
+--- a/libavcodec/v4l2_m2m_dec.c
++++ b/libavcodec/v4l2_m2m_dec.c
+@@ -261,8 +261,13 @@
+-    if ((*pdst_data = av_malloc(len + AV_INPUT_BUFFER_PADDING_SIZE)) == NULL)
+-        return AVERROR(ENOMEM);
+-
+-    if (avctx->codec_id == AV_CODEC_ID_H264)
+-        h264_xd_copy(src_data, src_len, *pdst_data);
+-    else
+-        memcpy(*pdst_data, src_data, len);
+-    *pdst_len = len;
++    if ((*pdst_data = av_malloc(len + 4 + AV_INPUT_BUFFER_PADDING_SIZE)) == NULL)
++        return AVERROR(ENOMEM);
++
++    if (avctx->codec_id == AV_CODEC_ID_H264)
++        h264_xd_copy(src_data, src_len, *pdst_data);
++    else
++        memcpy(*pdst_data, src_data, len);
++    if (avctx->codec_id == AV_CODEC_ID_VC1) {
++        uint8_t *p = *pdst_data;
++        AV_WB32(p + len, 0x0000010d);
++        len += 4;
++    }
++    *pdst_len = len;
+--- a/libavcodec/v4l2_m2m_dec.c
++++ b/libavcodec/v4l2_m2m_dec.c
+@@ -467,1 +467,52 @@
+-static int try_enqueue_src(AVCodecContext * const avctx, V4L2m2mContext * const s, const int do_not_get)
++/* Prefixes are metadata only. The coded packet is copied once by the
++ * existing V4L2 enqueue operation; no intermediate packet allocation.
++ */
++static int legacy_enqueue(AVCodecContext *avctx, V4L2m2mContext *s)
++{
++    uint8_t header[44] = {0};
++    size_t bytes = 0;
++    const AVPacket *pkt = &s->buf_pkt;
++
++    if (avctx->codec_id == AV_CODEC_ID_WMV3) {
++        if (s->extdata_size != 4 || pkt->size > 0xffffff)
++            return AVERROR_INVALIDDATA;
++        if (!s->extdata_sent) {
++            /* SMPTE 421M Annex-L, RCV version 2 sequence layer. */
++            header[3] = 0xc5;
++            AV_WL32(header + 4, 4);
++            memcpy(header + 8, s->extdata_data, 4);
++            AV_WL32(header + 12, avctx->coded_height);
++            AV_WL32(header + 16, avctx->coded_width);
++            AV_WL32(header + 20, 12);
++            header[27] = 0x80;
++            AV_WL32(header + 32, 0xffffffff);
++            bytes = 36;
++        }
++        AV_WL32(header + bytes, (uint32_t)pkt->size |
++                ((pkt->flags & AV_PKT_FLAG_KEY) ? 0x80000000U : 0));
++        AV_WL32(header + bytes + 4, pkt->pts == AV_NOPTS_VALUE ? 0 :
++                av_rescale_q(pkt->pts, avctx->pkt_timebase, (AVRational){1, 1000}));
++        bytes += 8;
++    } else if (avctx->codec_id == AV_CODEC_ID_VC1) {
++        /* Demuxed ASF/Matroska frames may omit the Annex-G frame startcode. */
++        if (pkt->size < 4 || AV_RB24(pkt->data) != 1) {
++            header[2] = 1;
++            header[3] = 0x0d;
++            bytes = 4;
++        }
++        if (!s->extdata_sent && s->extdata_size) {
++            /* Extradata already reserves a trailing frame startcode. */
++            return ff_v4l2_context_enqueue_packet(&s->output, pkt,
++                    s->extdata_data, s->extdata_size - (bytes ? 0 : 4));
++
++
++        }
++    } else {
++        return ff_v4l2_context_enqueue_packet(&s->output, pkt,
++                s->extdata_sent ? NULL : s->extdata_data,
++                s->extdata_sent ? 0 : s->extdata_size);
++    }
++    return ff_v4l2_context_enqueue_packet(&s->output, pkt, header, bytes);
++}
++
++static int try_enqueue_src(AVCodecContext * const avctx, V4L2m2mContext * const s, const int do_not_get)
+--- a/libavcodec/v4l2_m2m_dec.c
++++ b/libavcodec/v4l2_m2m_dec.c
+@@ -562,4 +562,1 @@
+-    if (s->extdata_sent)
+-        ret = ff_v4l2_context_enqueue_packet(&s->output, &s->buf_pkt, NULL, 0);
+-    else
+-        ret = ff_v4l2_context_enqueue_packet(&s->output, &s->buf_pkt, s->extdata_data, s->extdata_size);
++    ret = legacy_enqueue(avctx, s);
+--- a/libavcodec/v4l2_m2m_dec.c
++++ b/libavcodec/v4l2_m2m_dec.c
+@@ -1193,2 +1193,15 @@
+-    output->height = capture->height = 0;
+-    output->width = capture->width = 0;
++    output->height = capture->height = 0;
++    output->width = capture->width = 0;
++    switch (avctx->codec_id) {
++    case AV_CODEC_ID_MPEG4:
++    case AV_CODEC_ID_VC1:
++    case AV_CODEC_ID_WMV3:
++    case AV_CODEC_ID_CAVS:
++    case AV_CODEC_ID_MJPEG:
++        /* Single-stream firmware needs surfaces before its first frame. */
++        output->height = capture->height = avctx->coded_height;
++        output->width = capture->width = avctx->coded_width;
++        break;
++    default:
++        break;
++    }
+--- a/libavcodec/v4l2_m2m_dec.c
++++ b/libavcodec/v4l2_m2m_dec.c
+@@ -1378,1 +1378,4 @@
+-M2MDEC(mpeg4, "MPEG4", AV_CODEC_ID_MPEG4,      NULL);
++M2MDEC(mpeg4, "MPEG4", AV_CODEC_ID_MPEG4,      NULL);
++M2MDEC(cavs,  "AVS",   AV_CODEC_ID_CAVS,       NULL);
++M2MDEC(wmv3,  "WMV3",  AV_CODEC_ID_WMV3,       NULL);
++M2MDEC(mjpeg, "MJPEG", AV_CODEC_ID_MJPEG,      NULL);

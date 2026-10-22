@@ -1,0 +1,68 @@
+Subject: [PATCH] v4l2m2m: retain native fixed capture surfaces across visible changes
+
+SC2 single-stream legacy codecs allocate fixed 1920x1088 backing canvases.
+A midstream visible-size event changes neither plane strides nor allocations.
+Keep those surfaces and the firmware reference ownership alive; retain the
+standard capture restart for the initial event and every other driver.
+EOS events may precede dequeue of completed CAPTURE buffers. For the native
+fixed-backing driver, keep draining until a CAPTURE LAST buffer or EPIPE;
+an earlier EOS event is not permission to discard ready pictures.
+
+
+--- a/libavcodec/v4l2_m2m.h
++++ b/libavcodec/v4l2_m2m.h
+@@ -127,1 +127,2 @@
+-#define FF_V4L2_QUIRK_ENUM_FRAMESIZES_BROKEN    2
++#define FF_V4L2_QUIRK_ENUM_FRAMESIZES_BROKEN    2
++#define FF_V4L2_QUIRK_FIXED_CAPTURE             4
+--- a/libavcodec/v4l2_m2m_dec.c
++++ b/libavcodec/v4l2_m2m_dec.c
+@@ -969,2 +969,8 @@
+-    if (strcmp(cap.driver, "meson-vdec") == 0)
+-        s->quirks |= FF_V4L2_QUIRK_REINIT_ALWAYS | FF_V4L2_QUIRK_ENUM_FRAMESIZES_BROKEN;
++    if (strcmp(cap.driver, "meson-vdec") == 0)
++        s->quirks |= FF_V4L2_QUIRK_REINIT_ALWAYS | FF_V4L2_QUIRK_ENUM_FRAMESIZES_BROKEN;
++    if (strcmp(cap.driver, "meson-sc2-vdec") == 0 &&
++        (avctx->codec_id == AV_CODEC_ID_MPEG4 || avctx->codec_id == AV_CODEC_ID_VC1 ||
++         avctx->codec_id == AV_CODEC_ID_WMV3 || avctx->codec_id == AV_CODEC_ID_CAVS ||
++         avctx->codec_id == AV_CODEC_ID_MJPEG || avctx->codec_id == AV_CODEC_ID_MPEG1VIDEO ||
++         avctx->codec_id == AV_CODEC_ID_MPEG2VIDEO))
++        s->quirks |= FF_V4L2_QUIRK_FIXED_CAPTURE;
+--- a/libavcodec/v4l2_context.c
++++ b/libavcodec/v4l2_context.c
+@@ -347,1 +347,22 @@
+-    s->capture.format = cap_fmt;
++    if ((s->quirks & FF_V4L2_QUIRK_FIXED_CAPTURE) && s->capture.streamon &&
++        V4L2_TYPE_IS_MULTIPLANAR(cap_fmt.type) &&
++        cap_fmt.fmt.pix_mp.pixelformat == s->capture.format.fmt.pix_mp.pixelformat &&
++        cap_fmt.fmt.pix_mp.num_planes == s->capture.format.fmt.pix_mp.num_planes) {
++        unsigned int plane;
++        int same_backing = 1;
++        for (plane = 0; plane < cap_fmt.fmt.pix_mp.num_planes; plane++) {
++            const struct v4l2_plane_pix_format *old = &s->capture.format.fmt.pix_mp.plane_fmt[plane];
++            const struct v4l2_plane_pix_format *now = &cap_fmt.fmt.pix_mp.plane_fmt[plane];
++            if (old->bytesperline != now->bytesperline || old->sizeimage != now->sizeimage)
++                same_backing = 0;
++        }
++        if (same_backing) {
++            s->capture.format = cap_fmt;
++            s->capture.width = ff_v4l2_get_format_width(&cap_fmt);
++            s->capture.height = ff_v4l2_get_format_height(&cap_fmt);
++            s->capture.sample_aspect_ratio = v4l2_get_sar(&s->capture);
++            ret = ff_set_dimensions(avctx, s->capture.width, s->capture.height);
++            return ret < 0 ? ret : 1;
++        }
++    }
++    s->capture.format = cap_fmt;
+@@ -582,3 +603,6 @@
+     if (evt.type == V4L2_EVENT_EOS) {
+         av_log(avctx, AV_LOG_TRACE, "V4L2 VIDIOC_EVENT_EOS\n");
++        if ((m->quirks & FF_V4L2_QUIRK_FIXED_CAPTURE) &&
++            !ff_v4l2_ctx_eos(&m->capture))
++            return 0;
+         return AVERROR_EOF;
+@@ -623,1 +647,4 @@
++        if (is_cap && (m->quirks & FF_V4L2_QUIRK_FIXED_CAPTURE))
++            pfd.events |= poll_event;
++
+         // Timeout kludged s.t. "forever" eventually gives up & produces logging
