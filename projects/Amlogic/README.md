@@ -3918,3 +3918,63 @@ or one-vblank guess is not an acceptable substitute. Exact local authority and
 missing prerequisite: `gpt-av1-film-grain-blocker-v91.json` in the same evidence
 directory. V06 remains blocked on this boundary, not silently waived.
 
+#### Production image and same-context AV1 seek (v92)
+
+Linux `cbc00949aac6` and `f6d11fe38068` are exported as 0073/0074;
+LibreELEC `4d96e6c06849` integrates these with FFmpeg016. The complete
+`LibreELEC-SC2.aarch64-12.2-devel-20261023230059-4d96e6c` disk image and TAR
+built successfully (`artifact://5335`). KERNEL/SYSTEM/DTB/boot-script bytes
+match between disk and TAR; FFmpeg/Kodi match their formal packages. Before
+standard external-USB update, all eight current boot files were archived,
+copied to the host and independently hashed. eMMC was not made writable.
+
+Actual new boot: `183bef13-96d8-4046-b729-5ed3050e515d`, Linux6.18.57,
+BUILD_ID `4d96e6c06849adbe5e7278f00c693e0aa8dd3f10`. All four installed
+boot payload hashes match the delivery record. Actual production codec SHA:
+`a150f4a57be6e6498faeb268eef47756a99ac7de74f5eb8125910f07a16440f9`;
+unchanged Kodi SHA: `024b83d714d217c77100c9e9a8029043e1cd32fdb02334b6b5a4e80986ed5d85`.
+No diagnostic module or preload is used. The normal Kodi environment contains
+`LD_LIBRARY_PATH=/usr/lib`, not a diagnostic library override.
+
+Production-only decode returns all 48 variable-superres, eight legal ID-wrap
+and nine redisplay presentations, all 65 exact to independent original-stream
+dav1d. Four malformed-ID cases reject after their legal prefixes (1/1/1/8
+presentations), with specific current/reference/display-ID diagnostics.
+On a 900-picture changing-width original, the existing client seeks in the
+same context after 30 presentations, calls `avcodec_flush_buffers()` and
+resumes from the independent preceding keyframe at PTS10733 for target12000.
+All 608 returned pictures and their complete PTS order match the independent
+original-stream oracle: 70,041,600 NV12 bytes. This is neither reopen nor a
+playback-clock-only seek check.
+
+Real Kodi identifies `ff-av1-drm_prime`; DRM has an imported NV12 overlay.
+Actual HDMI pictures were retained with the test source's embedded counter:
+held frame175, forward-seek frame584, backward-seek frame116, then resumed
+frame293. These establish real displayed progression, reversal and resume,
+not just RPC time. First start/seek captures showed the menu and are retained
+as too-early observations: the receiver outputs JPEG only every five seconds.
+Holding each target for eight seconds supplied the actual video evidence;
+the early captures are not counted as passes or a decoder fix.
+
+Delivery/rollback: `gpt-native-image-delivery-v92.json` and
+`gpt-image-backup-verified-v92.json`. Pixel/PTS authority:
+`gpt-native-image-av1-comparison-v92.json`,
+`gpt-native-image-av1-seek-comparison-v92.json` and their linked REA captures
+under `Work/sc2-all-codecs-20261022/`. Actual HDMI files:
+`gpt-av1-kodi-superres-{hold,forward,back,resume}-v92.jpg` in that directory.
+V09 is only partially satisfied: all other required formats/transitions and
+live regression remain explicit. Grain, the retained MPEG4/VC1/AVS failures,
+AV1 wider-tool/bit-depth envelope and absolute A/V sync are not closed.
+
+All 684 raw hardware pictures, including the 11 valid-prefix pictures from
+rejected inputs, were archived and copied to the host. Every member's size
+and SHA-256 matches its captured run; the archive remains under Work for
+independent reinspection. `gpt-native-image-av1-pixel-archive-v92.json`
+records the archive digest. The labelled contact sheet
+`gpt-av1-kodi-counters-v92.png` fixes source-counter attribution; the forward
+counter is 584. Owned RAM clients/inputs/outputs and the temporary Kodi clip
+were removed after verification. Final health capture
+`gpt-native-image-av1-cleanup-health-v92-rea.json` records unchanged new boot,
+production module refcnt0, Kodi/panel/console/preload active with zero restarts
+and exit0, no failed units, /flash read-only and all three eMMC regions read-only.
+
