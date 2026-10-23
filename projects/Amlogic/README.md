@@ -17,6 +17,11 @@ This project is for Amlogic SoC devices
 
 ## SC2 / HK1 RBOX X4 minimal bring-up
 
+Current implemented-feature evidence, retained failures, the nine scoped remaining
+work packages and the owner-requested pause are recorded in
+[SC2-CODEC-STATUS.md](SC2-CODEC-STATUS.md). Its v93 snapshot distinguishes
+RAM hardware acceptance, formal packages and the unchanged v92 production image.
+
 The owner has accepted IR RAW, the native FD6551 layout, GPU output and
 ordinary HDMI PCM, and now explicitly authorizes Kodi and codec integration.
 CEC awaits a real TV (the owner estimates about 15 hours); optical audio has
@@ -3314,15 +3319,15 @@ format does not by itself establish absent silicon capability:
 | Family | Conservative supported envelope | Native acceptance boundary |
 | --- | --- | --- |
 | HEVC | Main/Main10, 4:2:0 8/10-bit, 3840x2160/60 | Existing Request/pixel/Main10 evidence plus live repair above; not every coding tool/HDR mode |
-| AV1 | Main, 4:2:0 8/10-bit, 3840x2160/60 | Existing covered Request/pixel cases; grain/frame-ID/super-resolution not inferred |
-| H.264 | 8-bit High, 3840x2160/30; actual 1080i field/MBAFF/PAFF path | RAM MULTI: progressive/MBAFF/1080i and CCTV-1/CCTV13 independent pixels pass; Hunan PAFF v73 returns 24 pictures with matching PTS/TFF/EOF and 74,649,600 exact visible bytes. Real HTSP and hardware EI viewed; formal image integration remains open |
-| VP9 | Profile 0/2, 4:2:0 8/10-bit, 3840x2160/60 | RAM native implementation: 36 covered pictures per profile match independent full-depth samples; formal image acceptance remains open |
-| AVS2 | P2/10-bit, 3840x2160/60 | RAM native implementation: 32 640x360 8-bit and 23 expected 3840x2160 10-bit presentations match independent samples, including low bits; formal image acceptance remains open |
-| MPEG-1/2 | Conventional 8-bit, MPEG-2 MP/HL, 1920x1088 coded / 1080p60 | RAM MULTI: MPEG-1 all 36 frames/PTS/progressive metadata/EOF pass; MPEG-2 1080i 24 pictures and 48 hardware-EI outputs plus Kodi viewing pass. IDCT differences are recorded below; formal integration remains open |
-| MPEG-4 Part 2 | Xvid/ASP@L5, 1080p60 | v79 uses donor incomplete-VOP padding and observes genuine hardware EMPTY, all 36 pictures/PTS and EOF; a single held I reference also returns once with EMPTY/EOF. Late B25/B26/B28/B29/B31/B32 pixels remain corrupt; full MPEG4 acceptance and image deployment remain open (`gpt-mpeg4-final-v79-run.json`, `gpt-mpeg4-final-v79-pixels.json`) |
+| AV1 | Main, 4:2:0 8/10-bit, 3840x2160/60 | Production covered Main8 superresolution/frame-ID/seek cases pass; v93 RAM adds 128x128 SB and multi-tile. Main10/4K, grain, intrabc, timing and nonidentity global motion remain unaccepted |
+| H.264 | 8-bit High, 3840x2160/30; actual 1080i field/MBAFF/PAFF path | Native progressive/MBAFF/1080i and CCTV-1/CCTV13 pixels pass; Hunan PAFF v73 returns 24 pictures with matching PTS/TFF/EOF and 74,649,600 exact visible bytes. Real HTSP/hardware EI viewed; implementation packaged in v81/v92, remaining production regressions tracked separately |
+| VP9 | Profile 0/2, 4:2:0 8/10-bit, 3840x2160/60 | Native covered 36 pictures per profile match independent full-depth samples; implementation packaged in v81/v92, not a claim of full production acceptance |
+| AVS2 | P2/10-bit, 3840x2160/60 | Native 32 640x360 8-bit and 23 expected 3840x2160 10-bit presentations match independent samples including low bits; implementation packaged in v81/v92, remaining production matrix open |
+| MPEG-1/2 | Conventional 8-bit, MPEG-2 MP/HL, 1920x1088 coded / 1080p60 | MPEG-1 all 36 frames/PTS/progressive metadata/EOF pass; MPEG-2 1080i 24 pictures and 48 hardware-EI outputs plus Kodi viewing pass. Recorded IDCT differences are not byte equality; implementation packaged in v81/v92 |
+| MPEG-4 Part 2 | Xvid/ASP@L5, 1080p60 | v79 donor incomplete-VOP padding gives genuine hardware EMPTY, all 36 pictures/PTS and EOF; held single-I returns once. Late B25/B26/B28/B29/B31/B32 remain corrupt. Implementation packaged in v81/v92; full format acceptance remains open |
 | VC-1 / WMV3 | SP/MP/AP, 1080p60 | Native/vendor-direct v75 reproduces 30 nonzero publications and 29 consumer returns from 32 unchanged packets; standard EOS does not flush the missing inputs, and pixels/EOS remain unaccepted. Authenticated selector-9 completion/reference authority is still missing (`gpt-codec-next-discriminators-v76.json`, `gpt-vc1-factory-handoff.json`) |
-| AVS / AVS+ | AVS P2/JiZhun up to 1080p60; AVS+ P16 720x576/25i verified | AVS P2 v70 covered samples pass; the retained 60-picture bunny output now exactly matches an independent weighted-capable scalar reference (82,944,000 samples). v76 P16 returns 50 original pictures/31,104,000 exact samples with original payloads/PTS; v77 EI returns 100 fields with original luma rows exact. Old no-slice and issue767 failures, broader profiles and full image deployment remain open |
-| MJPEG video | Conservative 1080p60 streaming scope | RAM native progressive 36-picture and paired-field 12-picture comparisons have maximum sample difference 1/255; formal image integration and broader still/progressive-JPEG limits remain open |
+| AVS / AVS+ | AVS P2/JiZhun up to 1080p60; AVS+ P16 720x576/25i verified | AVS v70 and weighted 60-picture bunny pass; P16 50 pictures/PTS and EI 100 fields have independent pixels and actual viewing. v93 confirms production 36+24+50 pictures, 100 EI outputs and real EOF. No-slice/issue767 and wider interlaced/1080 P16 specifications remain open |
+| MJPEG video | Conservative 1080p60 streaming scope | Native progressive 36-picture and paired-field 12-picture comparisons have maximum difference 1/255; implementation packaged in v81/v92, broader production/still/progressive-JPEG limits remain open |
 
 H.263 has generic vendor implementations but no established exact-SC2
 hardware profile/rate contract here. H.264 MVC and RealVideo have additional
@@ -3977,4 +3982,39 @@ were removed after verification. Final health capture
 `gpt-native-image-av1-cleanup-health-v92-rea.json` records unchanged new boot,
 production module refcnt0, Kodi/panel/console/preload active with zero restarts
 and exit0, no failed units, /flash read-only and all three eMMC regions read-only.
+
+
+#### Scoped decoder closure and pause (v93)
+
+The owner requested the simpler remaining decoder work first, detailed completed
+and incomplete records, then a pause. The complete handoff is
+[SC2-CODEC-STATUS.md](SC2-CODEC-STATUS.md), including four-family boundaries,
+F01–F09 remaining work packages, previous negative discriminators and all-format
+implementation history. No failed fixture or external acceptance was waived.
+
+Linux `2bd611734c9a` / patch0075 admits native AV1 128x128 superblocks, selects
+SAO geometry and checks the RPM sequence flag against controls. A real multi-tile
+PIC_END reports LCU counter8 for six geometric SBs; the donor's PIC_END/nonzero
+counter contract replaces the invalid geometric-equality test. Final clean RAM
+hardware: 128 normal, 128 four-tile, 128 lossless and 64 four-tile regression,
+24 pictures each; all 96 / 11,059,200 visible bytes and PTS match independent
+original-stream dav1d. Temporary observers were removed before that run.
+The complete LE Linux package rebuilt successfully (`artifact://5405`); both
+changed applied sources equal the development tree. Package construction is
+not full-image deployment: production remains unchanged v92/4d96e6c.
+
+With unchanged production modules/libraries, AVS 352x288/1080p returns 36/24
+byte-exact pictures; P16 576i returns 50 exact pictures with original timestamps.
+Its 100-output EI preserves all 20,736,000 original luma samples; interpolation
+and chroma equality are not asserted. All four cases show real draining EOF.
+Raw archives contain every compared output and have been copied and hashed.
+Evidence under `Work/sc2-all-codecs-20261022/`:
+`gpt-av1-sb128-{comparison,package}-v93.json`,
+`gpt-image-avs-positive-comparison-v93.json` and linked REA captures/archives.
+
+Final production build-id restored, both decoder refcnt0, actual Kodi/panel/
+console/preload active with zero restarts, no failed units, /flash and all three
+eMMC regions read-only. All 384 owned RAM files/directories were removed after
+archiving; `gpt-codec-pause-state-v93.json` links cleanup and actual-unit health.
+No reboot, boot-payload write, eMMC install or security-firmware replacement.
 
