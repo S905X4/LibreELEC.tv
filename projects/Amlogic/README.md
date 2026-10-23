@@ -3304,29 +3304,97 @@ Evidence under `Work/sc2-pvr-20261022/`:
   `hevc-idr-live-after-v1-{0,1,2,3}.jpg`;
 - `hevc-idr-root-cause-and-smoke-v1.json`.
 
-Supported integration scope follows the board's stock MediaCodec limits,
-the exact CE media-module support gate and real decoder implementations,
-not the generic feature reporter's misleading SC2 "8k" string:
+Supported integration scope combines this board's stock MediaCodec limits,
+vendor decoder implementations, feature-report registration and actual
+hardware evidence, not the generic reporter's misleading SC2 "8k" string.
+`vdec_feature_support_format()` gates feature-report registration only
+(`vdec_feature_register()`), not universal decoder admission. An omitted
+format does not by itself establish absent silicon capability:
 
 | Family | Conservative supported envelope | Native acceptance boundary |
 | --- | --- | --- |
 | HEVC | Main/Main10, 4:2:0 8/10-bit, 3840x2160/60 | Existing Request/pixel/Main10 evidence plus live repair above; not every coding tool/HDR mode |
 | AV1 | Main, 4:2:0 8/10-bit, 3840x2160/60 | Existing covered Request/pixel cases; grain/frame-ID/super-resolution not inferred |
-| H.264 | 8-bit High, 3840x2160/30; actual 1080i field/MBAFF path | RAM MULTI: progressive/MBAFF/1080i and CCTV-1/CCTV13 independent pixels pass; real HTSP CCTV-1/CCTV13/Hunan and hardware EI viewed. Clean PAFF oracle and formal integration remain open |
+| H.264 | 8-bit High, 3840x2160/30; actual 1080i field/MBAFF/PAFF path | RAM MULTI: progressive/MBAFF/1080i and CCTV-1/CCTV13 independent pixels pass; Hunan PAFF v73 returns 24 pictures with matching PTS/TFF/EOF and 74,649,600 exact visible bytes. Real HTSP and hardware EI viewed; formal image integration remains open |
 | VP9 | Profile 0/2, 4:2:0 8/10-bit, 3840x2160/60 | RAM native implementation: 36 covered pictures per profile match independent full-depth samples; formal image acceptance remains open |
 | AVS2 | P2/10-bit, 3840x2160/60 | RAM native implementation: 32 640x360 8-bit and 23 expected 3840x2160 10-bit presentations match independent samples, including low bits; formal image acceptance remains open |
 | MPEG-1/2 | Conventional 8-bit, MPEG-2 MP/HL, 1920x1088 coded / 1080p60 | RAM MULTI: MPEG-1 all 36 frames/PTS/progressive metadata/EOF pass; MPEG-2 1080i 24 pictures and 48 hardware-EI outputs plus Kodi viewing pass. IDCT differences are recorded below; formal integration remains open |
-| MPEG-4 Part 2 | Xvid/ASP@L5, 1080p60 | v72 returned 36 presentations, but its EOF claim is withdrawn: ordinary completion was incorrectly promoted to terminal. v78 admits EOS-only runs and requires genuine EMPTY; the same fixture now fails on an unmatched completion after 36 coded tokens, with 32 consumer returns and no EOF. Late B25/B26/B28/B29/B31/B32 corruption also remains unresolved (`gpt-mpeg4-lifecycle-v78-run.json`, `gpt-mpeg4-frame-v72-comparison.json`) |
+| MPEG-4 Part 2 | Xvid/ASP@L5, 1080p60 | v79 uses donor incomplete-VOP padding and observes genuine hardware EMPTY, all 36 pictures/PTS and EOF; a single held I reference also returns once with EMPTY/EOF. Late B25/B26/B28/B29/B31/B32 pixels remain corrupt; full MPEG4 acceptance and image deployment remain open (`gpt-mpeg4-final-v79-run.json`, `gpt-mpeg4-final-v79-pixels.json`) |
 | VC-1 / WMV3 | SP/MP/AP, 1080p60 | Native/vendor-direct v75 reproduces 30 nonzero publications and 29 consumer returns from 32 unchanged packets; standard EOS does not flush the missing inputs, and pixels/EOS remain unaccepted. Authenticated selector-9 completion/reference authority is still missing (`gpt-codec-next-discriminators-v76.json`, `gpt-vc1-factory-handoff.json`) |
-| AVS / AVS+ | AVS P2/JiZhun up to 1080p60; AVS+ P16 720x576/25i verified | AVS P2 v70 covered samples pass; v76 P16 returns 50 original pictures and 31,104,000 samples exactly matching independent software, with original packet payloads and 40ms PTS preserved. v77 DI returns 100 fields at 20ms with every original luma row byte-exact. Patch 0070 exported; full image deployment and broader AVS/AVS+ limits remain open |
+| AVS / AVS+ | AVS P2/JiZhun up to 1080p60; AVS+ P16 720x576/25i verified | AVS P2 v70 covered samples pass; the retained 60-picture bunny output now exactly matches an independent weighted-capable scalar reference (82,944,000 samples). v76 P16 returns 50 original pictures/31,104,000 exact samples with original payloads/PTS; v77 EI returns 100 fields with original luma rows exact. Old no-slice and issue767 failures, broader profiles and full image deployment remain open |
 | MJPEG video | Conservative 1080p60 streaming scope | RAM native progressive 36-picture and paired-field 12-picture comparisons have maximum sample difference 1/255; formal image integration and broader still/progressive-JPEG limits remain open |
 
-H.263 and H.264 MVC have vendor implementations but no established SC2
-profile/rate contract here. VP8, VP6, RealVideo, AVS3, VVC, 12-bit and
+H.263 has generic vendor implementations but no established exact-SC2
+hardware profile/rate contract here. H.264 MVC and RealVideo have additional
+exact-S905X4 manufacturer claims, recorded below as investigations rather
+than silently accepted HK1 hardware paths. VP8, VP6, AVS3, VVC, 12-bit and
 4:2:2/4:4:4 extensions are not added from generic enums/software entries.
 Dolby metadata/processing and audio-DSP decoding are separate features,
-not additional proven video decoder families. These limits are supported
-scope, not claims that every listed format already works natively.
+not additional proven video decoder families. The supported envelope is
+not a claim that every listed coding tool or rate already works natively.
+
+##### 2026-10-23 S905X4 capability audit
+
+No authenticated Amlogic-origin S905X4 datasheet was obtained in this search.
+Older S905X/S905X3 and newer S905X5 documents are not substituted. Primary
+product specifications establish claims, not hardware acceptance of this HK1:
+
+- [Geniatech APC329L4 specification, PDF pp.6–7](https://file.geniatech.com/download/APC/APC329L4_Specification_V1.1_EN.pdf)
+  explicitly identifies S905X4. It lists AV1 MP-10/L5.1, HEVC Main10/L5.1,
+  VP9 P2 and AVS2 P2 at 4Kx2K60; H.264 High/L5.1 at 4Kx2K30; MPEG4 ASP/L5,
+  VC1 SP/MP/AP, AVS P2/P16 and MPEG1/2 at 1080p60, plus RealVideo8/9/10.
+- [SEI800 specification](https://www.seirobotics.net/s905x4-4k-av1-android-tv-ott-hybrid-stb-p00063p1.html)
+  explicitly names S905X4 in the chipset table and claims H.264 MVC1080p60
+  and RealVideo8/9/10 in addition to that core list. Its heading also offers
+  S905C2 variants; it is not a proof of this HK1's selected firmware path.
+- [OSMC Vero V technical specifications](https://osmc.tv/wiki/vero-v/technical-specifications/)
+  corroborate the core list for S905X4-OSMC. The
+  [product FAQ](https://osmc.tv/vero/) explicitly mentions 3D MVC playback;
+  frame-packed/SBS/TAB output alone would not establish MVC decoding.
+- [SDMC's S905X4 comparison](https://en.sdmctech.com/news/product-news_1899.html)
+  explicitly groups HEVC/VP9/AVS2 under 4Kp60 10-bit and adds AV1 4K60.
+  VP9 Profile2 is not evidence of 12-bit support. Profile-derived 4:2:0
+  limits are interpretation of those profiles, not a separate chroma test.
+- [Tanix TX4 decoding specification](https://www.tanixtvbox.com/product/tanix-x4/)
+  corroborates MPEG4/AVS/VC1/MPEG1/2 and JPEG/MJPEG. Its "unlimited pixel
+  resolution" wording is not a practical JPEG allocation/throughput bound;
+  baseline/progressive/lossless, sampling, depth and size require separate
+  verification. Its narrative 4x1080p60 conflicts with its detailed
+  2x1080p60 claim; neither establishes tested simultaneous-session rates.
+
+This HK1's stock hardware XML caps its 4K entries at **3840x2160**, not
+4096-wide or 8K. The performance XML is not a new hardware measurement:
+`vp6a`, `vp6f`, `vp8`, `rm10` and `rm20` entries explicitly end in `.sw`;
+H.263 is `OMX.google.h263.decoder`. Their presence does not prove hardware
+support, while their software exposure alone does not prove absent silicon.
+MPEG1 "MP/HL" in manufacturer tables is imprecise terminology, not a new
+valid MPEG1 profile. File extensions, encoding engines, audio DSPs and
+generic Dolby XML entries do not expand the video-hardware contract.
+
+The ten existing implementation families remain. **Two claim-ledger tasks
+are added:** C01 authenticates MVC firmware/SC2 dispatch/stereo outputs;
+C02 authenticates RealVideo hardware dispatch and output versus software.
+H.263/VP8/VP6 are unresolved hardware capabilities, not promised additions.
+AVS3/VVC/12-bit/422/444 and AVIF/HEIF/PNG/WebP image hardware paths are not
+inferred. Dolby Vision support on licensed variants does not establish it
+on this HK1; HDR and full-depth HDMI output remain separate from decoding.
+
+The complete remaining-project checklist in root `skill.md` has **24 existing
+delivery/acceptance work packages plus C01/C02 = 26**, not 26 unimplemented
+decoders or a completion percentage. It retains codec failures, full-image
+integration/regression, sync/output verification, six peripheral tasks,
+three eMMC/install/update tasks, TCL/multi-brand testing and three upstream/
+asset delivery tasks. CPU, IR RAW, accepted panel layout, USB2/3 and basic
+GPU/EDID/HDMI PCM are not reopened; cancelled tests stay cancelled.
+
+Read-only live evidence records the actual deployed full image as
+`9deaa0575bb50e26580bbd6ecb5782728d1373b4`, Linux6.18.57, boot
+`073c1d00-79cc-4ff8-bca7-9135351a2d50`. Kodi maps only the production
+`/usr/lib/libavcodec.so.60.3.100`, not the later RAM field-pair library.
+Exact hashes and health are in `gpt-s905x4-audit-{live,library-parity}-v80-rea.json`.
+Different hashes alone are not proof of a functional delta; source/package
+parity must be checked before producing a complete new image. No audit
+claim itself closes a codec failure or authorizes an unknown eMMC write.
 
 #### AVS+ P16 and hardware EI verification
 
@@ -3365,6 +3433,49 @@ are exhausted; terminal drain requires a real EMPTY with the latest writer
 pointer and no unmatched tokens. The v78 hardware run exposed a duplicate
 completion instead of EMPTY after the final coded token. It now returns an
 error rather than publishing false EOF; full MPEG4 acceptance is still open.
+
+Patch `0072-meson-sc2-mpeg4-drain-padding.patch` exports kernel commit
+`64aa465e5b40`, correcting that duplicate-completion cause without relaxing
+the EMPTY rule. The read-only v79 run-boundary capture observes the host
+write `BUFFEROUT=0x10000`, followed about 16 microseconds after processor
+start by a repeated `0x13` with no input-pointer or picture-offset progress.
+Replacing sequence-end `b1` with `vmpeg4_multi.c`'s incomplete-VOP `b6`
+padding produces real hardware EMPTY after the 36th coded picture, all 36
+presentations at 40ms PTS, and `Dequeue EOF`. The final candidate also
+returns one held I reference exactly once with real EMPTY/EOF; its 115,200
+samples differ from independent software by at most 1/255. Token, writer
+pointer and final-reference checks are unchanged. The six late B-picture
+pixel failures remain separate and unaccepted. Evidence:
+`gpt-mpeg4-{boundary,b6-boundary,final,single-final}-v79-*` under the same
+work directory. These are RAM runs, not deployment of a complete image.
+
+A separate v79 RAM discriminator matched the donor's extra VLD reset and
+enable-before-WP ordering. It still returned 36 pictures and EOF with the
+same six late-B failures (B25/B26/B28/B29/B31/B32); it is not a fix, and
+both diagnostic source changes were reverted. Exact results are in
+`gpt-mpeg4-order-v79-{run,pixels}.json`. The remaining discriminator needs
+the loaded firmware's future-P skip decision and bit position at the first
+divergent macroblock; donor host source does not identify those fields.
+The public [AMRISC disassembler](https://github.com/cyrozap/amlogic-video-codec-re/blob/master/disasm.py)
+only labels no-ops and relative branches, not LMEM state or load/store
+semantics. Arbitrary workspace words are not authenticated skip-map fields.
+Final source and rebuilt RAM-module hashes again match the earlier final
+v79 candidate. `gpt-codec-discriminators-v79-summary.json` and
+`gpt-codec-discriminators-cleanup-health-v79-rea.json` retain the negative
+experiments and recovery: 68 temporary board artifacts removed after host
+raster SHA-256 verification, production decoder restored, Kodi/panel/console
+active with zero restarts, no failed units or observer, decoder refcount 0,
+and `/flash` plus all three eMMC areas still read-only. No reboot occurred.
+
+The complete LE kernel package with patch 0072 rebuilt and installed its
+modules (`artifact://5100`); the patched MPEG4 source SHA-256 matches the
+development kernel. `gpt-native-codecs-integration-v79.json` records the
+separate package-module and hardware-smoke-module hashes. The package
+module was not separately loaded on the board. Production decoder build ID
+`7848a25fac2cd7e4068cbec43a3827be9c999181` is restored, Kodi/panel/console
+are active with zero restarts and no failed units, the observer is unloaded,
+and all temporary RAM modules/input/output are removed. `/flash` and all
+three eMMC areas remain read-only. No reboot or boot-payload update occurred.
 
 SC2 stop synchronizes IRQ, cancels legacy delayed recycle work, then drains
 DMA before releasing backing. A failed final drain retains backing and the
@@ -3571,10 +3682,13 @@ compressed input and separate xavs encoder reconstruction as pixel oracles:
 
 The [FFmpeg FATE HD bunny](https://fate-suite.ffmpeg.org/cavs/bunny.mp4)
 returns all 60 pictures, matching PTS/geometry/field metadata and real EOF.
-It is **not** pixel-exact acceptance: 2,289 of 82,944,000 samples differ from
-scalar software decoding, with maximum difference 255. SIMD/scalar software
-outputs also differ, and FFmpeg logs unsupported weighted-prediction warnings;
-the residual cause is unresolved, not assigned to either decoder by assumption.
+The earlier scalar reference omitted weighted prediction and differed in
+2,289 samples. A newer independent scalar decoder supporting weighting now
+matches all 82,944,000 retained hardware samples byte-for-byte, with zero
+warnings. Hardware was not rerun or modified for this comparison; the old
+SIMD/scalar discrepancy is not evidence of a hardware defect. Exact input,
+reference binary/source hashes and output identities are recorded in
+`gpt-avs-bunny-weighted-reference-v79-comparison.json`.
 The independent encoder source is
 <https://github.com/Distrotech/xavs>; its exact commit and generated-fixture
 identities are retained with the comparisons.
@@ -3588,6 +3702,23 @@ removed from compatibility scope or declared nonconformant. The earlier CE
 stream trace is not a successful pixel oracle. AVS+ P16, interlaced AVS,
 remaining compatibility cases and Kodi/production-image integration remain
 unaccepted; the supported envelope is not a throughput or universal-tool claim.
+
+The later v79 trace pins issue767's exhausted run to coded AU5 (21 bytes),
+while its BUFFEROUT is the delayed AU4 picture, not completion of the
+current REC. AU4/AU5 start with skip-run30; AU6 starts with whole-picture
+skip-run396. Four offline slice/skip-run variants, including row-local
+terminal skips throughout AU5/AU6, independently decode to the same six
+352x288 pictures and identical 912,384 bytes. On the unchanged production
+decoder each variant returns only four pictures, then drain times out
+without EOS; no pixel equivalence is claimed for those hardware outputs.
+This does not establish a firmware-only cause or repair the old inputs.
+The independent raw-stream reference logs `no frame decoded` on header-only
+packets; this comparison is not the warning-free bunny result. Evidence:
+`gpt-avs-issue767-tail-syntax-v79.json`,
+`gpt-avs-issue767-row-slice-reference-v79.json` and
+`gpt-avs-issue767-{au5rows,au6rows,au56rows,allrows}-v79-run.json`.
+No diagnostic input rewrite, counted padding, or false PIC_DONE was added
+to the driver; both original compatibility failures remain unaccepted.
 
 Evidence under `Work/sc2-all-codecs-20261022/`:
 `gpt-avsm-final-v70-comparison.json`, `gpt-avsm-{ipb,1080p,hd}-final-v70-rea.json`,
