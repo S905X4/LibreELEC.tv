@@ -1,0 +1,312 @@
+From cbc00949aac6bf310f78093a552a13c34aef43d7 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Fri, 23 Oct 2026 22:58:20 +0800
+Subject: [PATCH] media: meson: reconstruct SC2 AV1 superresolution pictures
+
+Keep coded width distinct from reconstructed output and retained reference
+geometry. Program the donor upscale phases and scale reference factors;
+only reuse temporal motion and segmentation for matching coded MI grids.
+
+Verify sequence superres against firmware RPM rather than treating its bit
+as a decode error. Keep fixed output allocation and grain rejection.
+
+Packaged kernel/FFmpeg hardware series: 24 denominator-12 pictures and
+144 pictures at denominator 9, 16 and varying 9..16 exactly match dav1d.
+
+Change-Id: Ie9d5f00f46c642b0b29cabc47db3a9b28c798c1b
+---
+ .../platform/amlogic/meson-sc2-vdec/Kconfig   |   8 +-
+ .../amlogic/meson-sc2-vdec/meson_sc2_av1.h    | 113 +++++++++++++-----
+ .../amlogic/meson-sc2-vdec/meson_sc2_vdec.c   |   2 +-
+ 3 files changed, 85 insertions(+), 38 deletions(-)
+
+diff --git a/drivers/media/platform/amlogic/meson-sc2-vdec/Kconfig b/drivers/media/platform/amlogic/meson-sc2-vdec/Kconfig
+index aa6722bbd53b..7374743c7465 100644
+--- a/drivers/media/platform/amlogic/meson-sc2-vdec/Kconfig
++++ b/drivers/media/platform/amlogic/meson-sc2-vdec/Kconfig
+@@ -17,9 +17,9 @@ config VIDEO_MESON_SC2_HEVC
+ 	  bytes; sequence/frame headers are rebuilt from native AV1 controls.
+ 	  Main8 CAPTURE is contiguous NV12. HEVC Main10 CAPTURE uses the local
+ 	  proposed AMF0 Amlogic scatter-FBC ABI with exported vb2-owned header/body
+-	  storage, not an eight-bit preview. AV1 supports fixed-size <=1920x1088 streams,
+-	  64x64 superblocks and <=256 tiles; film grain, superresolution,
+-	  intrabc, frame IDs, timing models and nonidentity global motion are
+-	  rejected explicitly.
++	  storage, not an eight-bit preview. AV1 supports fixed output size
++	  <=1920x1088, superresolution, 64x64 superblocks and <=256 tiles.
++	  Film grain, intrabc, frame IDs, timing models and nonidentity global
++	  motion are rejected explicitly.
+ 	  The original SC2 secure firmware must already have been preloaded.
+ 	  Full-depth compressed scanout requires matching DRM PRIME userspace.
+diff --git a/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_av1.h b/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_av1.h
+index 934f1e27ff0c..cfd2a88b8c03 100644
+--- a/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_av1.h
++++ b/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_av1.h
+@@ -38,7 +38,7 @@ struct sc2_av1_state {
+     struct meson_av1_syntax_reference snapshots[8];
+     struct v4l2_ctrl_av1_sequence sequence_control;
+     int ref_map[8], refs[7], current_slot, primary;
+-    u32 sequence[128], width, height;
++    u32 sequence[128], width, height, upscaled_width;
+     unsigned int order_bits;
+     bool order_enabled, initialized;
+ };
+@@ -186,6 +186,13 @@ static u32 av1_seq_skip_mode(struct sc2_av1_state *st, const unsigned int *p)
+     return BIT(8) | min(forward, second) | (max(forward, second) << 4);
+ }
+ 
++static bool av1_seq_same_mi(const struct sc2_av1_state *st,
++                           const struct av1_retained_picture *ref)
++{
++    return ALIGN(ref->frame.frame_width_minus_1 + 1, 8) == ALIGN(st->width, 8) &&
++           ALIGN(ref->frame.frame_height_minus_1 + 1, 8) == ALIGN(st->height, 8);
++}
++
+ /* Vendor motion_field_projection contributes only reference offsets and
+  * eligibility here; vector projection itself is real hardware MPRED work.
+  */
+@@ -195,7 +202,7 @@ static bool av1_seq_project(struct sc2_av1_state *st, unsigned int type, int sel
+     struct av1_retained_picture *ref = &st->slot[st->refs[type - 1]];
+     unsigned int i;
+ 
+-    if (av1_seq_intra(ref->type))
++    if (av1_seq_intra(ref->type) || !av1_seq_same_mi(st, ref))
+         return false;
+     if (*count >= 3)
+         return false;
+@@ -203,7 +210,6 @@ static bool av1_seq_project(struct sc2_av1_state *st, unsigned int type, int sel
+     for (i = 0; i < 7; i++)
+         offsets[*count][i] = av1_seq_distance(st, ref->order_hint, ref->ref_order_hint[i]);
+     (*count)++;
+-    /* Fixed-size streams satisfy the vendor mi_rows/mi_cols eligibility test. */
+     return true;
+ }
+ 
+@@ -234,10 +240,15 @@ static unsigned int av1_seq_motion_fields(struct sc2_av1_state *st, int selected
+     return count;
+ }
+ 
++static u32 av1_seq_scale(u32 reference, u32 dimension)
++{
++    return ((reference << 14) + dimension / 2) / dimension;
++}
++
+ static void av1_seq_mc(struct sc2_av1_state *st, struct meson_sc2_hw *hw, bool intra)
+ {
+     unsigned int bank, type;
+-    u32 packed;
++    u32 packed, scale_enable = 0;
+ 
+     for (bank = 0; bank < 2; bank++) {
+         sc2_write(hw, HEVCD_MPP_ANC_CANVAS_ACCCONFIG_ADDR, ((bank * 16) << 8) | 1);
+@@ -251,14 +262,24 @@ static void av1_seq_mc(struct sc2_av1_state *st, struct meson_sc2_hw *hw, bool i
+     }
+     sc2_write(hw, A1_REFINFO_CONFIG, BIT(2));
+     for (type = 0; type < 8; type++) {
+-        sc2_write(hw, A1_REFINFO_DATA, st->width);
+-        sc2_write(hw, A1_REFINFO_DATA, st->height);
+-        sc2_write(hw, A1_REFINFO_DATA, 1 << 14);
+-        sc2_write(hw, A1_REFINFO_DATA, 1 << 14);
++        unsigned int physical = !type || intra ? st->current_slot : st->refs[type-1];
++        const struct v4l2_ctrl_av1_frame *ref = &st->slot[physical].frame;
++        u32 x_scale = 1 << 14, y_scale = 1 << 14;
++
++        if (type && !intra) {
++            x_scale = av1_seq_scale(ref->upscaled_width, st->width);
++            y_scale = av1_seq_scale(ref->frame_height_minus_1 + 1, st->height);
++            if (x_scale != 1 << 14 || y_scale != 1 << 14)
++                scale_enable |= BIT(type);
++        }
++        sc2_write(hw, A1_REFINFO_DATA, ref->upscaled_width);
++        sc2_write(hw, A1_REFINFO_DATA, ref->frame_height_minus_1 + 1);
++        sc2_write(hw, A1_REFINFO_DATA, x_scale);
++        sc2_write(hw, A1_REFINFO_DATA, y_scale);
+         sc2_write(hw, A1_REFINFO_DATA, 0);
+     }
+-    sc2_write(hw, A1_REF_SCALE_MPP, 0);
+-    sc2_write(hw, A1_REF_SCALE_PARSER, 0); /* all retained dimensions match */
++    sc2_write(hw, A1_REF_SCALE_MPP, scale_enable);
++    sc2_write(hw, A1_REF_SCALE_PARSER, scale_enable);
+ }
+ 
+ static void av1_seq_mpred(struct sc2_av1_state *st, struct meson_sc2_hw *hw, const unsigned int *p, bool intra, bool error_resilient)
+@@ -371,6 +392,16 @@ static void av1_seq_mcrcc(struct sc2_av1_state *st, struct meson_sc2_hw *hw, boo
+     sc2_write(hw, HEVCD_MCRCC_CTL1, 0xff0);
+ }
+ 
++/* AV1 resize phase, matching av1_upscale_frame_init in the SC2 donor. */
++static u32 av1_seq_upscale_start(u32 input, u32 output, u32 step)
++{
++    s32 error = (s32)(output * step) - (s32)(input << 14);
++    s32 start = (-(s32)((output - input) << 13) + (s32)output / 2) /
++                (s32)output + 128 - error / 2;
++
++    return start & ((1 << 14) - 1);
++}
++
+ static void av1_seq_filters(struct sc2_av1_state *st, struct meson_sc2_hw *hw, const unsigned int *p)
+ {
+     static const s32 defaults[8] = { 1, 0, 0, 0, -1, 0, -1, -1 };
+@@ -402,10 +433,10 @@ static void av1_seq_filters(struct sc2_av1_state *st, struct meson_sc2_hw *hw, c
+     cur->seg_enabled = p[76] & 1;
+     cur->intra_only = (p[76] >> 2) & 1;
+     cur->seg_update_map = (p[76] >> 3) & 1;
+-    cur->prev_seg_enabled = prev && prev->seg_enabled &&
++    cur->prev_seg_enabled = prev && av1_seq_same_mi(st, prev) && prev->seg_enabled &&
+                            (prev->seg_update_map || prev->prev_seg_enabled);
+-    cur->seg_mi_cols = DIV_ROUND_UP(st->width, 4);
+-    cur->seg_mi_rows = DIV_ROUND_UP(st->height, 4);
++    cur->seg_mi_cols = ALIGN(st->width, 8) / 4;
++    cur->seg_mi_rows = ALIGN(st->height, 8) / 4;
+     for (i = 0; i < 8; i++) {
+         cur->seg_y[i] = cur->seg_c[i] = 0;
+         if ((p[76] & 3) == 3) {
+@@ -425,13 +456,22 @@ static void av1_seq_filters(struct sc2_av1_state *st, struct meson_sc2_hw *hw, c
+         sc2_write(hw, A1_DBLK_SEGMENT, (u32)cur->seg_y[i] | ((u32)cur->seg_c[i] << 16));
+     sc2_write(hw, A1_DBLK_CDEF0, av1_workspace(st, CDEF));
+     sc2_write(hw, A1_DBLK_CDEF1, (sc2_read(hw, A1_DBLK_CDEF1) & 0xffffff00) | 17);
+-    sc2_write(hw, A1_DBLK_UPS1, av1_workspace(st, UPS));
+-    sc2_write(hw, A1_DBLK_UPS2, 128);
+-    sc2_write(hw, A1_DBLK_UPS3, 128);
+-    sc2_write(hw, A1_DBLK_UPS4, 1 << 14);
+-    sc2_write(hw, A1_DBLK_UPS5, 1 << 14);
+-    sc2_write(hw, A1_UPSCALE_X0, (128 << 16) | 128);
+-    sc2_write(hw, A1_UPSCALE_STEP, (1U << 30) | (1 << 14));
++    {
++        u32 y_step = av1_seq_scale(st->width, st->upscaled_width);
++        u32 c_step = av1_seq_scale(DIV_ROUND_UP(st->width, 2),
++                                  DIV_ROUND_UP(st->upscaled_width, 2));
++        u32 y_start = av1_seq_upscale_start(st->width, st->upscaled_width, y_step);
++        u32 c_start = av1_seq_upscale_start(DIV_ROUND_UP(st->width, 2),
++                                          DIV_ROUND_UP(st->upscaled_width, 2), c_step);
++
++        sc2_write(hw, A1_DBLK_UPS1, av1_workspace(st, UPS));
++        sc2_write(hw, A1_DBLK_UPS2, y_start);
++        sc2_write(hw, A1_DBLK_UPS3, c_start);
++        sc2_write(hw, A1_DBLK_UPS4, y_step);
++        sc2_write(hw, A1_DBLK_UPS5, c_step);
++        sc2_write(hw, A1_UPSCALE_X0, (c_start << 16) | y_start);
++        sc2_write(hw, A1_UPSCALE_STEP, (c_step << 16) | y_step);
++    }
+     sc2_write(hw, HEVC_ASSIST_SCRATCH_8, av1_workspace(st, CDF) + st->current_slot * 0x8000);
+     sc2_write(hw, A1_SEG_WRITE, av1_workspace(st, SEG) + st->current_slot * 0xca80);
+     sc2_write(hw, HEVC_ASSIST_SCRATCH_9, av1_workspace(st, CDF) + (prev ? st->primary * 0x8000 : 0));
+@@ -564,7 +604,10 @@ static void sc2_av1_ref_info(struct sc2_av1_state *st, struct meson_sc2_hw *hw)
+                              (u32)slot) << (j * 8);
+             }
+         } else if (st->ref_map[i - 2] >= 0) {
+-            info = (st->width << 16) | st->height;
++            const struct v4l2_ctrl_av1_frame *ref =
++                &st->slot[st->ref_map[i - 2]].frame;
++
++            info = (ref->upscaled_width << 16) | (ref->frame_height_minus_1 + 1);
+         }
+         sc2_write(hw, A1_PARSER_MEM_DATA, info);
+     }
+@@ -636,7 +679,9 @@ static int sc2_av1_validate(struct meson_sc2_hevc_context *ctx,
+     /* Main8 NV12 only. DW8 is not full-depth Main10. The stock workspace
+      * capacities are the <=1920x1088 layout, not an invented 4K layout. */
+     if (s->seq_profile || s->bit_depth != 8 || width < 64 || height < 64 ||
+-        width > 1920 || height > 1088 || (width & 1) || (height & 1) ||
++        width > 1920 || height > 1088 || (height & 1) ||
++        f->upscaled_width < width || f->upscaled_width > 1920 ||
++        (f->upscaled_width & 1) ||
+         (s->flags & (V4L2_AV1_SEQUENCE_FLAG_MONO_CHROME |
+                      V4L2_AV1_SEQUENCE_FLAG_FILM_GRAIN_PARAMS_PRESENT |
+                      V4L2_AV1_SEQUENCE_FLAG_USE_128X128_SUPERBLOCK)) ||
+@@ -645,10 +690,9 @@ static int sc2_av1_validate(struct meson_sc2_hevc_context *ctx,
+                     (V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_X |
+                      V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_Y) ||
+         f->current_frame_id ||
+-        (f->flags & (V4L2_AV1_FRAME_FLAG_USE_SUPERRES |
+-                     V4L2_AV1_FRAME_FLAG_ALLOW_INTRABC |
++        (f->flags & (V4L2_AV1_FRAME_FLAG_ALLOW_INTRABC |
+                      V4L2_AV1_FRAME_FLAG_BUFFER_REMOVAL_TIME_PRESENT)) ||
+-        f->upscaled_width != width || f->tile_info.tile_cols > 64 ||
++        f->tile_info.tile_cols > 64 ||
+         f->tile_info.tile_rows > 64 || job->syntax->num_tiles > 256)
+         return -EOPNOTSUPP;
+     /* A fresh parser has no implicit previous global-motion predictor bank.
+@@ -657,15 +701,15 @@ static int sc2_av1_validate(struct meson_sc2_hevc_context *ctx,
+         if (f->global_motion.type[i] != V4L2_AV1_WARP_MODEL_IDENTITY)
+             return -EOPNOTSUPP;
+     if (!owner || (owner->context && owner->context != ctx) ||
+-        owner->surface.width != width || owner->surface.height != height ||
++        owner->surface.width != f->upscaled_width || owner->surface.height != height ||
+         owner->surface.depth != 8 || owner->surface.mv_size < SZ_1M ||
+-        !out->output_buffer || out->output_stride != ALIGN(width, 64) ||
++        !out->output_buffer || out->output_stride != ALIGN(f->upscaled_width, 64) ||
+         out->output_uv_offset != out->output_stride * ALIGN(height, 64) ||
+         out->output_size < out->output_uv_offset * 3 / 2 ||
+         out->output_buffer->size < out->output_size)
+         return -EINVAL;
+     if (st->initialized &&
+-        (width != st->width || height != st->height ||
++        (f->upscaled_width != st->upscaled_width || height != st->height ||
+          memcmp(s, &st->sequence_control, sizeof(*s))))
+         return -EOPNOTSUPP; /* STREAMOFF establishes a new sequence boundary. */
+     if (!st->initialized && f->frame_type != V4L2_AV1_KEY_FRAME)
+@@ -748,6 +792,7 @@ static int sc2_av1_validate(struct meson_sc2_hevc_context *ctx,
+         (f->primary_ref_frame < 7 && !intra ? st->refs[f->primary_ref_frame] : -1);
+     st->width = width;
+     st->height = height;
++    st->upscaled_width = f->upscaled_width;
+     st->order_enabled = s->flags & V4L2_AV1_SEQUENCE_FLAG_ENABLE_ORDER_HINT;
+     st->order_bits = s->order_hint_bits;
+     st->sequence[9] = st->order_bits ? st->order_bits - 1 : 0;
+@@ -777,7 +822,7 @@ static void sc2_av1_program(struct meson_sc2_hevc_context *ctx,
+                               (i < pages ? i * SZ_4K : 0)) >> PAGE_SHIFT);
+     if (st->primary >= 0) {
+         struct av1_retained_picture *prev = &st->slot[st->primary];
+-        bool inherited = prev->seg_enabled &&
++        bool inherited = av1_seq_same_mi(st, prev) && prev->seg_enabled &&
+                          (prev->seg_update_map || prev->prev_seg_enabled);
+         skip |= (inherited ? BIT(31) : 0) | (prev->intra_only ? BIT(30) : 0) |
+                 ((u32)st->primary << 24);
+@@ -786,8 +831,8 @@ static void sc2_av1_program(struct meson_sc2_hevc_context *ctx,
+     }
+     sc2_write(hw, HEVC_ASSIST_SCRATCH_2, 0);
+     sc2_write(hw, A1_SKIP_MODE_INFO, skip | (st->current_slot << 16));
+-    sc2_write(hw, HEVC_PARSER_PICTURE_SIZE, (st->height << 16) | st->width);
+-    sc2_write(hw, A1_PIC_SIZE_FB, (st->height << 16) | st->width);
++    sc2_write(hw, HEVC_PARSER_PICTURE_SIZE, (st->height << 16) | st->upscaled_width);
++    sc2_write(hw, A1_PIC_SIZE_FB, (st->height << 16) | st->upscaled_width);
+     sc2_write(hw, HEVC_SAO_CTRL5,
+               (sc2_read(hw, HEVC_SAO_CTRL5) | BIT(9) | BIT(10)) & ~BIT(15));
+     sc2_write(hw, HEVCD_MPP_DECOMP_CTL1, BIT(4));
+@@ -854,7 +899,9 @@ static int sc2_av1_run(struct meson_sc2_hevc_context *ctx,
+             for (i = 0; i < 128; i++)
+                 p[i] = le16_to_cpu(raw[(i & ~3U) + 3 - (i & 3)]);
+             if (status == 0xf2) {
+-                if (++sequences != 1 || p[0] || p[56] != 8 || p[57] & BIT(15))
++                if (++sequences != 1 || p[0] || p[56] != 8 || (p[57] & BIT(6)) ||
++                    !!(p[57] & BIT(15)) !=
++                    !!(job->syntax->sequence->flags & V4L2_AV1_SEQUENCE_FLAG_ENABLE_SUPERRES))
+                     return -EPROTO;
+                 sc2_av1_ref_info(st, hw);
+                 dma_wmb();
+@@ -863,7 +910,7 @@ static int sc2_av1_run(struct meson_sc2_hevc_context *ctx,
+                 if (!sequences || ++headers != 1 || p[13] || p[14] != f->frame_type ||
+                     p[21] != f->order_hint || p[22] != f->primary_ref_frame ||
+                     p[17] != f->refresh_frame_flags || p[25] != st->width ||
+-                    p[26] != st->width || p[27] != st->height || p[56] != 8)
++                    p[26] != st->upscaled_width || p[27] != st->height || p[56] != 8)
+                     return -EPROTO;
+                 for (i = 0; i < 7; i++)
+                     if (!av1_seq_intra(p[14]) && p[34 + i] != f->ref_frame_idx[i])
+diff --git a/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_vdec.c b/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_vdec.c
+index 88585560cc8e..8bded3119427 100644
+--- a/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_vdec.c
++++ b/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_vdec.c
+@@ -745,7 +745,7 @@ static int sc2_decode_av1(struct sc2_ctx *ctx, struct vb2_v4l2_buffer *src,
+ 		V4L2_CID_STATELESS_AV1_SEQUENCE)->p_req.p;
+ 	syntax.frame = sc2_request_control(hdl, V4L2_CID_STATELESS_AV1_FRAME)->p_req.p;
+ 	frame = syntax.frame;
+-	if (frame->frame_width_minus_1 + 1 != ctx->source_fmt.width ||
++	if (frame->upscaled_width != ctx->source_fmt.width ||
+ 	    frame->frame_height_minus_1 + 1 != ctx->source_fmt.height)
+ 		return -EINVAL;
+ 	tiles = sc2_request_control(hdl, V4L2_CID_STATELESS_AV1_TILE_GROUP_ENTRY);
+-- 
+2.47.3
+

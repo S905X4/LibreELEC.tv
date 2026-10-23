@@ -1,0 +1,69 @@
+From f6d11fe3806890ebad40bd16cae4eb2aa5ff7fcf Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Fri, 23 Oct 2026 22:58:20 +0800
+Subject: [PATCH] media: meson: accept source-validated AV1 frame-ID controls
+
+The native controls omit source ID lengths and deltas. Require source
+parsers to check current, reference and show-existing IDs before resolving
+references by timestamp, and normalize optional current IDs thereafter.
+Do not invent unavailable ABI fields or weaken missing-reference checks.
+
+Packaged kernel/FFmpeg series: original, legal wrap and redisplay streams
+produce 41 pictures exact to original-stream dav1d. Eight direct-control
+pictures also match; four invalid-ID streams reject after legal prefixes.
+
+Change-Id: I257073188c0147e0b6b071c0bbafd2ea12ba95ad
+---
+ drivers/media/platform/amlogic/meson-sc2-vdec/Kconfig      | 5 +++--
+ .../platform/amlogic/meson-sc2-vdec/av1_request_syntax.h   | 7 ++++---
+ .../media/platform/amlogic/meson-sc2-vdec/meson_sc2_av1.h  | 1 -
+ 3 files changed, 7 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/media/platform/amlogic/meson-sc2-vdec/Kconfig b/drivers/media/platform/amlogic/meson-sc2-vdec/Kconfig
+index 7374743c7465..2b671e226ec7 100644
+--- a/drivers/media/platform/amlogic/meson-sc2-vdec/Kconfig
++++ b/drivers/media/platform/amlogic/meson-sc2-vdec/Kconfig
+@@ -19,7 +19,8 @@ config VIDEO_MESON_SC2_HEVC
+ 	  proposed AMF0 Amlogic scatter-FBC ABI with exported vb2-owned header/body
+ 	  storage, not an eight-bit preview. AV1 supports fixed output size
+ 	  <=1920x1088, superresolution, 64x64 superblocks and <=256 tiles.
+-	  Film grain, intrabc, frame IDs, timing models and nonidentity global
+-	  motion are rejected explicitly.
++	  Source frame IDs must be validated by userspace before normalization.
++	  Film grain, intrabc, timing models and nonidentity global motion are
++	  rejected explicitly.
+ 	  The original SC2 secure firmware must already have been preloaded.
+ 	  Full-depth compressed scanout requires matching DRM PRIME userspace.
+diff --git a/drivers/media/platform/amlogic/meson-sc2-vdec/av1_request_syntax.h b/drivers/media/platform/amlogic/meson-sc2-vdec/av1_request_syntax.h
+index 3ce5d3babe8f..1d72f3dcd9c6 100644
+--- a/drivers/media/platform/amlogic/meson-sc2-vdec/av1_request_syntax.h
++++ b/drivers/media/platform/amlogic/meson-sc2-vdec/av1_request_syntax.h
+@@ -71,9 +71,10 @@ struct meson_av1_syntax_error {
+  * Feed software comparison decoders normalized requests in decode order too.
+  *
+  * Native ABI omissions are canonicalized: full (not reduced-still) header;
+- * no timing/decoder model/frame IDs (caller must validate reference identity
+- * via timestamps), one unfiltered operating point, level 31, selectable screen
+- * tools/integer MV, explicit seven reference indices and explicit frame size.
++ * no timing/decoder model/frame IDs (caller must validate source current,
++ * reference and display IDs before resolving references via timestamps), one
++ * unfiltered operating point, level 31, selectable screen tools/integer MV,
++ * explicit seven reference indices and explicit frame size.
+  * These choices preserve tile entropy and reference semantics, not original
+  * packaging, timing, conformance level or missing-reference detection. Native
+  * color range is retained; color description/chroma position are unspecified
+diff --git a/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_av1.h b/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_av1.h
+index cfd2a88b8c03..4e9f0ab63299 100644
+--- a/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_av1.h
++++ b/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_av1.h
+@@ -689,7 +689,6 @@ static int sc2_av1_validate(struct meson_sc2_hevc_context *ctx,
+                      V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_Y)) !=
+                     (V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_X |
+                      V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_Y) ||
+-        f->current_frame_id ||
+         (f->flags & (V4L2_AV1_FRAME_FLAG_ALLOW_INTRABC |
+                      V4L2_AV1_FRAME_FLAG_BUFFER_REMOVAL_TIME_PRESENT)) ||
+         f->tile_info.tile_cols > 64 ||
+-- 
+2.47.3
+

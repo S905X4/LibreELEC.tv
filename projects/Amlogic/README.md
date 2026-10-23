@@ -3379,6 +3379,70 @@ AVS3/VVC/12-bit/422/444 and AVIF/HEIF/PNG/WebP image hardware paths are not
 inferred. Dolby Vision support on licensed variants does not establish it
 on this HK1; HDR and full-depth HDMI output remain separate from decoding.
 
+##### C01/C02 exact-HK1 capability disposition
+
+**C01 H.264 MVC remains unresolved.** SEI800 claims MVC1080p60 for an
+S905X4 product, and the generic vendor tree exposes a real two-view provider:
+`VFORMAT_H264MVC` maps to `CORE_MASK_VDEC_1`; `vh264_mvc.c` requests selector
+14 (`VIDEO_DEC_H264_MVC`/`h264_mvc`) and publishes separate view surfaces,
+`VIDTYPE_MVC`, and eye rectangles (`reference-kernels/linux/drivers/amlogic/
+media_modules/frame_provider/decoder/utils/vdec.c:853-878,1088-1150`,
+`.../h264/vh264_mvc.c:531-645,1600-1632`). This is an implementation path,
+not proof that SC2's secure loader accepts selector14 or that this HK1 emits
+two valid eyes. The retained runtime only observed ordinary `mh264`/`am-h264`;
+the loaded `amvdec_h264mvc` module is not decode evidence. The v82 offline
+decomposition now retains every member's descriptor, CODE-header CPU/format,
+offset, CRC and SHA-256 in
+`Work/sc2-all-codecs-20261022/gpt-factory-package-members-v82.json`.
+The factory package has five `h264_mvc` records: real GXL, GXM and SM1
+payloads (28,672 bytes each), plus TL1-to-GXM and TM2-to-SM1 aliases.
+The SM1 payload SHA-256 is
+`0ef2a0600dbf7c6cdd5cec92a6f137eb4d89981dc7e96544195a3a741eb385ed`.
+There is no SC2-labelled MVC record. This neither proves lack of SC2 support
+nor identifies the payload selected by secure selector14. Require a traceable
+secure selection and real MVC left/right pixels and metadata before expanding
+native scope; ordinary H.264 playback is not that evidence.
+
+**C02 RealVideo8/9/10 remains unresolved.** Geniatech and SEI800 make
+S905X4 product/playback claims, but the current decoder tree has no local
+`real/vreal.c`; its generic dispatch still maps `VFORMAT_REAL` to
+`CORE_MASK_VDEC_1`, `amvdec_real`/`ammvdec_real`, and selectors
+`VIDEO_DEC_REAL_V8=7`/`real_v8` or `VIDEO_DEC_REAL_V9=8`/`real_v9`
+(`reference-kernels/linux/drivers/amlogic/media_modules/frame_provider/
+decoder/utils/vdec.c:850-885,1084-1145`, `amvdec.c:448-453,504-523`). No
+SC2-specific RealVideo rejection was found, but generic admission is not
+positive silicon evidence. Stock `rm10`/`rm20`/`rm30`/`rm40` entries are
+explicitly `.sw` (`Work/sc2-android-adb/adaptation-20261020-231410/
+public-configs/media_codecs_performance.xml:154-165`); their digits do not
+identify RealVideo generations. The v82 table contains five `real_v8` and
+five `real_v9` records: GXL, TXLX and SM1 have real 16,384-byte payloads;
+TL1 aliases TXLX and TM2 aliases SM1 for each format. No SC2-labelled
+RealVideo record exists. All package aliases have a unique CRC-matched
+non-alias payload digest, but this is not a secure selector7/8 observation.
+Require selected-payload identity, an established bitstream-version mapping
+and real decoded pixels before adding a native family.
+
+The same audit retains five VC1 records: GXL, G12A and SM1 payloads,
+TL1-to-G12A and TM2-to-SM1 aliases; no SC2-labelled VC1 member. The SM1
+payload SHA-256 is
+`c991fa6e87dfe10ac04b960285f8d4e4bc0f590beaf3d177cd158e2b6e328bb8`.
+This supplies candidate identities, not the missing V03 secure selector9
+binding. `firmware_drv.c:99-100` bypasses the local CPU filter under TEE;
+`amvdec.c:393-395,448-453,478-480,504-522` requests format selectors rather
+than reporting selected member bytes. Do not substitute the local fallback
+prediction for secure-loader evidence.
+
+The original `video_ucode.bin` remains unchanged: 1,871,104 bytes, SHA-256
+`032b96c498cee371c3eb37d60b1eae0f25e32c0b9695a1d91735408662306ce4`.
+The complete 110-record traversal found 79 stored payloads with matching CRCs
+and 31 aliases; all descriptor/header identities match. Only HEVC MMU and
+AV1 MMU have SC2-labelled records. The final 256 bytes remain uninterpreted.
+Evidence `ev_bf138b3f8226788133bd99a18ae5f150c0f57681a34be991f7096e8b70b3c823`
+has complete raw/normalized output; rendered terminal snapshots are partial.
+This is structural/digest evidence, not cryptographic signature validation,
+firmware execution or hardware acceptance. MPEG4, VC1/WMV3 and old AVS
+failures remain unchanged.
+
 The complete remaining-project checklist in root `skill.md` has **24 existing
 delivery/acceptance work packages plus C01/C02 = 26**, not 26 unimplemented
 decoders or a completion percentage. It retains codec failures, full-image
@@ -3387,10 +3451,10 @@ three eMMC/install/update tasks, TCL/multi-brand testing and three upstream/
 asset delivery tasks. CPU, IR RAW, accepted panel layout, USB2/3 and basic
 GPU/EDID/HDMI PCM are not reopened; cancelled tests stay cancelled.
 
-Read-only live evidence records the actual deployed full image as
+Historical v80 read-only evidence records the then-deployed full image as
 `9deaa0575bb50e26580bbd6ecb5782728d1373b4`, Linux6.18.57, boot
-`073c1d00-79cc-4ff8-bca7-9135351a2d50`. Kodi maps only the production
-`/usr/lib/libavcodec.so.60.3.100`, not the later RAM field-pair library.
+`073c1d00-79cc-4ff8-bca7-9135351a2d50`. At that point Kodi mapped only the
+production `/usr/lib/libavcodec.so.60.3.100`, not the later RAM field-pair library.
 Exact hashes and health are in `gpt-s905x4-audit-{live,library-parity}-v80-rea.json`.
 Different hashes alone are not proof of a functional delta; source/package
 parity must be checked before producing a complete new image. No audit
@@ -3759,4 +3823,98 @@ files use the existing `/storage/videos/` source; Kodi JSONRPC access policy
 is unchanged. AVS+ P16, interlaced AVS and retained compatibility failures
 remain unaccepted. VC-1/WMV3 and MPEG-4 late-B corruption remain unresolved.
 
+
+#### AV1 superresolution reconstruction (v89)
+
+The clean RAM candidate keeps coded width separate from reconstructed width,
+programs the donor upscale phases and reference scaling factors, and permits
+motion/segmentation reuse only for compatible coded MI grids. RPM sequence
+bit 15 means `enable_superres`, not an error; bit 6 remains the unsupported
+128x128-superblock check. Fixed output/workspace limits remain 1920x1088.
+Kernel integration is `0073-meson-sc2-av1-superresolution.patch`.
+
+On production boot `d73cd328-0283-4c09-84c4-1d963c61be35`, a denominator-12
+Main8 stream reconstructs coded 213x240 to 320x240. All 24 displayed NV12
+pictures (2,764,800 bytes) exactly match independent original-stream dav1d.
+A native-controls-only client also returns all eight coded pictures, including
+five hidden references, each byte-exact against original-stream dav1d; two
+show-existing events reuse retained pictures without another coded request.
+An intentionally missing reference fails, and a subsequent independent open
+again returns eight exact pictures. These checks use the clean module without
+the temporary stage logging. Evidence and exact hashes:
+`Work/sc2-all-codecs-20261022/gpt-av1-superres-comparison-v89.json`,
+`gpt-av1-superres-native-v89-rea.json`, and
+`gpt-av1-superres-oracle-v88-rea.json` in the same directory.
+
+The production module and Kodi were restored after the RAM run. This does not
+establish a deployed production-image cutover, all denominators, dynamic coded
+widths, film-grain synthesis, frame-ID validation, or full V06 acceptance.
+
+#### Source frame-ID validation and native normalization (v90)
+
+AV1 frame IDs detect missing references; they do not change reconstructed
+pixels. The native ABI omits their wire lengths and reference deltas. The
+paired `ffmpeg-016-native-av1-source-frame-ids.patch` and kernel
+`0074-meson-sc2-av1-frame-id-normalization.patch` therefore validate source
+IDs before resolving native references to timestamps, then normalize away
+the optional wire IDs. No guessed native ID-length extension is introduced.
+Authority: [AV1 specification](https://aomediacodec.github.io/av1-spec/av1-spec.pdf),
+section 6.8.2. The parser checks ID length <=16, modular current-ID progression,
+selected reference IDs and show-existing display ID, and drops previous-ID
+authority on flush. Non-key show-existing does not replace previous coded ID.
+
+The old CBS parser accepted all four retained corruptions: wrong reference
+delta, repeated current ID, half-cycle jump and wrong display ID. The patched
+parser rejects each. Legal wraparound and legal show-existing still parse;
+original-versus-normalized persistent dav1d contexts match every event.
+Raw OBU inputs initially lacked temporal delimiters required by the private
+OBU demuxer; retained failed runs are packaging failures, not ID regressions.
+The successful container run adds delimiters without changing coded OBUs.
+
+Both full LE packages built successfully (`artifact://5291` kernel,
+`artifact://5292` FFmpeg); source hashes match the exercised host/development
+versions. Their packaged module and codec library were RAM-loaded together
+on the unchanged production boot. Original source returns 24 pictures, legal
+wrap returns eight, legal show-existing returns nine: all 41 displayed NV12
+pictures exactly match independent original-stream dav1d. A controls-only
+client also returns all eight wrapped-ID coded pictures byte-exact. Each
+corrupt source exits nonzero and returns only its valid prefix (one picture
+for wrong reference/repeated/half-cycle ID; eight before wrong redisplay),
+never a bogus successful picture. The loader trace records the new codec
+library, not an assumed `LD_LIBRARY_PATH` override.
+
+Evidence: `Work/sc2-all-codecs-20261022/gpt-av1-frameid-comparison-v90.json`,
+with before/after/oracle and package-hardware REA captures beside it. Production
+module/Kodi restored, decoder refcnt zero and eMMC three regions read-only.
+This is a paired package RAM smoke, not a new complete-image deployment;
+film-grain synthesis and the rest of V06 remain unaccepted.
+
+#### Dynamic superresolution and grain safety boundary (v91)
+
+Using the packaged v90 kernel/codec pair, denominator 9 and 16 each return
+48 exact 320x240 pictures. A third 48-picture stream changes coded width in
+one sequence across every denominator 9..16; all 48 pictures exactly match
+independent original-stream dav1d. Total: 144 pictures / 16,588,800 NV12 bytes.
+Trace headers confirm the changing coded denominators; this is not a repeated
+fixed-ratio test. Generation, oracle hashes and hardware comparisons:
+`Work/sc2-all-codecs-20261022/gpt-av1-superres-matrix-comparison-v91.json`
+and its two linked REA captures. Production module/Kodi restored, refcnt zero,
+eMMC three regions read-only.
+
+Film-grain admission remains deliberately rejected. Three coordinated source
+investigations mapped its firmware producer, PRIME ownership and SC2 VPP
+consumer, then removed all provisional implementation changes: no unused
+capture format, modifier, job field or active consumer remains. Firmware
+`0xe1` transfers a 39-word parameter bank; acknowledgment is not table-done.
+The vendor publishes its 8192-byte table at `0xe0` picture-end. Display LUT DMA
+consumes 7968 bytes, independently of decoder DMA drain. Available SC2 source
+provides current-slot bits and trigger disable, but no bounded outstanding-read
+completion, LUTDMA reset or proven isolation contract before framebuffer
+release. Whole VPU power wrappers, SRAM power gates and ordinary vblank cleanup
+do not establish that guarantee. The maintained
+[Khadas LUTDMA implementation](https://github.com/khadas/common_drivers/blob/khadas-vims-5.15.y/drivers/media/common/lut_dma/lut_dma_mgr.c)
+also only clears triggers in its disable path. A delayed free, leaked backing
+or one-vblank guess is not an acceptable substitute. Exact local authority and
+missing prerequisite: `gpt-av1-film-grain-blocker-v91.json` in the same evidence
+directory. V06 remains blocked on this boundary, not silently waived.
 
