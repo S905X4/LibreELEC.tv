@@ -1,0 +1,160 @@
+From 624e63ddc46fe8b3bc8f1e07a0c2ed33bd474119 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Fri, 23 Oct 2026 19:10:38 +0800
+Subject: [PATCH] media: meson: require EMPTY drain evidence and quiesce run
+ producers
+
+Admit EOS-only MPEG4 runs and require a genuine EMPTY before terminal drain. Do not promote an ordinary picture completion to EOF. The hardware smoke now exposes an unmatched completion after the last coded token; full MPEG4 EOS and late-B pixel acceptance remain open.
+
+Synchronize IRQ and legacy recycle work before final DMA drain, keeping allocations alive on drain failure. Serialize decoder START/STOP with session work so restart cannot publish a partially initialized codec context.
+
+Change-Id: Ibbf8e807a41a89ead69d36e83e7d98bc9242b7ea
+---
+ drivers/staging/media/meson/vdec/codec_legacy.c | 13 +++++++++++--
+ drivers/staging/media/meson/vdec/codec_mpeg4.c  |  9 ++-------
+ drivers/staging/media/meson/vdec/vdec.c         |  5 ++++-
+ drivers/staging/media/meson/vdec/vdec.h         |  3 +++
+ drivers/staging/media/meson/vdec/vdec_1.c       |  5 +++--
+ 5 files changed, 23 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/staging/media/meson/vdec/codec_legacy.c b/drivers/staging/media/meson/vdec/codec_legacy.c
+index 074c94bf4943eb53d5109102b95ea0323ba447fa..899a077b2001c3ed769eb1673ad65f57708a8652 100644
+--- a/drivers/staging/media/meson/vdec/codec_legacy.c
++++ b/drivers/staging/media/meson/vdec/codec_legacy.c
+@@ -527,13 +527,19 @@ static int avs_start(struct amvdec_session *s)
+ }
+ static int mjpeg_start(struct amvdec_session *s) { return legacy_start(s, LEGACY_MJPEG); }
+ 
+-static int legacy_stop(struct amvdec_session *sess)
++static void legacy_quiesce(struct amvdec_session *sess)
+ {
+ 	struct codec_legacy *ctx = sess->priv;
+ 
+-	legacy_debug_state(sess, "stopping");
+ 	WRITE_ONCE(ctx->failed, true);
+ 	cancel_delayed_work_sync(&ctx->recycle_work);
++}
++
++static int legacy_stop(struct amvdec_session *sess)
++{
++	struct codec_legacy *ctx = sess->priv;
++
++	legacy_debug_state(sess, "stopping");
+ 	/* Engine stop has already drained VDEC's DMC channel before freeing DMA. */
+ 	if (ctx->workspace) {
+ 		dma_free_coherent(sess->core->dev, ctx->workspace_size,
+@@ -1699,6 +1705,7 @@ static const u8 *mjpeg_end(u32 *len) { *len = sizeof(mjpeg_eos); return mjpeg_eo
+ 
+ struct amvdec_codec_ops codec_vc1_ops = {
+ 	.start = vc1_start, .stop = legacy_stop,
++	.quiesce = legacy_quiesce,
+ 	.resume = legacy_resume, .prepare_input = vc1_prepare_input,
+ 	.isr = legacy_isr, .threaded_isr = legacy_threaded_isr,
+ 	.can_recycle = legacy_can_recycle, .recycle = legacy_recycle,
+@@ -1706,6 +1713,7 @@ struct amvdec_codec_ops codec_vc1_ops = {
+ };
+ struct amvdec_codec_ops codec_avs_ops = {
+ 	.start = avs_start, .stop = legacy_stop,
++	.quiesce = legacy_quiesce,
+ 	.manages_processor = true,
+ 	.resume = legacy_resume,
+ 	.queue_input = avsm_queue_input,
+@@ -1715,6 +1723,7 @@ struct amvdec_codec_ops codec_avs_ops = {
+ };
+ struct amvdec_codec_ops codec_mjpeg_ops = {
+ 	.start = mjpeg_start, .stop = legacy_stop,
++	.quiesce = legacy_quiesce,
+ 	.resume = legacy_resume,
+ 	.prepare_input = mjpeg_prepare_input,
+ 	.isr = legacy_isr, .threaded_isr = legacy_threaded_isr,
+diff --git a/drivers/staging/media/meson/vdec/codec_mpeg4.c b/drivers/staging/media/meson/vdec/codec_mpeg4.c
+index 5a35473ec258b226fa9cbddc7f14502b36921bfc..38127bcef125bc03a9ba82523fbcbf82c513e2cf 100644
+--- a/drivers/staging/media/meson/vdec/codec_mpeg4.c
++++ b/drivers/staging/media/meson/vdec/codec_mpeg4.c
+@@ -193,7 +193,7 @@ static bool mpeg4_terminal_empty(struct amvdec_session *sess)
+ {
+ 	struct codec_mpeg4 *m = sess->priv;
+ 
+-	return m->eos_queued && sess->draining && !m->running &&
++	return m->empty && m->eos_queued && sess->draining && !m->running &&
+ 		m->job_end == m->committed &&
+ 		m->committed == READ_ONCE(sess->stream_offset) &&
+ 		amvdec_read_dos(sess->core, VLD_MEM_VIFIFO_WP) ==
+@@ -331,8 +331,7 @@ static int mpeg4_run(struct amvdec_session *sess)
+ 		m->display = -1;
+ 	}
+ 	if (!m->ready || m->running || m->terminal || !m->committed ||
+-	    (m->empty && m->job_end == m->committed) ||
+-	    (m->eos_queued && mpeg4_timestamps_empty(sess))) {
++	    (m->empty && m->job_end == m->committed)) {
+ 		dev_dbg(core->dev,
+ 			"MPEG4 defer ready=%u running=%u terminal=%u empty=%u committed=%08x job=%08x retained=%08x decoded=%u pending=%u\n",
+ 			m->ready, m->running, m->terminal, m->empty,
+@@ -585,10 +584,6 @@ static irqreturn_t mpeg4_threaded_isr(struct amvdec_session *sess)
+ 		ret = mpeg4_swap(sess, true);
+ 		if (ret)
+ 			goto fail;
+-		if (mpeg4_terminal_empty(sess)) {
+-			m->empty = true;
+-			m->terminal = true;
+-		}
+ 	}
+ 	ret = mpeg4_run(sess);
+ 	if (ret)
+diff --git a/drivers/staging/media/meson/vdec/vdec.c b/drivers/staging/media/meson/vdec/vdec.c
+index b5b1117bdc1033673006084eb67f16836f9d40fd..0dae2eb5dd39733a98e1337619bddc4161b6fc4d 100644
+--- a/drivers/staging/media/meson/vdec/vdec.c
++++ b/drivers/staging/media/meson/vdec/vdec.c
+@@ -1012,10 +1012,13 @@ static int
+ vdec_decoder_cmd(struct file *file, void *fh, struct v4l2_decoder_cmd *cmd)
+ {
+ 	struct amvdec_session *sess = file_to_amvdec_session(file);
+-	struct amvdec_codec_ops *codec_ops = sess->fmt_out->codec_ops;
++	struct amvdec_codec_ops *codec_ops;
+ 	struct device *dev = sess->core->dev;
+ 	int ret;
+ 
++	guard(mutex)(&sess->lock);
++	codec_ops = sess->fmt_out->codec_ops;
++
+ 	ret = v4l2_m2m_ioctl_try_decoder_cmd(file, fh, cmd);
+ 	if (ret)
+ 		return ret;
+diff --git a/drivers/staging/media/meson/vdec/vdec.h b/drivers/staging/media/meson/vdec/vdec.h
+index a7d593eb7ea6607a3ab9853793bb0f5aa4c913c9..ce7f5a31988edd45d60ae3a5f625847fa012a1b8 100644
+--- a/drivers/staging/media/meson/vdec/vdec.h
++++ b/drivers/staging/media/meson/vdec/vdec.h
+@@ -124,6 +124,8 @@ struct amvdec_ops {
+  *
+  * @start: mandatory call when the codec needs to initialize
+  * @stop: mandatory call when the codec needs to stop
++ * @quiesce: stop asynchronous producers after IRQ synchronization and before
++ *           the final SC2 DMA drain; session mutex held, no backing freed
+  * @load_extended_firmware: optional call to load additional firmware bits
+  * @num_pending_bufs: optional call to get the number of dst buffers on hold
+  * @queue_input: optional codec-owned framed submission; consumes OUTPUT on
+@@ -152,6 +154,7 @@ struct amvdec_codec_ops {
+ 	bool manages_processor;
+ 	int (*start)(struct amvdec_session *sess);
+ 	int (*stop)(struct amvdec_session *sess);
++	void (*quiesce)(struct amvdec_session *sess);
+ 	int (*load_extended_firmware)(struct amvdec_session *sess,
+ 				      const u8 *data, u32 len);
+ 	u32 (*num_pending_bufs)(struct amvdec_session *sess);
+diff --git a/drivers/staging/media/meson/vdec/vdec_1.c b/drivers/staging/media/meson/vdec/vdec_1.c
+index 75bc904b95559086e803f9db9ed60378c4a5de80..10ad4a314fbf104ae6b449376474c1191f9e17ab 100644
+--- a/drivers/staging/media/meson/vdec/vdec_1.c
++++ b/drivers/staging/media/meson/vdec/vdec_1.c
+@@ -202,9 +202,10 @@ static int vdec_1_sc2_stop(struct amvdec_session *sess)
+ 
+ 	if (core->quarantined)
+ 		return -EIO;
+-	ret = vdec_1_sc2_drain(core);
+-
+ 	disable_irq(core->irq);
++	if (sess->priv && sess->fmt_out->codec_ops->quiesce)
++		sess->fmt_out->codec_ops->quiesce(sess);
++	ret = vdec_1_sc2_drain(core);
+ 	if (ret) {
+ 		core->quarantined = true;
+ 		__module_get(THIS_MODULE);

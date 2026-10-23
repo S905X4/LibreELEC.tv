@@ -3261,3 +3261,371 @@ through that exact capture chain, including its audio sync offset setting,
 is still required. This is not a claim of HDR, ten-bit HDMI capture, or
 unexercised AV1 grain/frame-ID/super-resolution support.
 
+#### Authentic HTSP live decode and full SC2 video scope
+
+The owner has expanded native hardware decoding beyond HEVC/AV1: H.264,
+including the actual High/8-bit 1920x1080 top-first HTSP source and a real
+50-field/s deinterlaced viewing path, plus the other SC2-supported video
+families below. Software decode followed by DRM PRIME rendering is not
+hardware-decode acceptance. Codec discovery, a firmware enum, an advancing
+player clock, framebuffer recycling and service health are not pixel proof.
+
+The authentic HEVC Main10 3840x2160 live freeze has a separate confirmed
+cause from the earlier CRA seek repair. The initial IDR exports TMVP=0;
+later IDRs incorrectly inherit TMVP=1 from a non-IDR parser state. The native
+driver correctly rejects this absent/inferred-zero syntax. FFmpeg formerly
+marked failed CAPTURE completions corrupt but returned success, allowing
+recycled stale surfaces to appear as advancing pictures. Patch
+`ffmpeg-007-native-hevc-idr-completion.patch` corrects the IDR inference at
+its parser producer and returns failed completions through FFmpeg's existing
+negative-error/frame-unref path. Native validation is not weakened and
+independently established corruption is not cleared.
+
+A RAM-only corrected library was actually mapped by Kodi, SHA-256
+`c246f8087eed7a79b9da54747acf512e3eb3f8247114244af69f4319f8688c99`.
+The same local authentic stream returns 368 clean hardware frames and no
+corrupt frames; live HTSP returns another 1,384 clean frames without a
+failed completion. Four fresh received HDMI pictures show different actual
+scenes, not just changing counters. The live overlay is native 3840x2160
+YU10/FBC, modifier `0xa00000000000002`, scaled to 1920x1080. The initial
+LD_LIBRARY_PATH-only attempt did **not** load the fix: the Kodi profile
+overrides it with `/usr/lib`; explicit preload and `/proc/<kodi.bin>/maps`
+established the exercised library. One startup OutputPicture timeout remains
+in the smoke log. This paragraph does not claim persistent deployment of
+007, absolute A/V synchronization, HDR/HLG output, or native H.264 completion.
+Tvheadend backend configuration is preserved; boot/eMMC files were not
+written for this smoke.
+
+Evidence under `Work/sc2-pvr-20261022/`:
+
+- `hevc-live-native-control-before-v2.log` and
+  `hevc-live-native-syntax-rejection-v1.json`;
+- `hevc-idr-local-after-v2.json`, `hevc-idr-live-after-v1.json` and
+  `hevc-idr-live-after-v1-{0,1,2,3}.jpg`;
+- `hevc-idr-root-cause-and-smoke-v1.json`.
+
+Supported integration scope follows the board's stock MediaCodec limits,
+the exact CE media-module support gate and real decoder implementations,
+not the generic feature reporter's misleading SC2 "8k" string:
+
+| Family | Conservative supported envelope | Native acceptance boundary |
+| --- | --- | --- |
+| HEVC | Main/Main10, 4:2:0 8/10-bit, 3840x2160/60 | Existing Request/pixel/Main10 evidence plus live repair above; not every coding tool/HDR mode |
+| AV1 | Main, 4:2:0 8/10-bit, 3840x2160/60 | Existing covered Request/pixel cases; grain/frame-ID/super-resolution not inferred |
+| H.264 | 8-bit High, 3840x2160/30; actual 1080i field/MBAFF path | RAM MULTI: progressive/MBAFF/1080i and CCTV-1/CCTV13 independent pixels pass; real HTSP CCTV-1/CCTV13/Hunan and hardware EI viewed. Clean PAFF oracle and formal integration remain open |
+| VP9 | Profile 0/2, 4:2:0 8/10-bit, 3840x2160/60 | RAM native implementation: 36 covered pictures per profile match independent full-depth samples; formal image acceptance remains open |
+| AVS2 | P2/10-bit, 3840x2160/60 | RAM native implementation: 32 640x360 8-bit and 23 expected 3840x2160 10-bit presentations match independent samples, including low bits; formal image acceptance remains open |
+| MPEG-1/2 | Conventional 8-bit, MPEG-2 MP/HL, 1920x1088 coded / 1080p60 | RAM MULTI: MPEG-1 all 36 frames/PTS/progressive metadata/EOF pass; MPEG-2 1080i 24 pictures and 48 hardware-EI outputs plus Kodi viewing pass. IDCT differences are recorded below; formal integration remains open |
+| MPEG-4 Part 2 | Xvid/ASP@L5, 1080p60 | v72 returned 36 presentations, but its EOF claim is withdrawn: ordinary completion was incorrectly promoted to terminal. v78 admits EOS-only runs and requires genuine EMPTY; the same fixture now fails on an unmatched completion after 36 coded tokens, with 32 consumer returns and no EOF. Late B25/B26/B28/B29/B31/B32 corruption also remains unresolved (`gpt-mpeg4-lifecycle-v78-run.json`, `gpt-mpeg4-frame-v72-comparison.json`) |
+| VC-1 / WMV3 | SP/MP/AP, 1080p60 | Native/vendor-direct v75 reproduces 30 nonzero publications and 29 consumer returns from 32 unchanged packets; standard EOS does not flush the missing inputs, and pixels/EOS remain unaccepted. Authenticated selector-9 completion/reference authority is still missing (`gpt-codec-next-discriminators-v76.json`, `gpt-vc1-factory-handoff.json`) |
+| AVS / AVS+ | AVS P2/JiZhun up to 1080p60; AVS+ P16 720x576/25i verified | AVS P2 v70 covered samples pass; v76 P16 returns 50 original pictures and 31,104,000 samples exactly matching independent software, with original packet payloads and 40ms PTS preserved. v77 DI returns 100 fields at 20ms with every original luma row byte-exact. Patch 0070 exported; full image deployment and broader AVS/AVS+ limits remain open |
+| MJPEG video | Conservative 1080p60 streaming scope | RAM native progressive 36-picture and paired-field 12-picture comparisons have maximum sample difference 1/255; formal image integration and broader still/progressive-JPEG limits remain open |
+
+H.263 and H.264 MVC have vendor implementations but no established SC2
+profile/rate contract here. VP8, VP6, RealVideo, AVS3, VVC, 12-bit and
+4:2:2/4:4:4 extensions are not added from generic enums/software entries.
+Dolby metadata/processing and audio-DSP decoding are separate features,
+not additional proven video decoder families. These limits are supported
+scope, not claims that every listed format already works natively.
+
+#### AVS+ P16 and hardware EI verification
+
+The P16 fixture is one 50-picture, top-first interlaced 720x576 GOP copied
+from PID 0x5011 in the original transport stream. The compressed packet
+payloads are unchanged. The v76 native candidate produced all 50 pictures
+and 31,104,000 NV12 samples with zero differing samples against the
+independent software reference; PTS/field metadata matched and EOS was
+observed. The timestamped remux independently preserves the 40ms picture
+PTS sequence. Evidence: `gpt-avs-plus-original-gop-v76-{comparison,rea}.json`
+and `gpt-avs-plus-pes-timed-v76-{comparison,rea}.json`.
+
+The first hardware-EI run exposed a separate DI output-stride defect; fixing
+the AVS+ parser alone did not fix it. SC2 DI writeback requires 64-byte
+bursts, so `di_try_fmt()` now retains 32-byte alignment for OUTPUT queues but
+uses 64-byte alignment for CAPTURE queues. The v77 run returned 100 fields
+with exact 20ms PTS and every original luma row byte-for-byte intact
+(20,736,000 luma samples, zero differences); interpolated rows are not
+claimed equivalent to software DI, and chroma is outside that comparison.
+Patch `0070-meson-sc2-native-codecs-and-di.patch` carries the complete tested kernel delta.
+
+Kodi was also observed using `ff-cavs_v4l2m2m-drm_prime` with the SC2 hardware
+EI label at 25fps. The HDMI receiver sequence advanced 142 frames during the
+capture, and a fresh paused picture was saved as
+`gpt-avs-plus-kodi-fullscreen-v77.jpg`. This is a bounded playback smoke, not
+long-duration cadence or audio/video-sync acceptance. Evidence is under
+`Work/sc2-all-codecs-20261022/`: `gpt-avs-plus-pes-timed-di-v77-comparison.json`,
+`gpt-avs-plus-pes-timed-di-v77-rea.json`, `gpt-avs-plus-kodi-playback-v77.json`,
+and `gpt-avs-plus-kodi-fullscreen-v77.jpg`.
+
+#### Drain evidence and codec teardown correction
+
+Patch `0071-meson-sc2-drain-and-teardown.patch` exports kernel commit
+`624e63ddc46f`. MPEG4 no longer suppresses an EOS-only run when coded tokens
+are exhausted; terminal drain requires a real EMPTY with the latest writer
+pointer and no unmatched tokens. The v78 hardware run exposed a duplicate
+completion instead of EMPTY after the final coded token. It now returns an
+error rather than publishing false EOF; full MPEG4 acceptance is still open.
+
+SC2 stop synchronizes IRQ, cancels legacy delayed recycle work, then drains
+DMA before releasing backing. A failed final drain retains backing and the
+DOS lease. Decoder START/STOP now hold the session mutex, including
+START-after-EOS teardown/reinitialization, excluding parser and queue work
+from partially initialized codec state.
+
+The v78 RAM-module smoke retained all 50 AVS+ P16 pictures, PTS, field metadata
+and EOF; every output file hash matches v76's independent-pixel-verified
+result. MJPEG returned 36 pictures and EOF. A temporary ioctl observer issued
+START immediately after CAPTURE LAST: START returned 0, then STREAMOFF/close
+completed with module reference count 0. No deadlock or quarantine was
+observed; this is not an exhaustive concurrency proof. The retained old
+`avs-stream01-prefix-32.mkv` fixture still failed with zero output and is not
+promoted by the P16 regression.
+
+Evidence: `gpt-{mpeg4,mjpeg,avs-plus}-lifecycle-v78-run.json`,
+`gpt-mjpeg-restart-v78-run.json` and their `-rea.json` captures under
+`Work/sc2-all-codecs-20261022/`. This is RAM verification, not deployment of
+a complete updated image.
+
+The complete LE kernel package rebuilt successfully with patch 0071, and all
+five changed source hashes match the development kernel. The package module
+was built, not separately loaded on hardware; RAM smoke used the module
+recorded above. `gpt-native-codecs-integration-v78.json` records the build
+and exact hashes. Production decoder build ID was restored and verified;
+Kodi, panel and console are active with zero restarts, no failed units,
+`/flash` read-only and all three eMMC areas read-only. Generated probe/output
+files were removed; no reboot or boot-payload change was made.
+
+
+Covered VP9/AVS2/MJPEG comparisons are retained under
+`Work/sc2-all-codecs-20261022/` as
+`vp9-actual-full-depth-pixels-v1.json`, `avs2{-main10,}-mpred-v4-pixels.json`
+and `mjpeg-{planar,paired}-bank-v7-pixels.json`. A row's supported envelope
+does not expand the resolution/profile coverage of these finite fixtures.
+
+Local authority: stock `media_codecs.xml` / `media_codecs_performance.xml`
+in `Work/sc2-android-adb/adaptation-20261020-231410/public-configs/`, and
+`reference-kernels/linux/drivers/amlogic/media_modules/frame_provider/decoder/`.
+Pinned CE media source: `a387dea216e416f975377152d374557d448093c8`, especially
+`drivers/frame_provider/decoder/utils/vdec_feature.c`. Detailed external
+profile corroboration: <https://osmc.tv/wiki/vero-v/technical-specifications/>.
+
+#### Native H.264 per-picture reset correction
+
+The RAM-only VDEC1 MULTI candidate now uses the existing stopped-core reset
+helper before restoring each picture's VLD checkpoint. The previous reset
+covered VLD/FIFO only; the factory `h264_multi/vmh264.c` run path also resets
+MC, deblock and picture-DC through `utils/vdec.c:vdec_reset_core`. The native
+helper retains its DMA/DMC drain and quarantine requirements. No capture-pool
+growth, reference substitution or software pixel reconstruction is involved.
+
+On boot `bc42b229-0ae2-4a04-8ea6-818b33d1c621`, module SHA-256
+`42635cb67579ecf6137d91af0075f2706e74b85d5abeb0dec204793dcc2d260a`
+produced all 36 progressive, 24 small MBAFF, 24 clean 1080i50 and 48 authentic
+CCTV-1 pictures. Every visible NV12 byte matched independent decoding of the
+same original input, and all four runs received real EOF. The clean 1080i50
+DI run produced 48 hardware-EI outputs from 24 pictures; every original field
+luma row is exact in its corresponding output. Interpolated rows are not
+claimed identical to a software deinterlacer.
+
+Evidence: `Work/sc2-all-codecs-20261022/gpt-h264-core-reset-` files for
+`progressive-v24`, `mbaff-v24`, `clean1080i50-v24`, `real159-v25` and
+`fullrate-di-v24`, with their `-pixels.json` and `-rea.json` records. This is
+not formal image deployment or complete H.264 acceptance. CCTV13 initially
+aborted at the next slice; the correction and later proof follow below.
+Hunan PAFF had no clean independent prefix
+oracle. The older authentic PAFF fixture's software decoder reports MMCO
+errors and yields only 14 pictures versus 16 native outputs; it is diagnostic,
+not a valid pixel-acceptance substitute. AVS/AVS+, MPEG4, VC1/WMV3 and the
+remaining format criteria are retained as unfinished work.
+
+#### H.264 default-reference bounds and leading-picture disposition
+
+The CCTV13 failure was the host's false requirement that a default reference
+list's available size equal the PPS active count. The observed P slice has
+one available reference and an active count of two. The factory DPB clips
+default lists to available references; its hardware table repeats the last
+real entry for the unused tail. Native configuration now accepts that bound,
+still validates every real reference and rejects an empty required list.
+
+Independent strict software decoding of the original 48-packet capture emits
+45 pictures. The first corrected native run emitted those 45 byte-exact
+pictures but wrongly presented three leading B pictures before recovery.
+That run is retained as a failure, not accepted as 48/48. Restoring the
+factory first-output POC boundary now gives exactly the same 45 pictures and
+PTS, every visible NV12 byte equal, followed by actual EOF. A completed
+leading picture retires only its exact coded-packet token; it does not become
+a CAPTURE image, release a reference hold early, or forgive missing input.
+
+RAM module SHA-256
+`24daf4fb9ca0d24d7a337789b4e2bb51edbc3a5ffcaafa686f45f0b4d03975dd`
+was exercised on the same native boot. Hardware EI produces 90 outputs from
+the 45 CCTV13 pictures; all original top/bottom field luma rows match the
+independent source. Interpolated rows are not claimed equal to software DI.
+Evidence under `Work/sc2-all-codecs-20261022/`:
+`gpt-h264-real103-leading-disposition-v32-{pixels,rea}.json` and
+`gpt-h264-real103-fullrate-di-v32-{pixels,rea}.json`.
+
+Actual Kodi HTSP CCTV13 and CCTV1 show changing received HDMI scenes with
+`ff-h264_v4l2m2m-drm_prime`, native NV12 overlay and both the decoder and
+`meson-sc2-di` devices open. Kodi reports completed
+`SC2 hardware EI full-rate (not MA/MC)` output at 50 Hz. Their
+`gpt-h264-cctv{13,1}-kodi-active-di-v32-rea.json` records and
+`gpt-h264-cctv{13,1}-live-v32-{0,1}.jpg` preserve the runtime evidence.
+The separately named CCTV13 `-2.jpg` was captured during the channel change
+and is not attributed to CCTV13. This remains RAM driver proof, not formal
+image integration, universal PAFF acceptance or absolute A/V synchronization.
+
+
+The same RAM driver also plays actual HTSP Hunan channel 61. The native
+decoder and DI nodes remain active with the completed hardware-EI label
+and 50 Hz output; two received HDMI pictures show different real broadcast
+scenes. Evidence: `gpt-h264-hunan61-kodi-active-di-v32-rea.json`,
+`gpt-h264-hunan61-live-v32-{0,1}.jpg`, and the final active-player/50 Hz
+observation before an explicit stop in `gpt-h264-hunan61-live-complete-v33-rea.json`.
+This proves this live viewing case, not a clean independent PAFF oracle.
+
+#### Native MPEG-2 1080i hardware EI
+
+The original 24-picture 1920x1080 MPEG-2 Main top-first fixture has PTS
+0–920 ms in 40 ms steps. Native MULTI returns all 24 pictures with those
+PTS and real EOF. Compared with independent software decoding of the same
+compressed input, maximum absolute sample difference is 4/255 and worst
+frame mean absolute error is 0.010133; this is not byte-exact equality.
+All 24 pictures carry the correct interlaced/top-first metadata. Hardware
+EI returns 48 progressive outputs at 20 ms intervals and real EOF; every
+retained original top/bottom luma row equals the corresponding native
+decoded row exactly. Interpolated rows are not asserted equal to software DI.
+
+Evidence under `Work/sc2-all-codecs-20261022/`:
+`gpt-mpeg2-clean1080i50{,-di}-v33-rea.json` and
+`gpt-mpeg2-clean1080i50-v33-pixels.json`. These are RAM-module results;
+formal image integration remains separate. Kodi also plays the longer
+1080i fixture with `ff-mpeg2_v4l2m2m-drm_prime` and completed hardware-EI
+output at 50 Hz. Received pictures `gpt-mpeg2-kodi-received-v33-{e,f}.jpg`
+show source counters 58 then 183, with preserved receiver mtimes five seconds
+apart. The receiver deliberately samples at `fps=1/5`; earlier identical
+`{c,d}` pictures were taken less than that interval apart and cannot prove
+a decoder freeze. Early `{a,b}` pictures show the pre-playback menu and are
+not playback evidence. `gpt-mpeg2-kodi-five-second-sampling{,-later}-v33-rea.json`
+binds the actual viewing scenario; the later process-info query occurs after
+the finite movie ends and is not described as an active player.
+
+
+#### Native MPEG-1 progressive metadata and EOS
+
+MPEG-1 has no MPEG-2 sequence/picture coding extension. An absent firmware
+`PICINFO_PROG` bit must not label those frames interlaced. The SC2 MULTI
+completion path now interprets the progressive/interlaced bits only when
+`MPEG12_MULTI_SEQ_EXT` is present; MPEG-2 interlaced handling is retained.
+
+On the same native boot, RAM candidate
+`33f2d2e8b00d1ac4d8f8f0de71b3a1abea4dc480d8419351074372efbab435b7`
+returns all 36 MPEG-1 frames, original PTS 0–1400 ms in 40 ms steps, progressive
+metadata and real EOF. All 4,147,200 visible bytes were compared with independent
+software decoding of the original compressed input: maximum sample difference
+4/255, worst frame MAE 0.021615, not byte-exact equality. Before this fix, the
+same 36 original progressive pictures were incorrectly marked interlaced/bottom-first.
+Evidence: `gpt-mpeg1-progressive-v36-{pixels,rea}.json` under
+`Work/sc2-all-codecs-20261022/`.
+
+The same candidate also returns all 24 original 1920x1080 MPEG-2 top-first
+pictures with matching PTS/field metadata and real EOF; 74,649,600 visible bytes
+retain maximum difference 4/255 and worst MAE 0.010133. Evidence:
+`gpt-mpeg2-interlaced-v36-{pixels,rea}.json`. Its dmesg-prefix preservation check
+is false, so that ring snapshot is not complete new-kernel-log evidence.
+Formal image integration remains separate; MPEG-4/AVS v36 still fail and are
+not promoted by these MPEG-1/2 results.
+
+#### Native AVS reconstruction ownership and delayed-reference EOS
+
+RAM candidate `meson-vdec-avsm-v70.ko`, SHA-256
+`6cdf6bc6f0069bdca568623852c52aa926127ff738e8f6ff0f01fc6fa93b29c6`,
+runs on native boot `a2e1680b-d76d-4908-9a98-ce629747b52d` using the
+unchanged factory AVSM image and secure loading ABI. Frame-based input,
+per-run core/VLD initialization and the decoder-local canvas LUT establish
+the actual pixel path. The run slot is not the display identity: ordinary
+presentation follows the firmware's BUFFEROUT and the completed surface's
+original OUTPUT timestamp token.
+
+PIC_DONE alone commits the current REC raster. SEARCH_EMPTY/DECODE_EMPTY
+can leave a partially reconstructed surface and must not validate it. At true
+input idle, EOS may release exactly one completed, undisplayed I/P reference
+whose unique token and canvas match ANC0. It never flushes every busy surface.
+Saved coded-header metadata supplies that tail's type/field flags; metadata
+from an unrelated displayed picture is not reused. The local AVS0 ABI now
+explicitly requires complete picture access units and defines header-only
+OUTPUT buffers. Obsolete stream-swap state and initial pixel-readback probes
+have been removed.
+
+Final-candidate hardware results, with software decoding of the original
+compressed input and separate xavs encoder reconstruction as pixel oracles:
+
+- 352x288: all 36 pictures (3 I / 18 P / 15 B), all 5,474,304 visible NV12
+  bytes, original PTS, dimensions and progressive/field metadata match exactly;
+  real EOF and clean teardown follow.
+- 1920x1080: all 24 pictures (2 I / 12 P / 10 B), all 74,649,600 visible bytes
+  and the same metadata match exactly against both references, with real EOF.
+- A single-I access unit returns exactly its one 152,064-byte reference raster
+  and EOF. Successful cases also run after the failing fixtures, exercising
+  reopen without resetting the board.
+
+The [FFmpeg FATE HD bunny](https://fate-suite.ffmpeg.org/cavs/bunny.mp4)
+returns all 60 pictures, matching PTS/geometry/field metadata and real EOF.
+It is **not** pixel-exact acceptance: 2,289 of 82,944,000 samples differ from
+scalar software decoding, with maximum difference 255. SIMD/scalar software
+outputs also differ, and FFmpeg logs unsupported weighted-prediction warnings;
+the residual cause is unresolved, not assigned to either decoder by assumption.
+The independent encoder source is
+<https://github.com/Distrotech/xavs>; its exact commit and generated-fixture
+identities are retained with the comparisons.
+
+The original 720x576 no-slice-start fixture still fails reconstruction, with
+zero consumer pictures rather than false zero-filled output. The issue767
+stream03 fixture still reaches SEARCH_EMPTY on a later picture; the final
+candidate returns only three earlier byte-exact pictures before a bounded
+error, never its partially reconstructed raster. Neither input is silently
+removed from compatibility scope or declared nonconformant. The earlier CE
+stream trace is not a successful pixel oracle. AVS+ P16, interlaced AVS,
+remaining compatibility cases and Kodi/production-image integration remain
+unaccepted; the supported envelope is not a throughput or universal-tool claim.
+
+Evidence under `Work/sc2-all-codecs-20261022/`:
+`gpt-avsm-final-v70-comparison.json`, `gpt-avsm-{ipb,1080p,hd}-final-v70-rea.json`,
+`gpt-avsm-single-i-v70-rea.json`, and
+`gpt-avsm-{legacy,partial}-rejected-v70-rea.json`.
+Large board-side rasters are reclaimed only after host SHA-256 verification;
+the host evidence remains. No boot image or eMMC data is updated by these RAM
+module tests. The existing image patch is intentionally not presented as the
+tested v70 module; formal integration remains part of the outstanding codec work.
+Final health evidence `gpt-avsm-final-health-v70-rea.json` records Kodi and
+the panel active, systemd running with no failed units, `/flash` read-only,
+all three eMMC regions read-only, and no temporary IRQ observer. Kodi has
+been restarted after the CLI runs; this is not an AVS viewing acceptance.
+
+#### Clean PAFF conformance and live OBS observations (v73)
+
+The unchanged v70 RAM candidate on boot
+`a2e1680b-d76d-4908-9a98-ce629747b52d` returns all 15 Sharp
+`Sharp_MP_PAFF_1r2.jvt` and all 30 Motorola `camp_mot_picaff0_full.26l`
+reconstructed pictures with true EOF and exit zero. Every visible NV12 byte
+matches the retained strict single-thread reference, whose complete-frame
+checksums match FFmpeg FATE: maximum difference zero for both streams.
+Field/frame switching metadata also matches. Earlier broken multithreaded
+oracle and v6 native failures remain historical evidence, not current results.
+Evidence: `gpt-clean-paff-current-v70-v73-comparison.json` and both
+`*-current-v70-v73-{run,rea}.json` under `Work/sc2-all-codecs-20261022/`.
+This does not establish long-running PAFF live/seek or production integration.
+
+OBS receiver session `1792740128611976667` again provides fresh HDMI images.
+One uninterrupted MPEG-2 1080i native/EI playback visibly advances source
+counter 5 to 130. A newly generated, non-looping 600-picture AVS movie uses
+`ff-cavs_v4l2m2m-drm_prime` at 25 fps and visibly advances counter 112 to 237.
+Images and process observations: `gpt-obs-mpeg2-sustained-v70-*` and
+`gpt-obs-avs-video-source-v70-*`. The capture is 640x360 at roughly one image
+per five seconds: evidence of current source motion, not every field,
+transient-free playback, absolute sync, HDR or a TCL/CEC result. New playback
+files use the existing `/storage/videos/` source; Kodi JSONRPC access policy
+is unchanged. AVS+ P16, interlaced AVS and retained compatibility failures
+remain unaccepted. VC-1/WMV3 and MPEG-4 late-B corruption remain unresolved.
+
+
