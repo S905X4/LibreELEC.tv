@@ -1,0 +1,39 @@
+From 6e762f42ca914c9e7c9a5b10cf2e8de221a28f42 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Wed, 21 Oct 2026 04:42:51 +0800
+Subject: [PATCH] arm64: dts: amlogic: Describe the SC2 firmware wake timer
+
+The exact stock board DT and the SC2 native-style donor agree on the
+four-byte firmware countdown register at fe010288. Describe it using
+the existing meson-vrtc binding and driver already built for SC2.
+
+The generic driver stores alarm state in RAM and writes remaining
+seconds on suspend. Do not copy the incompatible vendor FIFO mailbox
+or add the vendor PM driver as a competing scratch-register writer.
+This is not a battery-backed clock or proof of firmware alarm wake,
+CPU/PWM retention, or safe USB-root system suspend.
+
+
+---
+ arch/arm64/boot/dts/amlogic/meson-sc2.dtsi | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi b/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi
+index 571a01a36bde..1ee2def0c5f6 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi
++++ b/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi
+@@ -155,6 +155,11 @@ gic: interrupt-controller@fff01000 {
+ 			interrupts = <GIC_PPI 9 IRQ_TYPE_LEVEL_HIGH>;
+ 		};
+ 
++		vrtc: rtc@fe010288 {
++			compatible = "amlogic,meson-vrtc";
++			reg = <0 0xfe010288 0 0x4>;
++		};
++
+ 		apb4: bus@fe000000 {
+ 			compatible = "simple-bus";
+ 			#address-cells = <2>;
+-- 
+2.47.3
+

@@ -1,0 +1,7 @@
+# BCM4339 SDIO firmware from linux-firmware, covered by LICENCE.cypress.
+brcm/brcmfmac4339-sdio.bin
+# Board calibration data is not included; other board variants must not reuse
+# this device's settings. No external CLM file is installed.
+# Bluetooth controller firmware is supplied under its Broadcom license by
+# bcm4335c0-firmware. The upstream r8152 module uses this USB Ethernet firmware.
+rtl_nic/rtl8153a-3.fw

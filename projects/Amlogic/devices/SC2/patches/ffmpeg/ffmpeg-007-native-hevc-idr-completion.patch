@@ -1,0 +1,46 @@
+Subject: [PATCH] avcodec: infer IDR temporal MVP and propagate capture failure
+
+An IDR has no slice_temporal_mvp_enabled_flag syntax; infer zero instead
+of retaining the previous non-IDR value. The second IDR in the authentic
+4K Main10 HTSP sample otherwise exports TMVP=1 and is correctly rejected
+by native Request validation. Do not relax the driver's control contract.
+
+A failed CAPTURE generation is not a successful decoded picture. Return
+its error through the existing post-process cleanup instead of exposing
+recycled surface contents with advancing timestamps. Preserve any corrupt
+flag established independently of this completion.
+
+--- a/libavcodec/hevcdec.c
++++ b/libavcodec/hevcdec.c
+@@ -763,6 +763,7 @@
+         } else {
+             s->sh.short_term_rps = NULL;
+             s->poc               = 0;
++            sh->slice_temporal_mvp_enabled_flag = 0;
+         }
+ 
+         /* 8.3.1 */
+--- a/libavcodec/v4l2_req_hevc_vx.c
++++ b/libavcodec/v4l2_req_hevc_vx.c
+@@ -709,16 +709,16 @@
+-// Set corrupt flag here as this is actually the frame structure that
+-// is going to the user (in MT land each thread has its own pool)
++/* A failed native generation must not be exposed as a decoded picture. */
+ static int frame_post_process(void *logctx, AVFrame *frame)
+ {
+     V4L2MediaReqDescriptor *rd = (V4L2MediaReqDescriptor*)frame->data[0];
+ 
+ //    av_log(NULL, AV_LOG_INFO, "%s\n", __func__);
+-    frame->flags &= ~AV_FRAME_FLAG_CORRUPT;
+     if (rd->qe_dst) {
+         MediaBufsStatus stat = qent_dst_wait(rd->qe_dst);
+         if (stat != MEDIABUFS_STATUS_SUCCESS) {
+-            av_log(logctx, AV_LOG_ERROR, "%s: Decode fail\n", __func__);
+-            frame->flags |= AV_FRAME_FLAG_CORRUPT;
++            av_log(logctx, AV_LOG_ERROR, "%s: capture completion failed (%d)\n",
++                   __func__, stat);
++            return stat == MEDIABUFS_ERROR_DECODING_ERROR ?
++                   AVERROR_INVALIDDATA : AVERROR(EIO);
+         }
+     }
+ 

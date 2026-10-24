@@ -1,0 +1,71 @@
+From c5db7cf2e6042225af798d3a76f46dde74237d08 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Tue, 20 Oct 2026 00:14:31 +0800
+Subject: [PATCH] Bluetooth: h5: Keep an optional shared low-power clock
+ enabled
+
+RTL8821CS boards can share the external low-power clock between
+SDIO Wi-Fi and native H5 Bluetooth. Acquire the optional lpo clock
+while Bluetooth enable is low and keep its reference independent
+of SDIO power sequencing.
+
+Use managed enable/unwind for registration failure and removal.
+Existing consumers without the optional clock retain their path;
+native btrtl still owns firmware loading and UART baud switching.
+
+---
+ .../bindings/net/bluetooth/realtek,bluetooth.yaml         | 7 +++++++
+ drivers/bluetooth/hci_h5.c                                | 8 ++++++++
+ 2 files changed, 15 insertions(+)
+
+diff --git a/Documentation/devicetree/bindings/net/bluetooth/realtek,bluetooth.yaml b/Documentation/devicetree/bindings/net/bluetooth/realtek,bluetooth.yaml
+index 7d567122bac9bb4cc0b5469da2c7a37367d96ab5..0729035ee43b7fb03f70ab5b1adff9f34472b964 100644
+--- a/Documentation/devicetree/bindings/net/bluetooth/realtek,bluetooth.yaml
++++ b/Documentation/devicetree/bindings/net/bluetooth/realtek,bluetooth.yaml
+@@ -29,6 +29,13 @@ properties:
+               - realtek,rtl8821cs-bt
+           - const: realtek,rtl8723bs-bt
+ 
++  clocks:
++    maxItems: 1
++    description: External low-power 32.768 kHz clock
++
++  clock-names:
++    const: lpo
++
+   device-wake-gpios:
+     maxItems: 1
+     description: GPIO specifier, used to wakeup the BT module
+diff --git a/drivers/bluetooth/hci_h5.c b/drivers/bluetooth/hci_h5.c
+index 9da2be1f3cc9c9b433d3387a7896ad8c286bf111..6a42f3327375c3c1426d9c162ddaa067d7a3a46c 100644
+--- a/drivers/bluetooth/hci_h5.c
++++ b/drivers/bluetooth/hci_h5.c
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include <linux/acpi.h>
++#include <linux/clk.h>
+ #include <linux/errno.h>
+ #include <linux/gpio/consumer.h>
+ #include <linux/kernel.h>
+@@ -821,6 +822,7 @@ static int h5_serdev_probe(struct serdev_device *serdev)
+ 	struct device *dev = &serdev->dev;
+ 	struct h5 *h5;
+ 	const struct h5_device_data *data;
++	struct clk *lpo_clk;
+ 
+ 	h5 = devm_kzalloc(dev, sizeof(*h5), GFP_KERNEL);
+ 	if (!h5)
+@@ -864,6 +866,12 @@ static int h5_serdev_probe(struct serdev_device *serdev)
+ 	if (IS_ERR(h5->device_wake_gpio))
+ 		return PTR_ERR(h5->device_wake_gpio);
+ 
++	/* Keep the shared LPO running independently of the Wi-Fi power state. */
++	lpo_clk = devm_clk_get_optional_enabled(dev, "lpo");
++	if (IS_ERR(lpo_clk))
++		return dev_err_probe(dev, PTR_ERR(lpo_clk),
++				     "Failed to enable LPO clock\n");
++
+ 	return hci_uart_register_device_priv(&h5->serdev_hu, &h5p,
+ 					     h5->vnd->sizeof_priv);
+ }

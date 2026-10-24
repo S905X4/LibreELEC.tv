@@ -1,0 +1,585 @@
+From 3fa1b3af7bbedc44c2a6311545c94a7a6a0ef19d Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Thu, 22 Oct 2026 11:09:36 +0800
+Subject: [PATCH] drm/meson: use native SC2 video-fetch register banks
+
+SC2 retains the G12A blending path but relocates linear MIF and AFBC
+fetch banks. Translate all touched MIF fields and route AFBC using the
+SC2 memory-path selector while preserving older SoC behavior.
+
+The Meson DRM directory compiles. A reversible native scanout experiment
+with the same register routing displayed the Main10 compressed fixture;
+this commit has not yet been booted as a production kernel.
+
+---
+ drivers/gpu/drm/meson/meson_crtc.c      | 231 ++++++++++++------------
+ drivers/gpu/drm/meson/meson_drv.h       |   2 +-
+ drivers/gpu/drm/meson/meson_overlay.c   |  12 +-
+ drivers/gpu/drm/meson/meson_registers.h |  23 +++
+ drivers/gpu/drm/meson/meson_viu.c       |  26 ++-
+ drivers/gpu/drm/meson/meson_viu.h       |  67 +++++++
+ 6 files changed, 244 insertions(+), 117 deletions(-)
+
+diff --git a/drivers/gpu/drm/meson/meson_crtc.c b/drivers/gpu/drm/meson/meson_crtc.c
+index d70616da8ce2..d5d20bbf20e2 100644
+--- a/drivers/gpu/drm/meson/meson_crtc.c
++++ b/drivers/gpu/drm/meson/meson_crtc.c
+@@ -27,8 +27,6 @@
+ #include "meson_vpp.h"
+ #include "meson_osd_afbcd.h"
+ 
+-#define MESON_G12A_VIU_OFFSET	0x5ec0
+-
+ /* CRTC definition */
+ 
+ struct meson_crtc {
+@@ -39,7 +37,6 @@ struct meson_crtc {
+ 	void (*enable_vd1)(struct meson_drm *priv);
+ 	void (*enable_osd1_afbc)(struct meson_drm *priv);
+ 	void (*disable_osd1_afbc)(struct meson_drm *priv);
+-	unsigned int viu_offset;
+ 	bool vsync_forced;
+ 	bool vsync_disabled;
+ };
+@@ -305,9 +302,7 @@ static void meson_g12a_crtc_enable_vd1(struct meson_drm *priv)
+ 		       VD_BLEND_POSTBLD_PREMULT_EN,
+ 		       priv->io_base + _REG(VD1_BLEND_SRC_CTRL));
+ 
+-	writel_relaxed(priv->viu.vd1_afbc ?
+-		       (VD1_AXI_SEL_AFBC | AFBC_VD1_SEL) : 0,
+-		       priv->io_base + _REG(VD1_AFBCD0_MISC_CTRL));
++	meson_viu_vd1_afbc_select(priv, priv->viu.vd1_afbc);
+ }
+ 
+ void meson_crtc_irq(struct meson_drm *priv)
+@@ -394,49 +389,49 @@ void meson_crtc_irq(struct meson_drm *priv)
+ 		if (priv->viu.vd1_afbc) {
+ 			writel_relaxed(priv->viu.vd1_afbc_head_addr,
+ 				       priv->io_base +
+-				       _REG(AFBC_HEAD_BADDR));
++				       _REG(meson_viu_afbc_reg(priv, AFBC_HEAD_BADDR)));
+ 			writel_relaxed(priv->viu.vd1_afbc_body_addr,
+ 				       priv->io_base +
+-				       _REG(AFBC_BODY_BADDR));
++				       _REG(meson_viu_afbc_reg(priv, AFBC_BODY_BADDR)));
+ 			writel_relaxed(priv->viu.vd1_afbc_en,
+ 				       priv->io_base +
+-				       _REG(AFBC_ENABLE));
++				       _REG(meson_viu_afbc_reg(priv, AFBC_ENABLE)));
+ 			writel_relaxed(priv->viu.vd1_afbc_mode,
+ 				       priv->io_base +
+-				       _REG(AFBC_MODE));
++				       _REG(meson_viu_afbc_reg(priv, AFBC_MODE)));
+ 			writel_relaxed(priv->viu.vd1_afbc_size_in,
+ 				       priv->io_base +
+-				       _REG(AFBC_SIZE_IN));
++				       _REG(meson_viu_afbc_reg(priv, AFBC_SIZE_IN)));
+ 			writel_relaxed(priv->viu.vd1_afbc_dec_def_color,
+ 				       priv->io_base +
+-				       _REG(AFBC_DEC_DEF_COLOR));
++				       _REG(meson_viu_afbc_reg(priv, AFBC_DEC_DEF_COLOR)));
+ 			writel_relaxed(priv->viu.vd1_afbc_conv_ctrl,
+ 				       priv->io_base +
+-				       _REG(AFBC_CONV_CTRL));
++				       _REG(meson_viu_afbc_reg(priv, AFBC_CONV_CTRL)));
+ 			writel_relaxed(priv->viu.vd1_afbc_size_out,
+ 				       priv->io_base +
+-				       _REG(AFBC_SIZE_OUT));
++				       _REG(meson_viu_afbc_reg(priv, AFBC_SIZE_OUT)));
+ 			writel_relaxed(priv->viu.vd1_afbc_vd_cfmt_ctrl,
+ 				       priv->io_base +
+-				       _REG(AFBC_VD_CFMT_CTRL));
++				       _REG(meson_viu_afbc_reg(priv, AFBC_VD_CFMT_CTRL)));
+ 			writel_relaxed(priv->viu.vd1_afbc_vd_cfmt_w,
+ 				       priv->io_base +
+-				       _REG(AFBC_VD_CFMT_W));
++				       _REG(meson_viu_afbc_reg(priv, AFBC_VD_CFMT_W)));
+ 			writel_relaxed(priv->viu.vd1_afbc_mif_hor_scope,
+ 				       priv->io_base +
+-				       _REG(AFBC_MIF_HOR_SCOPE));
++				       _REG(meson_viu_afbc_reg(priv, AFBC_MIF_HOR_SCOPE)));
+ 			writel_relaxed(priv->viu.vd1_afbc_mif_ver_scope,
+ 				       priv->io_base +
+-				       _REG(AFBC_MIF_VER_SCOPE));
++				       _REG(meson_viu_afbc_reg(priv, AFBC_MIF_VER_SCOPE)));
+ 			writel_relaxed(priv->viu.vd1_afbc_pixel_hor_scope,
+ 				       priv->io_base+
+-				       _REG(AFBC_PIXEL_HOR_SCOPE));
++				       _REG(meson_viu_afbc_reg(priv, AFBC_PIXEL_HOR_SCOPE)));
+ 			writel_relaxed(priv->viu.vd1_afbc_pixel_ver_scope,
+ 				       priv->io_base +
+-				       _REG(AFBC_PIXEL_VER_SCOPE));
++				       _REG(meson_viu_afbc_reg(priv, AFBC_PIXEL_VER_SCOPE)));
+ 			writel_relaxed(priv->viu.vd1_afbc_vd_cfmt_h,
+ 				       priv->io_base +
+-				       _REG(AFBC_VD_CFMT_H));
++				       _REG(meson_viu_afbc_reg(priv, AFBC_VD_CFMT_H)));
+ 		} else {
+ 			switch (priv->viu.vd1_planes) {
+ 			case 3:
+@@ -470,137 +465,152 @@ void meson_crtc_irq(struct meson_drm *priv)
+ 						    MESON_CANVAS_ENDIAN_SWAP64);
+ 			}
+ 
+-			writel_relaxed(0, priv->io_base + _REG(AFBC_ENABLE));
++			writel_relaxed(0, priv->io_base + _REG(meson_viu_afbc_reg(priv, AFBC_ENABLE)));
+ 		}
+ 
+ 		writel_relaxed(priv->viu.vd1_if0_gen_reg,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD1_IF0_GEN_REG));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD1_IF0_GEN_REG)));
+ 		writel_relaxed(priv->viu.vd1_if0_gen_reg,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD2_IF0_GEN_REG));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD2_IF0_GEN_REG)));
+ 		writel_relaxed(priv->viu.vd1_if0_gen_reg2,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD1_IF0_GEN_REG2));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD1_IF0_GEN_REG2)));
++		if (priv->sc2)
++			writel_relaxed(priv->viu.vd1_if0_gen_reg2,
++				       priv->io_base +
++				       _REG(meson_viu_mif_reg(priv, VD2_IF0_GEN_REG2)));
+ 		writel_relaxed(priv->viu.viu_vd1_fmt_ctrl,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VIU_VD1_FMT_CTRL));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VIU_VD1_FMT_CTRL)));
+ 		writel_relaxed(priv->viu.viu_vd1_fmt_ctrl,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VIU_VD2_FMT_CTRL));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VIU_VD2_FMT_CTRL)));
+ 		writel_relaxed(priv->viu.viu_vd1_fmt_w,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VIU_VD1_FMT_W));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VIU_VD1_FMT_W)));
+ 		writel_relaxed(priv->viu.viu_vd1_fmt_w,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VIU_VD2_FMT_W));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VIU_VD2_FMT_W)));
+ 		writel_relaxed(priv->viu.vd1_if0_canvas0,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD1_IF0_CANVAS0));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD1_IF0_CANVAS0)));
+ 		writel_relaxed(priv->viu.vd1_if0_canvas0,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD1_IF0_CANVAS1));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD1_IF0_CANVAS1)));
+ 		writel_relaxed(priv->viu.vd1_if0_canvas0,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD2_IF0_CANVAS0));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD2_IF0_CANVAS0)));
+ 		writel_relaxed(priv->viu.vd1_if0_canvas0,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD2_IF0_CANVAS1));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD2_IF0_CANVAS1)));
+ 		writel_relaxed(priv->viu.vd1_if0_luma_x0,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD1_IF0_LUMA_X0));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD1_IF0_LUMA_X0)));
+ 		writel_relaxed(priv->viu.vd1_if0_luma_x0,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD1_IF0_LUMA_X1));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD1_IF0_LUMA_X1)));
+ 		writel_relaxed(priv->viu.vd1_if0_luma_x0,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD2_IF0_LUMA_X0));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD2_IF0_LUMA_X0)));
+ 		writel_relaxed(priv->viu.vd1_if0_luma_x0,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD2_IF0_LUMA_X1));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD2_IF0_LUMA_X1)));
+ 		writel_relaxed(priv->viu.vd1_if0_luma_y0,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD1_IF0_LUMA_Y0));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD1_IF0_LUMA_Y0)));
+ 		writel_relaxed(priv->viu.vd1_if0_luma_y0,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD1_IF0_LUMA_Y1));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD1_IF0_LUMA_Y1)));
+ 		writel_relaxed(priv->viu.vd1_if0_luma_y0,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD2_IF0_LUMA_Y0));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD2_IF0_LUMA_Y0)));
+ 		writel_relaxed(priv->viu.vd1_if0_luma_y0,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD2_IF0_LUMA_Y1));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD2_IF0_LUMA_Y1)));
+ 		writel_relaxed(priv->viu.vd1_if0_chroma_x0,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD1_IF0_CHROMA_X0));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD1_IF0_CHROMA_X0)));
+ 		writel_relaxed(priv->viu.vd1_if0_chroma_x0,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD1_IF0_CHROMA_X1));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD1_IF0_CHROMA_X1)));
+ 		writel_relaxed(priv->viu.vd1_if0_chroma_x0,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD2_IF0_CHROMA_X0));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD2_IF0_CHROMA_X0)));
+ 		writel_relaxed(priv->viu.vd1_if0_chroma_x0,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD2_IF0_CHROMA_X1));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD2_IF0_CHROMA_X1)));
+ 		writel_relaxed(priv->viu.vd1_if0_chroma_y0,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD1_IF0_CHROMA_Y0));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD1_IF0_CHROMA_Y0)));
+ 		writel_relaxed(priv->viu.vd1_if0_chroma_y0,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD1_IF0_CHROMA_Y1));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD1_IF0_CHROMA_Y1)));
+ 		writel_relaxed(priv->viu.vd1_if0_chroma_y0,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD2_IF0_CHROMA_Y0));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD2_IF0_CHROMA_Y0)));
+ 		writel_relaxed(priv->viu.vd1_if0_chroma_y0,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD2_IF0_CHROMA_Y1));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD2_IF0_CHROMA_Y1)));
+ 		writel_relaxed(priv->viu.vd1_if0_repeat_loop,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD1_IF0_RPT_LOOP));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD1_IF0_RPT_LOOP)));
+ 		writel_relaxed(priv->viu.vd1_if0_repeat_loop,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD2_IF0_RPT_LOOP));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD2_IF0_RPT_LOOP)));
+ 		writel_relaxed(priv->viu.vd1_if0_luma0_rpt_pat,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD1_IF0_LUMA0_RPT_PAT));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD1_IF0_LUMA0_RPT_PAT)));
+ 		writel_relaxed(priv->viu.vd1_if0_luma0_rpt_pat,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD2_IF0_LUMA0_RPT_PAT));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD2_IF0_LUMA0_RPT_PAT)));
+ 		writel_relaxed(priv->viu.vd1_if0_luma0_rpt_pat,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD1_IF0_LUMA1_RPT_PAT));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD1_IF0_LUMA1_RPT_PAT)));
+ 		writel_relaxed(priv->viu.vd1_if0_luma0_rpt_pat,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD2_IF0_LUMA1_RPT_PAT));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD2_IF0_LUMA1_RPT_PAT)));
+ 		writel_relaxed(priv->viu.vd1_if0_chroma0_rpt_pat,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD1_IF0_CHROMA0_RPT_PAT));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD1_IF0_CHROMA0_RPT_PAT)));
+ 		writel_relaxed(priv->viu.vd1_if0_chroma0_rpt_pat,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD2_IF0_CHROMA0_RPT_PAT));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD2_IF0_CHROMA0_RPT_PAT)));
+ 		writel_relaxed(priv->viu.vd1_if0_chroma0_rpt_pat,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD1_IF0_CHROMA1_RPT_PAT));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD1_IF0_CHROMA1_RPT_PAT)));
+ 		writel_relaxed(priv->viu.vd1_if0_chroma0_rpt_pat,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD2_IF0_CHROMA1_RPT_PAT));
+-		writel_relaxed(0, priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD1_IF0_LUMA_PSEL));
+-		writel_relaxed(0, priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD1_IF0_CHROMA_PSEL));
+-		writel_relaxed(0, priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD2_IF0_LUMA_PSEL));
+-		writel_relaxed(0, priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD2_IF0_CHROMA_PSEL));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD2_IF0_CHROMA1_RPT_PAT)));
++		writel_relaxed(0, priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD1_IF0_LUMA_PSEL)));
++		writel_relaxed(0, priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD1_IF0_CHROMA_PSEL)));
++		writel_relaxed(0, priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD2_IF0_LUMA_PSEL)));
++		writel_relaxed(0, priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD2_IF0_CHROMA_PSEL)));
+ 		writel_relaxed(priv->viu.vd1_range_map_y,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD1_IF0_RANGE_MAP_Y));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD1_IF0_RANGE_MAP_Y)));
+ 		writel_relaxed(priv->viu.vd1_range_map_cb,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD1_IF0_RANGE_MAP_CB));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD1_IF0_RANGE_MAP_CB)));
+ 		writel_relaxed(priv->viu.vd1_range_map_cr,
+-				priv->io_base + meson_crtc->viu_offset +
+-				_REG(VD1_IF0_RANGE_MAP_CR));
++				priv->io_base +
++				_REG(meson_viu_mif_reg(priv, VD1_IF0_RANGE_MAP_CR)));
++		if (priv->sc2) {
++			writel_relaxed(priv->viu.vd1_range_map_y,
++				       priv->io_base +
++				       _REG(meson_viu_mif_reg(priv, VD2_IF0_RANGE_MAP_Y)));
++			writel_relaxed(priv->viu.vd1_range_map_cb,
++				       priv->io_base +
++				       _REG(meson_viu_mif_reg(priv, VD2_IF0_RANGE_MAP_CB)));
++			writel_relaxed(priv->viu.vd1_range_map_cr,
++				       priv->io_base +
++				       _REG(meson_viu_mif_reg(priv, VD2_IF0_RANGE_MAP_CR)));
++		}
+ 		writel_relaxed(VPP_VSC_BANK_LENGTH(4) |
+ 			       VPP_HSC_BANK_LENGTH(4) |
+ 			       VPP_SC_VD_EN_ENABLE |
+@@ -695,7 +705,6 @@ int meson_crtc_create(struct meson_drm *priv)
+ 	if (meson_vpu_is_compatible(priv, VPU_COMPATIBLE_G12A)) {
+ 		meson_crtc->enable_osd1 = meson_g12a_crtc_enable_osd1;
+ 		meson_crtc->enable_vd1 = meson_g12a_crtc_enable_vd1;
+-		meson_crtc->viu_offset = MESON_G12A_VIU_OFFSET;
+ 		meson_crtc->enable_osd1_afbc =
+ 					meson_crtc_g12a_enable_osd1_afbc;
+ 		meson_crtc->disable_osd1_afbc =
+diff --git a/drivers/gpu/drm/meson/meson_drv.h b/drivers/gpu/drm/meson/meson_drv.h
+index c9f6da83195a..2f68670eba13 100644
+--- a/drivers/gpu/drm/meson/meson_drv.h
++++ b/drivers/gpu/drm/meson/meson_drv.h
+@@ -34,7 +34,7 @@ enum {
+ struct meson_drm_match_data {
+ 	enum vpu_compatible compat;
+ 	struct meson_afbcd_ops *afbcd_ops;
+-	/* SC2 retains the G12A VIU/VPP layout, but splits the HHI banks. */
++	/* SC2 retains G12A blending/scaling, but moves video-fetch and HHI banks. */
+ 	bool sc2;
+ };
+ 
+diff --git a/drivers/gpu/drm/meson/meson_overlay.c b/drivers/gpu/drm/meson/meson_overlay.c
+index 7f98de38842b..f38ff591c9d0 100644
+--- a/drivers/gpu/drm/meson/meson_overlay.c
++++ b/drivers/gpu/drm/meson/meson_overlay.c
+@@ -736,12 +736,20 @@ static void meson_overlay_atomic_disable(struct drm_plane *plane,
+ 	if (meson_vpu_is_compatible(priv, VPU_COMPATIBLE_G12A)) {
+ 		writel_relaxed(0, priv->io_base + _REG(VD1_BLEND_SRC_CTRL));
+ 		writel_relaxed(0, priv->io_base + _REG(VD2_BLEND_SRC_CTRL));
+-		writel_relaxed(0, priv->io_base + _REG(VD1_IF0_GEN_REG + 0x17b0));
+-		writel_relaxed(0, priv->io_base + _REG(VD2_IF0_GEN_REG + 0x17b0));
++		writel_relaxed(0, priv->io_base +
++			       _REG(meson_viu_mif_reg(priv, VD1_IF0_GEN_REG)));
++		writel_relaxed(0, priv->io_base +
++			       _REG(meson_viu_mif_reg(priv, VD2_IF0_GEN_REG)));
+ 	} else
+ 		writel_bits_relaxed(VPP_VD1_POSTBLEND | VPP_VD1_PREBLEND, 0,
+ 				    priv->io_base + _REG(VPP_MISC));
+ 
++	if (priv->sc2) {
++		writel_relaxed(0, priv->io_base +
++			       _REG(meson_viu_afbc_reg(priv, AFBC_ENABLE)));
++		meson_viu_vd1_afbc_select(priv, false);
++	}
++
+ }
+ 
+ static const struct drm_plane_helper_funcs meson_overlay_helper_funcs = {
+diff --git a/drivers/gpu/drm/meson/meson_registers.h b/drivers/gpu/drm/meson/meson_registers.h
+index e02e545a6b20..d99067214d27 100644
+--- a/drivers/gpu/drm/meson/meson_registers.h
++++ b/drivers/gpu/drm/meson/meson_registers.h
+@@ -152,6 +152,7 @@
+ #define VD1_AFBCD0_MISC_CTRL 0x1a0a
+ #define		VD1_AXI_SEL_AFBC		(1 << 12)
+ #define		AFBC_VD1_SEL			(1 << 10)
++#define		VD1_AFBC0_MEM_SEL	BIT(22)
+ #define VD2_AFBCD1_MISC_CTRL 0x1a0b
+ #define VIU_OSD1_CTRL_STAT 0x1a10
+ #define		VIU_OSD1_OSD_BLK_ENABLE         BIT(0)
+@@ -328,6 +329,27 @@
+ #define VIU_VD2_FMT_CTRL 0x1a88
+ #define VIU_VD2_FMT_W 0x1a89
+ 
++/* SC2 keeps the initial MIF fields, but rearranges the tail of each bank. */
++#define SC2_VD1_IF0_GEN_REG 0x4800
++#define SC2_VD1_IF0_LUMA_FIFO_SIZE 0x4813
++#define SC2_VD1_IF0_RANGE_MAP_Y 0x4816
++#define SC2_VD1_IF0_RANGE_MAP_CB 0x4817
++#define SC2_VD1_IF0_RANGE_MAP_CR 0x4818
++#define SC2_VD1_IF0_GEN_REG2 0x4819
++#define SC2_VD1_IF0_GEN_REG3 0x481c
++#define SC2_VIU_VD1_FMT_CTRL 0x481d
++#define SC2_VIU_VD1_FMT_W 0x481e
++#define SC2_VD2_IF0_GEN_REG 0x4880
++#define SC2_VD2_IF0_LUMA_FIFO_SIZE 0x4893
++#define SC2_VD2_IF0_RANGE_MAP_Y 0x4896
++#define SC2_VD2_IF0_RANGE_MAP_CB 0x4897
++#define SC2_VD2_IF0_RANGE_MAP_CR 0x4898
++#define SC2_VD2_IF0_GEN_REG2 0x4899
++#define SC2_VD2_IF0_GEN_REG3 0x489c
++#define SC2_VIU_VD2_FMT_CTRL 0x489d
++#define SC2_VIU_VD2_FMT_W 0x489e
++#define SC2_AFBC_ENABLE 0x4840
++
+ /* VIU Matrix Registers */
+ #define VIU_OSD1_MATRIX_CTRL 0x1a90
+ #define VIU_OSD1_MATRIX_COEF00_01 0x1a91
+@@ -343,6 +365,7 @@
+ #define VIU_OSD1_MATRIX_COEF31_32 0x1a9e
+ #define VIU_OSD1_MATRIX_COEF40_41 0x1a9f
+ #define VD1_IF0_GEN_REG3 0x1aa7
++#define VD2_IF0_GEN_REG3 0x1aa8
+ 
+ #define VIU_OSD_BLENDO_H_START_END 0x1aa9
+ #define VIU_OSD_BLENDO_V_START_END 0x1aaa
+diff --git a/drivers/gpu/drm/meson/meson_viu.c b/drivers/gpu/drm/meson/meson_viu.c
+index cd399b0b7181..a5a305cde1d6 100644
+--- a/drivers/gpu/drm/meson/meson_viu.c
++++ b/drivers/gpu/drm/meson/meson_viu.c
+@@ -411,6 +411,21 @@ void meson_viu_gxm_disable_osd1_afbc(struct meson_drm *priv)
+ 			    priv->io_base + _REG(VIU_MISC_CTRL1));
+ }
+ 
++void meson_viu_vd1_afbc_select(struct meson_drm *priv, bool afbc)
++{
++	u32 mask = VD1_AXI_SEL_AFBC | AFBC_VD1_SEL;
++
++	if (priv->sc2) {
++		/* TL1+ also selects the AFBC memory path with bit 22. */
++		mask |= VD1_AFBC0_MEM_SEL;
++		writel_bits_relaxed(mask, afbc ? mask : 0,
++				    priv->io_base + _REG(VD1_AFBCD0_MISC_CTRL));
++	} else {
++		writel_relaxed(afbc ? mask : 0,
++			       priv->io_base + _REG(VD1_AFBCD0_MISC_CTRL));
++	}
++}
++
+ void meson_viu_init(struct meson_drm *priv)
+ {
+ 	uint32_t reg;
+@@ -460,12 +475,17 @@ void meson_viu_init(struct meson_drm *priv)
+ 	/* di_mif0_en=0 mif0_to_vpp_en=0 di_mad_en=0 and afbc vd1 set=0*/
+ 	writel_bits_relaxed(VIU_CTRL0_VD1_AFBC_MASK, 0,
+ 			    priv->io_base + _REG(VIU_MISC_CTRL0));
+-	writel_relaxed(0, priv->io_base + _REG(AFBC_ENABLE));
++	writel_relaxed(0, priv->io_base +
++		       _REG(meson_viu_afbc_reg(priv, AFBC_ENABLE)));
++	if (priv->sc2)
++		meson_viu_vd1_afbc_select(priv, false);
+ 
+ 	writel_relaxed(0x00FF00C0,
+-			priv->io_base + _REG(VD1_IF0_LUMA_FIFO_SIZE));
++		       priv->io_base + _REG(priv->sc2 ?
++			       SC2_VD1_IF0_LUMA_FIFO_SIZE : VD1_IF0_LUMA_FIFO_SIZE));
+ 	writel_relaxed(0x00FF00C0,
+-			priv->io_base + _REG(VD2_IF0_LUMA_FIFO_SIZE));
++		       priv->io_base + _REG(priv->sc2 ?
++			       SC2_VD2_IF0_LUMA_FIFO_SIZE : VD2_IF0_LUMA_FIFO_SIZE));
+ 
+ 	if (meson_vpu_is_compatible(priv, VPU_COMPATIBLE_G12A)) {
+ 		u32 val = (u32)VIU_OSD_BLEND_REORDER(0, 1) |
+diff --git a/drivers/gpu/drm/meson/meson_viu.h b/drivers/gpu/drm/meson/meson_viu.h
+index e4a2f24d7c38..47375bac8a7f 100644
+--- a/drivers/gpu/drm/meson/meson_viu.h
++++ b/drivers/gpu/drm/meson/meson_viu.h
+@@ -9,6 +9,73 @@
+ #ifndef __MESON_VIU_H
+ #define __MESON_VIU_H
+ 
++#include "meson_drv.h"
++#include "meson_registers.h"
++
++/* Translate legacy word addresses; VPP blending and scaling do not move. */
++static inline unsigned int meson_viu_mif_reg(struct meson_drm *priv,
++					  unsigned int reg)
++{
++	if (!priv->sc2) {
++		if (meson_vpu_is_compatible(priv, VPU_COMPATIBLE_G12A)) {
++			if (reg == VD1_IF0_GEN_REG3)
++				return 0x3216;
++			if (reg == VD2_IF0_GEN_REG3)
++				return 0x3236;
++			return reg + 0x17b0;
++		}
++		return reg;
++	}
++
++	/* GEN through FIFO retain their order in both SC2 MIF banks. */
++	if (reg >= VD1_IF0_GEN_REG && reg <= VD1_IF0_LUMA_FIFO_SIZE)
++		return SC2_VD1_IF0_GEN_REG + reg - VD1_IF0_GEN_REG;
++	if (reg >= VD2_IF0_GEN_REG && reg <= VD2_IF0_LUMA_FIFO_SIZE)
++		return SC2_VD2_IF0_GEN_REG + reg - VD2_IF0_GEN_REG;
++
++	switch (reg) {
++	case VD1_IF0_RANGE_MAP_Y:
++		return SC2_VD1_IF0_RANGE_MAP_Y;
++	case VD1_IF0_RANGE_MAP_CB:
++		return SC2_VD1_IF0_RANGE_MAP_CB;
++	case VD1_IF0_RANGE_MAP_CR:
++		return SC2_VD1_IF0_RANGE_MAP_CR;
++	case VD1_IF0_GEN_REG2:
++		return SC2_VD1_IF0_GEN_REG2;
++	case VD1_IF0_GEN_REG3:
++		return SC2_VD1_IF0_GEN_REG3;
++	case VIU_VD1_FMT_CTRL:
++		return SC2_VIU_VD1_FMT_CTRL;
++	case VIU_VD1_FMT_W:
++		return SC2_VIU_VD1_FMT_W;
++	case VD2_IF0_RANGE_MAP_Y:
++		return SC2_VD2_IF0_RANGE_MAP_Y;
++	case VD2_IF0_RANGE_MAP_CB:
++		return SC2_VD2_IF0_RANGE_MAP_CB;
++	case VD2_IF0_RANGE_MAP_CR:
++		return SC2_VD2_IF0_RANGE_MAP_CR;
++	case VD2_IF0_GEN_REG2:
++		return SC2_VD2_IF0_GEN_REG2;
++	case VD2_IF0_GEN_REG3:
++		return SC2_VD2_IF0_GEN_REG3;
++	case VIU_VD2_FMT_CTRL:
++		return SC2_VIU_VD2_FMT_CTRL;
++	case VIU_VD2_FMT_W:
++		return SC2_VIU_VD2_FMT_W;
++	default:
++		return reg;
++	}
++}
++
++static inline unsigned int meson_viu_afbc_reg(struct meson_drm *priv,
++					   unsigned int reg)
++{
++	/* AFBC_ENABLE through AFBC_VD_CFMT_H have identical field order. */
++	return priv->sc2 ? SC2_AFBC_ENABLE + reg - AFBC_ENABLE : reg;
++}
++
++void meson_viu_vd1_afbc_select(struct meson_drm *priv, bool afbc);
++
+ /* OSDx_BLKx_CFG */
+ #define OSD_MALI_SRC_EN		BIT(30)
+ 
+-- 
+2.47.3
+

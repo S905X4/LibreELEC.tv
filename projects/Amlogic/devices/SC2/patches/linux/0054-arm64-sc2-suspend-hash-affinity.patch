@@ -1,0 +1,55 @@
+From f6f4bdd98d6f57ec0280572782870a158ec9a8c7 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Wed, 21 Oct 2026 04:58:44 +0800
+Subject: [PATCH] arm64: Fix SC2 suspend context hash affinity
+
+SC2 firmware exposes flattened CPU identifiers in device tree and PSCI,
+but the hardware reports the cores in MPIDR Aff1 with MT set. Building
+the suspend hash from the firmware identifiers masks Aff0, so all four
+hardware affinities select sleep_save_stash[0] and overwrite saved
+resume contexts.
+
+Translate the hash mask to hardware affinity positions for SC2 MT
+systems whose CPU identifiers fit in Aff0. Keep the proven firmware
+CPU_ON and AFFINITY_INFO identifiers unchanged. Existing physical-ID
+DTs and other platforms retain their original hash interpretation.
+Both suspend and resume assembly consume the corrected descriptor.
+
+
+---
+ arch/arm64/kernel/setup.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/arch/arm64/kernel/setup.c b/arch/arm64/kernel/setup.c
+index 23c05dc7a8f2..2be3c9a86f39 100644
+--- a/arch/arm64/kernel/setup.c
++++ b/arch/arm64/kernel/setup.c
+@@ -26,6 +26,7 @@
+ #include <linux/panic_notifier.h>
+ #include <linux/proc_fs.h>
+ #include <linux/memblock.h>
++#include <linux/of.h>
+ #include <linux/of_fdt.h>
+ #include <linux/efi.h>
+ #include <linux/psci.h>
+@@ -118,6 +119,17 @@ static void __init smp_build_mpidr_hash(void)
+ 	 */
+ 	for_each_possible_cpu(i)
+ 		mask |= (cpu_logical_map(i) ^ cpu_logical_map(0));
++	/*
++	 * SC2 firmware uses flattened CPU IDs in Aff0, while MPIDR_EL1
++	 * reports the cores in Aff1 with MT set.  Keep the firmware IDs
++	 * for PSCI, but hash the hardware affinity used by sleep.S.  Do
++	 * not shift a device tree that already describes physical IDs.
++	 */
++	if (of_machine_is_compatible("amlogic,sc2") &&
++	    (read_cpuid_mpidr() & MPIDR_MT_BITMASK) &&
++	    !(mask & ~MPIDR_LEVEL_MASK))
++		mask <<= MPIDR_LEVEL_BITS;
++
+ 	pr_debug("mask of set bits %#llx\n", mask);
+ 	/*
+ 	 * Find and stash the last and first bit set at all affinity levels to
+-- 
+2.47.3
+

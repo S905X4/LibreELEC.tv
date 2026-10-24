@@ -1,0 +1,50 @@
+From 27d55aa73deed4c4d7f691f4544ca74c50124725 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Mon, 19 Oct 2026 21:42:14 +0800
+Subject: [PATCH] arm64: dts: amlogic: add SC2 default CMA pool
+
+The corrected HDMI resources allow the HK1 RBOX X4 to reach userspace
+and read EDID, but its 1920x1080 32-bit framebuffer allocation fails
+with -ENOMEM for 8294400 bytes. The deployed minimal kernel has CMA
+disabled, and SC2 lacks the default DMA pool used by other Meson SoCs.
+
+Add a reusable 256 MiB default shared DMA pool with 4 MiB alignment,
+following meson-g12-common.dtsi. Let memblock choose its location so
+firmware, secure-monitor and board carveouts remain excluded. This is
+Linux DMA memory, not an imported Android multimedia heap.
+
+The consumer kernel must also enable CONFIG_CMA and CONFIG_DMA_CMA.
+Controller initialization alone does not establish working scanout.
+
+---
+ arch/arm64/boot/dts/amlogic/meson-sc2.dtsi | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi b/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi
+index 5812163ecc47..8f77b43de3b8 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi
++++ b/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi
+@@ -75,6 +75,20 @@ psci {
+ 		method = "smc";
+ 	};
+ 
++	reserved-memory {
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++
++		linux,cma {
++			compatible = "shared-dma-pool";
++			reusable;
++			size = <0x0 0x10000000>;
++			alignment = <0x0 0x400000>;
++			linux,cma-default;
++		};
++	};
++
+ 	firmware {
+ 		sm: secure-monitor {
+ 			compatible = "amlogic,meson-gxbb-sm";
+-- 
+2.47.3
+

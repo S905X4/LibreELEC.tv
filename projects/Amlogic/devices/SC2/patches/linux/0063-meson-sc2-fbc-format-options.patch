@@ -1,0 +1,47 @@
+From 34ae2869e4438281417e69fdda8944c9c1f57193 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Thu, 22 Oct 2026 11:09:36 +0800
+Subject: [PATCH] drm/meson: honor FBC options and SC2 unpack format
+
+The modifier vendor tag is not an option mask. Extract option bits before
+selecting memory-saving mode, then select SC2 DOS decompression and the
+YUV420 conversion format.
+
+The matched reversible Main10 scanout experiment displayed the test
+picture. This does not claim HDR or full-depth HDMI-link verification.
+
+---
+ drivers/gpu/drm/meson/meson_overlay.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/meson/meson_overlay.c b/drivers/gpu/drm/meson/meson_overlay.c
+index f38ff591c9d0..87ee112f48fa 100644
+--- a/drivers/gpu/drm/meson/meson_overlay.c
++++ b/drivers/gpu/drm/meson/meson_overlay.c
+@@ -494,8 +494,8 @@ static void meson_overlay_atomic_update(struct drm_plane *plane,
+ 					  AFBC_HOLD_LINE_NUM(8) |
+ 					  AFBC_BURST_LEN(2);
+ 
+-		if (fb->modifier & DRM_FORMAT_MOD_AMLOGIC_FBC(0,
+-						AMLOGIC_FBC_OPTION_MEM_SAVING))
++		if ((fb->modifier >> __fourcc_mod_amlogic_options_shift) &
++		    AMLOGIC_FBC_OPTION_MEM_SAVING)
+ 			priv->viu.vd1_afbc_mode |= AFBC_BLK_MEM_MODE;
+ 
+ 		if ((fb->modifier & __fourcc_mod_amlogic_layout_mask) ==
+@@ -503,8 +503,12 @@ static void meson_overlay_atomic_update(struct drm_plane *plane,
+ 			priv->viu.vd1_afbc_mode |= AFBC_SCATTER_MODE;
+ 
+ 		priv->viu.vd1_afbc_en = 0x1600 | AFBC_DEC_ENABLE;
++		if (priv->sc2)
++			priv->viu.vd1_afbc_en |= BIT(19); /* DOS compression */
+ 
+ 		priv->viu.vd1_afbc_conv_ctrl = AFBC_CONV_LBUF_LEN(256);
++		if (priv->sc2)
++			priv->viu.vd1_afbc_conv_ctrl |= 2 << 12; /* YUV420 */
+ 
+ 		priv->viu.vd1_afbc_dec_def_color = AFBC_DEF_COLOR_Y(1023);
+ 
+-- 
+2.47.3
+

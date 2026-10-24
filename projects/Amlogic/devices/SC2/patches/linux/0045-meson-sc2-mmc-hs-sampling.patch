@@ -1,0 +1,123 @@
+From 7d6d2bbdb568a02b7b20c56085a9eaa291833d48 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Wed, 21 Oct 2026 02:08:07 +0800
+Subject: [PATCH] mmc: meson-gx: Enable SC2 source sampling in MMC high-speed
+ mode
+
+SC2 previously inherited AXG match data and disabled resampling in
+MMC_HS. The stock set_ios timing-1 path instead clears ADJUST[21:16]
+and sets ADJUST_EN. CE and Khadas agree on this zero-delay setup.
+
+Add SC2-specific match data, its AXG fallback binding and the three
+controller compatibles. Preserve all other timings and SoC behavior.
+Do not change voltage, clock limits or add raw register workarounds.
+
+
+---
+ .../bindings/mmc/amlogic,meson-gx-mmc.yaml    |  3 +++
+ arch/arm64/boot/dts/amlogic/meson-sc2.dtsi    |  6 ++---
+ drivers/mmc/host/meson-gx-mmc.c               | 24 ++++++++++++++++++-
+ 3 files changed, 29 insertions(+), 4 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/mmc/amlogic,meson-gx-mmc.yaml b/Documentation/devicetree/bindings/mmc/amlogic,meson-gx-mmc.yaml
+index 7b06199cd7c2bdfbc2e003e17278098fc008770a..ca0e332aedbf473c56c6ff6e012aec3db6cfdecf 100644
+--- a/Documentation/devicetree/bindings/mmc/amlogic,meson-gx-mmc.yaml
++++ b/Documentation/devicetree/bindings/mmc/amlogic,meson-gx-mmc.yaml
+@@ -20,6 +20,9 @@ properties:
+   compatible:
+     oneOf:
+       - const: amlogic,meson-axg-mmc
++      - items:
++          - const: amlogic,meson-sc2-mmc
++          - const: amlogic,meson-axg-mmc
+       - items:
+           - const: amlogic,meson-gx-mmc
+           - const: amlogic,meson-gxbb-mmc
+diff --git a/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi b/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi
+index 23735b1ab68940e7b05fd57544c40bef30132541..db5a5f91023474f4de432d795f708063a67f9f37 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi
++++ b/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi
+@@ -461,7 +461,7 @@ ir: ir-receiver@fe084040 {
+ 		};
+ 
+ 		sd_emmc_a: mmc@fe088000 {
+-			compatible = "amlogic,meson-axg-mmc";
++			compatible = "amlogic,meson-sc2-mmc", "amlogic,meson-axg-mmc";
+ 			reg = <0 0xfe088000 0 0x800>;
+ 			interrupts = <GIC_SPI 176 IRQ_TYPE_LEVEL_HIGH>;
+ 			clocks = <&clkc CLKID_SD_EMMC_A>,
+@@ -479,7 +479,7 @@ sd_emmc_a: mmc@fe088000 {
+ 		};
+ 
+ 		sd_emmc_b: mmc@fe08a000 {
+-			compatible = "amlogic,meson-axg-mmc";
++			compatible = "amlogic,meson-sc2-mmc", "amlogic,meson-axg-mmc";
+ 			reg = <0 0xfe08a000 0 0x800>;
+ 			interrupts = <GIC_SPI 177 IRQ_TYPE_EDGE_RISING>;
+ 			clocks = <&clkc CLKID_SD_EMMC_B>,
+@@ -495,7 +495,7 @@ sd_emmc_b: mmc@fe08a000 {
+ 		};
+ 
+ 		sd_emmc_c: mmc@fe08c000 {
+-			compatible = "amlogic,meson-axg-mmc";
++			compatible = "amlogic,meson-sc2-mmc", "amlogic,meson-axg-mmc";
+ 			reg = <0 0xfe08c000 0 0x800>;
+ 			interrupts = <GIC_SPI 178 IRQ_TYPE_EDGE_RISING>;
+ 			clocks = <&clkc CLKID_NAND>,
+diff --git a/drivers/mmc/host/meson-gx-mmc.c b/drivers/mmc/host/meson-gx-mmc.c
+index 180f243e82a64125426a4f970fbd77aca47a6eee..7f58d18137704df40791c7c4d660a926cfcdfe8b 100644
+--- a/drivers/mmc/host/meson-gx-mmc.c
++++ b/drivers/mmc/host/meson-gx-mmc.c
+@@ -139,6 +139,7 @@ struct meson_mmc_data {
+ 	unsigned int always_on;
+ 	unsigned int adjust;
+ 	unsigned int irq_sdio_sleep;
++	bool mmc_hs_resampling;
+ };
+ 
+ struct sd_emmc_desc {
+@@ -600,9 +601,20 @@ static int meson_mmc_prepare_ios_clock(struct meson_host *host,
+ static void meson_mmc_check_resampling(struct meson_host *host,
+ 				       struct mmc_ios *ios)
+ {
++	unsigned int val;
++
+ 	switch (ios->timing) {
+-	case MMC_TIMING_LEGACY:
+ 	case MMC_TIMING_MMC_HS:
++		if (host->data->mmc_hs_resampling) {
++			/* SC2 uses the source-clock sampler in MMC high-speed mode. */
++			val = readl(host->regs + host->data->adjust);
++			val &= ~ADJUST_ADJ_DELAY_MASK;
++			val |= ADJUST_ADJ_EN;
++			writel(val, host->regs + host->data->adjust);
++			break;
++		}
++		fallthrough;
++	case MMC_TIMING_LEGACY:
+ 	case MMC_TIMING_SD_HS:
+ 	case MMC_TIMING_MMC_DDR52:
+ 		meson_mmc_disable_resampling(host);
+@@ -1407,12 +1419,22 @@ static const struct meson_mmc_data meson_axg_data = {
+ 	.irq_sdio_sleep	= CLK_V3_IRQ_SDIO_SLEEP,
+ };
+ 
++static const struct meson_mmc_data meson_sc2_data = {
++	.tx_delay_mask	= CLK_V3_TX_DELAY_MASK,
++	.rx_delay_mask	= CLK_V3_RX_DELAY_MASK,
++	.always_on	= CLK_V3_ALWAYS_ON,
++	.adjust		= SD_EMMC_V3_ADJUST,
++	.irq_sdio_sleep	= CLK_V3_IRQ_SDIO_SLEEP,
++	.mmc_hs_resampling = true,
++};
++
+ static const struct of_device_id meson_mmc_of_match[] = {
+ 	{ .compatible = "amlogic,meson-gx-mmc",		.data = &meson_gx_data },
+ 	{ .compatible = "amlogic,meson-gxbb-mmc", 	.data = &meson_gx_data },
+ 	{ .compatible = "amlogic,meson-gxl-mmc",	.data = &meson_gx_data },
+ 	{ .compatible = "amlogic,meson-gxm-mmc",	.data = &meson_gx_data },
+ 	{ .compatible = "amlogic,meson-axg-mmc",	.data = &meson_axg_data },
++	{ .compatible = "amlogic,meson-sc2-mmc",	.data = &meson_sc2_data },
+ 	{}
+ };
+ MODULE_DEVICE_TABLE(of, meson_mmc_of_match);

@@ -1,0 +1,139 @@
+From 9a163067147f538a618b495ca530b20334132817 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Wed, 21 Oct 2026 01:06:35 +0800
+Subject: [PATCH] mmc: meson-gx: Capture the first IRQ error before
+ acknowledgement
+
+Retain one immutable diagnostic snapshot per host lifetime before IRQ
+acknowledgement or descriptor stop can change controller evidence.
+Capture command, raw response registers, ios, actual clock and safe
+controller-owned CFG/CLOCK/ADJUST/status without allocation or CCF calls.
+
+Emit the bounded block from the existing IRQF_ONESHOT thread. Keep CRC
+before timeout precedence, request completion and all board policy.
+There is no opcode filter, latch reset, retry, tuning or error suppression.
+A normal discovery timeout can consume the one-shot; full UART logs are
+still required and this diagnostic does not fix the observed eMMC -84.
+
+
+---
+ drivers/mmc/host/meson-gx-mmc.c | 78 +++++++++++++++++++++++++++++++++
+ 1 file changed, 78 insertions(+)
+
+diff --git a/drivers/mmc/host/meson-gx-mmc.c b/drivers/mmc/host/meson-gx-mmc.c
+index a16afe826c289dcc0588080bbb811cfd9ff6d5af..180f243e82a64125426a4f970fbd77aca47a6eee 100644
+--- a/drivers/mmc/host/meson-gx-mmc.c
++++ b/drivers/mmc/host/meson-gx-mmc.c
+@@ -148,6 +148,24 @@ struct sd_emmc_desc {
+ 	u32 cmd_resp;
+ };
+ 
++/* One immutable, pre-acknowledgement snapshot per host lifetime. */
++struct meson_mmc_error_snapshot {
++	bool captured;
++	bool pending;
++	u32 opcode;
++	u32 arg;
++	u32 flags;
++	u32 resp[4];
++	int cmd_error;
++	int data_error;
++	struct mmc_ios ios;
++	unsigned int actual_clock;
++	u32 raw_status;
++	u32 cfg;
++	u32 clock;
++	u32 adjust;
++};
++
+ struct meson_host {
+ 	struct	device		*dev;
+ 	const struct meson_mmc_data *data;
+@@ -175,6 +193,7 @@ struct meson_host {
+ 	int irq;
+ 
+ 	bool needs_pre_post_req;
++	struct meson_mmc_error_snapshot first_error;
+ 
+ 	spinlock_t lock;
+ };
+@@ -928,6 +947,61 @@ static void __meson_mmc_enable_sdio_irq(struct mmc_host *mmc, int enable)
+ 	writel(reg_irqen, host->regs + SD_EMMC_IRQ_EN);
+ }
+ 
++static void meson_mmc_capture_error(struct meson_host *host, u32 status,
++				    u32 raw_status)
++{
++	struct meson_mmc_error_snapshot *s = &host->first_error;
++	struct mmc_command *cmd = host->cmd;
++
++	if (s->captured || !cmd || !(status & (IRQ_CRC_ERR | IRQ_TIMEOUTS)))
++		return;
++
++	/* Only controller-owned, non-destructive registers are read here. */
++	s->raw_status = raw_status;
++	s->cfg = readl(host->regs + SD_EMMC_CFG);
++	s->clock = readl(host->regs + SD_EMMC_CLOCK);
++	s->adjust = readl(host->regs + host->data->adjust);
++	s->resp[0] = readl(host->regs + SD_EMMC_CMD_RSP);
++	s->resp[1] = readl(host->regs + SD_EMMC_CMD_RSP1);
++	s->resp[2] = readl(host->regs + SD_EMMC_CMD_RSP2);
++	s->resp[3] = readl(host->regs + SD_EMMC_CMD_RSP3);
++	s->opcode = cmd->opcode;
++	s->arg = cmd->arg;
++	s->flags = cmd->flags;
++	/* Match the IRQ handler's CRC-before-timeout error precedence. */
++	s->cmd_error = status & IRQ_CRC_ERR ? -EILSEQ : -ETIMEDOUT;
++	s->data_error = cmd->data ? cmd->data->error : 0;
++	s->ios = host->mmc->ios;
++	s->actual_clock = host->mmc->actual_clock;
++	s->captured = true;
++	s->pending = true;
++}
++
++static void meson_mmc_report_error(struct meson_host *host)
++{
++	struct meson_mmc_error_snapshot *s = &host->first_error;
++
++	if (!s->pending)
++		return;
++	s->pending = false;
++
++	/* IRQF_ONESHOT keeps the snapshot stable until this thread returns. */
++	dev_err(host->dev,
++		"%s first IRQ error: opcode=%u arg=%08x flags=%08x cmd_error=%d data_error=%d\n",
++		mmc_hostname(host->mmc), s->opcode, s->arg, s->flags,
++		s->cmd_error, s->data_error);
++	/* Raw response registers, not a valid card response on every error. */
++	dev_err(host->dev,
++		"first IRQ error: rsp_regs[0..3]=%08x %08x %08x %08x raw_irq=%08x cfg=%08x clock=%08x adjust=%08x\n",
++		s->resp[0], s->resp[1], s->resp[2], s->resp[3],
++		s->raw_status, s->cfg, s->clock, s->adjust);
++	dev_err(host->dev,
++		"first IRQ error: timing=%u bus_width=%u power_mode=%u signal_voltage=%u vdd=%u requested_clock=%u actual_clock=%u\n",
++		s->ios.timing, s->ios.bus_width, s->ios.power_mode,
++		s->ios.signal_voltage, s->ios.vdd, s->ios.clock,
++		s->actual_clock);
++}
++
+ static irqreturn_t meson_mmc_irq(int irq, void *dev_id)
+ {
+ 	struct meson_host *host = dev_id;
+@@ -947,6 +1021,8 @@ static irqreturn_t meson_mmc_irq(int irq, void *dev_id)
+ 		return IRQ_NONE;
+ 	}
+ 
++	meson_mmc_capture_error(host, status, raw_status);
++
+ 	/* ack all raised interrupts */
+ 	writel(status, host->regs + SD_EMMC_STATUS);
+ 
+@@ -1030,6 +1106,8 @@ static irqreturn_t meson_mmc_irq_thread(int irq, void *dev_id)
+ 	if (WARN_ON(!cmd))
+ 		return IRQ_NONE;
+ 
++	meson_mmc_report_error(host);
++
+ 	if (cmd->error) {
+ 		meson_mmc_wait_desc_stop(host);
+ 		meson_mmc_request_done(host->mmc, cmd->mrq);

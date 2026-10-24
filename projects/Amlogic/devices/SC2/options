@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: GPL-2.0
+# Minimal HK1 RBOX X4 / S905X4 (SC2), using the original vendor boot firmware.
+
+[ "${TARGET_ARCH}" = "aarch64" ] || die "SC2 requires ARCH=aarch64"
+TARGET_CPU="cortex-a55"
+TARGET_CPU_FLAGS="+crc+fp+simd"
+LINUX="amlogic-sc2"
+
+# Script-only boot: no U-Boot/FIP binary, environment installer, or internal install.
+BOOTLOADER="u-boot-script"
+UBOOT_FIRMWARE=""
+UBOOT_SYSTEM=""
+KERNEL_TARGET="uImage"
+KERNEL_UIMAGE_LOADADDR="0x02000000"
+KERNEL_UIMAGE_ENTRYADDR="0x02000000"
+KERNEL_MAKE_EXTRACMD="amlogic/meson-sc2-hk1-rbox-x4.dtb"
+# Use the vendor UART for the kernel and diagnostic consoles.
+EXTRA_CMDLINE="console=ttyAML0,921600n8 earlycon ssh"
+DEBUG_TTY="/dev/ttyAML0"
+SERIAL_CONSOLE="ttyAML0"
+INITRAMFS_DEBUG_SHELL="no"
+OPENGL="no"
+OPENGLES="mesa"
+KODIPLAYER_DRIVER="$OPENGLES"
+VULKAN="no"
+GRAPHIC_DRIVERS="panfrost"
+
+# Share the aarch64 Kodi user-space add-ons, as AMLGX does.
+ADDON_PROJECT="ARMv8"
+
+DISPLAYSERVER="no"
+WINDOWMANAGER="no"
+ALSA_SUPPORT="yes"
+PULSEAUDIO_SUPPORT="no"
+KODI_PULSEAUDIO_SUPPORT="no"
+PIPEWIRE_SUPPORT="no"
+BLUETOOTH_SUPPORT="yes"
+REMOTE_SUPPORT="no"
+JOYSTICK_SUPPORT="no"
+CEC_SUPPORT="yes"
+CEC_FRAMEWORK_SUPPORT="yes"
+ESPEAK_SUPPORT="no"
+SAMBA_SUPPORT="no"
+SAMBA_SERVER="no"
+NFS_SUPPORT="no"
+OPENVPN_SUPPORT="no"
+WIREGUARD_SUPPORT="no"
+ISCSI_SUPPORT="no"
+UDEVIL="no"
+INSTALLER_SUPPORT="no"
+OEM_SUPPORT="no"
+SFTP_SERVER="yes"
+
+# Native kernel modules and a small firmware set; no AMLGX out-of-tree drivers.
+FIRMWARE="kernel-firmware bcm4335c0-firmware"
+ADDITIONAL_DRIVERS=""
+ADDITIONAL_PACKAGES="dtc ethtool pciutils usbutils strace memtester nano v4l-utils alsa-utils libdrm kmscube glmark2 hk1-panel sc2-optee-preload"

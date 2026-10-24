@@ -1,0 +1,18 @@
+From bc2d785d9827e8ae496f4162d0b6eedfac3b8761 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Thu, 22 Oct 2026 02:40:05 +0800
+Subject: [PATCH] arm64: dts: amlogic: select SC2 secure-monitor video ABI
+
+---
+ arch/arm64/boot/dts/amlogic/meson-sc2.dtsi | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi b/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi
+index 1ee2def0c5f669ea39face3bf97197c76eb2ba0e..a6777d5805d4f679b770873f751468a7976a7f41 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi
++++ b/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi
+@@ -112,3 +112,3 @@ firmware {
+ 		sm: secure-monitor {
+-			compatible = "amlogic,meson-gxbb-sm";
++			compatible = "amlogic,meson-sc2-sm", "amlogic,meson-gxbb-sm";
+ 

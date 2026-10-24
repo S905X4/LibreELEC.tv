@@ -1,0 +1,47 @@
+From 0e17edda193d3a3dc19550f7165f3e23eb3d301f Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Tue, 20 Oct 2026 14:17:39 +0800
+Subject: [PATCH] arm64: dts: amlogic: Own the SC2 SDIO functional clock
+
+SDIO A currently connects its local clkin0 directly to XTAL, bypassing
+ownership of the external mux, divider and functional gate. The other
+SC2 MMC controllers already consume their external functional clocks.
+
+Stock 5.4.125 disassembly shows its local divider using mux1, the
+external functional gate, and selecting XTAL through mux0 before
+requesting 400 kHz. CE, Khadas and hkallweit independently describe the
+same topology. The direct-XTAL declaration cannot own that gate or
+normalize its inherited parent and divider configuration.
+
+Connect clkin0 to SD_EMMC_A_CLK and assign its external mux to XTAL and
+its functional clock to 24 MHz. Reuse the B/C DT convention; leave the
+host driver, PWM sequencing, voltages and board capabilities unchanged.
+Do not copy the downstream raw-register clear: its DT resource differs
+from the CCF provider register.
+
+
+---
+ arch/arm64/boot/dts/amlogic/meson-sc2.dtsi | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi b/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi
+index 05abf9eef7d89989d876143e0ee5e9d5f0042ae7..23735b1ab68940e7b05fd57544c40bef30132541 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi
++++ b/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi
+@@ -464,9 +464,14 @@ sd_emmc_a: mmc@fe088000 {
+ 			compatible = "amlogic,meson-axg-mmc";
+ 			reg = <0 0xfe088000 0 0x800>;
+ 			interrupts = <GIC_SPI 176 IRQ_TYPE_LEVEL_HIGH>;
+-			clocks = <&clkc CLKID_SD_EMMC_A>, <&xtal>,
+-				 <&clkc CLKID_FCLK_DIV2>;
++			clocks = <&clkc CLKID_SD_EMMC_A>,
++				 <&clkc CLKID_SD_EMMC_A_CLK>, <&clkc CLKID_FCLK_DIV2>;
+ 			clock-names = "core", "clkin0", "clkin1";
++			/* Initial identification needs the 24MHz parent, not fclk. */
++			assigned-clocks = <&clkc CLKID_SD_EMMC_A_CLK_MUX>,
++					  <&clkc CLKID_SD_EMMC_A_CLK>;
++			assigned-clock-parents = <&xtal>;
++			assigned-clock-rates = <0>, <24000000>;
+ 			resets = <&reset RESET_SD_EMMC_A>;
+ 			#address-cells = <1>;
+ 			#size-cells = <0>;

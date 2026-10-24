@@ -1,0 +1,33 @@
+From dad8074c7292d9f5a3c9be19f8e23581bbe01b20 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Thu, 22 Oct 2026 15:19:58 +0800
+Subject: [PATCH] arm64: dts: amlogic: Reserve HK1 video CMA for 4K decoding
+
+The real 3840x2160 Main10 stream requests sixteen CAPTURE objects,
+exceeding the generic 256 MiB pool before reference metadata and scanout.
+
+Reserve 512 MiB only on this 4 GiB board. Keep firmware reservations and
+the generic SC2 default unchanged; do not reduce the codec DPB request.
+The associated native HTSP playback run is recorded separately.
+
+---
+ arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts b/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
+index 5126423352f30e45bbfe78d3244ed7a397ffbdbc..26747402a7993b2c4b8cb855bdd5ef00e814ce53 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
++++ b/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
+@@ -45,6 +45,12 @@ memory@0 {
+ 		reg = <0 0 0 0xf0000000>;
+ 	};
+ 
++	reserved-memory {
++		linux,cma {
++			size = <0x0 0x20000000>;
++		};
++	};
++
+ 	leds {
+ 		compatible = "gpio-leds";
+ 

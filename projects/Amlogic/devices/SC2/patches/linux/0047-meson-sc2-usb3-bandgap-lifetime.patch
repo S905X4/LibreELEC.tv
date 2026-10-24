@@ -1,0 +1,97 @@
+From e385f754bb85d6e0b8e8be6847cd09b12273ec7f Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Wed, 21 Oct 2026 02:55:27 +0800
+Subject: [PATCH] phy: amlogic: Defer the SC2 bandgap gate until lane
+ initialization
+
+The SC2 bandgap gate is parented by pcie_pll. Enabling it during
+probe can start that PLL before USB3 lane selection, bypassing the
+reference-clock deferral introduced for the same ordering constraint.
+
+Acquire the gate without enabling it, then enable it after the
+reference clock in init. Release it before the reference on analog
+initialization failure and exit, and unwind reference-clock ownership
+when the bandgap enable fails. Preserve G12A managed-clock lifetime,
+PCIe mode selection, USB2 behavior and all analog tuning.
+
+Analog I/O is modeled; SuperSpeed transfer support is outside this change.
+
+---
+ .../phy/amlogic/phy-meson-g12a-usb3-pcie.c    | 24 +++++++++++++------
+ 1 file changed, 17 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/phy/amlogic/phy-meson-g12a-usb3-pcie.c b/drivers/phy/amlogic/phy-meson-g12a-usb3-pcie.c
+index e1e204b89627..d29df54a7ff0 100644
+--- a/drivers/phy/amlogic/phy-meson-g12a-usb3-pcie.c
++++ b/drivers/phy/amlogic/phy-meson-g12a-usb3-pcie.c
+@@ -61,6 +61,7 @@ struct phy_g12a_usb3_pcie_priv {
+ 	struct regmap		*regmap;
+ 	struct regmap		*regmap_cr;
+ 	struct clk		*clk_ref;
++	struct clk		*clk_bgp;
+ 	struct reset_control	*reset;
+ 	struct phy		*phy;
+ 	unsigned int		mode;
+@@ -365,14 +366,22 @@ static int phy_g12a_usb3_pcie_init(struct phy *phy)
+ 		ret = clk_prepare_enable(priv->clk_ref);
+ 		if (ret)
+ 			return ret;
++
++		ret = clk_prepare_enable(priv->clk_bgp);
++		if (ret) {
++			clk_disable_unprepare(priv->clk_ref);
++			return ret;
++		}
+ 	}
+ 
+ 	if (priv->mode != PHY_TYPE_USB3)
+ 		return 0;
+ 
+ 	ret = phy_g12a_usb3_init(phy);
+-	if (ret && priv->soc_id == MESON_USB3_PCIE_SC2)
++	if (ret && priv->soc_id == MESON_USB3_PCIE_SC2) {
++		clk_disable_unprepare(priv->clk_bgp);
+ 		clk_disable_unprepare(priv->clk_ref);
++	}
+ 
+ 	return ret;
+ }
+@@ -385,8 +394,10 @@ static int phy_g12a_usb3_pcie_exit(struct phy *phy)
+ 	if (priv->mode == PHY_TYPE_USB3)
+ 		ret = reset_control_reset(priv->reset);
+ 
+-	if (priv->soc_id == MESON_USB3_PCIE_SC2)
++	if (priv->soc_id == MESON_USB3_PCIE_SC2) {
++		clk_disable_unprepare(priv->clk_bgp);
+ 		clk_disable_unprepare(priv->clk_ref);
++	}
+ 
+ 	return ret;
+ }
+@@ -429,7 +440,6 @@ static int phy_g12a_usb3_pcie_probe(struct platform_device *pdev)
+ 	struct device_node *np = dev->of_node;
+ 	struct phy_g12a_usb3_pcie_priv *priv;
+ 	struct phy_provider *phy_provider;
+-	struct clk *clk_bgp;
+ 	void __iomem *base;
+ 
+ 	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
+@@ -460,11 +470,11 @@ static int phy_g12a_usb3_pcie_probe(struct platform_device *pdev)
+ 	if (IS_ERR(priv->clk_ref))
+ 		return PTR_ERR(priv->clk_ref);
+ 
+-	/* SC2 has a separately gated analog bandgap reference. */
++	/* Defer bgp too: enabling it also starts its PLL parent. */
+ 	if (priv->soc_id == MESON_USB3_PCIE_SC2) {
+-		clk_bgp = devm_clk_get_enabled(dev, "bgp");
+-		if (IS_ERR(clk_bgp))
+-			return PTR_ERR(clk_bgp);
++		priv->clk_bgp = devm_clk_get(dev, "bgp");
++		if (IS_ERR(priv->clk_bgp))
++			return PTR_ERR(priv->clk_bgp);
+ 	}
+ 
+ 	priv->reset = devm_reset_control_array_get_exclusive(dev);
+-- 
+2.47.3
+

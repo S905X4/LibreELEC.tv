@@ -1,0 +1,411 @@
+Subject: [PATCH] avcodec: SC2 stateful VP9/AVS2 and depth-correct scatter DRM PRIME
+
+Register AVS2 in the actual configure, codec and object tables and split VP9
+superframes before handing complete coded frames to the stateful decoder.
+The AVS2 fourcc and AMF8/AMF0 capture formats are the SC2-specific downstream
+ABI; the AMF formats are not upstream-assigned.
+
+Preserve negotiated compressed fourccs rather than round-tripping logical
+YUV through a linear format. Export the actual decoder-owned object size,
+fd and dequeued header offset. AMF8 is eight-bit scatter with MEM_SAVING;
+AMF0 is ten-bit scatter without MEM_SAVING. Both use the negotiated aligned
+width as DRM pitch; neither is CPU-linear YUV. Existing Request decoders,
+including their AMF0 path, are not modified.
+
+Validate FBC sizes using negotiated padded capture geometry, and reallocate
+native surfaces when actual depth, allocation layout or unpadded COMPOSE
+dimensions change, even when the padded capture dimensions remain equal.
+
+An optional video_device decoder option lets Kodi pin its capability-probed
+native node; the existing autodetection remains the default.
+
+--- a/configure
++++ b/configure
+@@ -3271,6 +3271,9 @@
+ vp9_qsv_encoder_deps="libmfx MFX_CODEC_VP9"
+ vp9_qsv_encoder_select="qsvenc"
+ vp9_v4l2m2m_decoder_deps="v4l2_m2m vp9_v4l2_m2m"
++vp9_v4l2m2m_decoder_select="vp9_superframe_split_bsf"
++avs2_v4l2m2m_decoder_deps="v4l2_m2m"
++avs2_v4l2m2m_decoder_select="avs2_parser"
+ wmv3_crystalhd_decoder_select="crystalhd"
+ av1_qsv_decoder_select="qsvdec"
+ av1_qsv_encoder_select="qsvenc"
+--- a/libavcodec/Makefile
++++ b/libavcodec/Makefile
+@@ -261,6 +261,7 @@
+ OBJS-$(CONFIG_AVRN_DECODER)            += avrndec.o
+ OBJS-$(CONFIG_AVRP_DECODER)            += r210dec.o
+ OBJS-$(CONFIG_AVRP_ENCODER)            += r210enc.o
++OBJS-$(CONFIG_AVS2_V4L2M2M_DECODER)    += v4l2_m2m_dec.o
+ OBJS-$(CONFIG_AVS_DECODER)             += avs.o
+ OBJS-$(CONFIG_AVUI_DECODER)            += avuidec.o
+ OBJS-$(CONFIG_AVUI_ENCODER)            += avuienc.o
+--- a/libavcodec/allcodecs.c
++++ b/libavcodec/allcodecs.c
+@@ -59,6 +59,7 @@
+ extern const FFCodec ff_avrp_decoder;
+ extern const FFCodec ff_avrn_decoder;
+ extern const FFCodec ff_avs_decoder;
++extern const FFCodec ff_avs2_v4l2m2m_decoder;
+ extern const FFCodec ff_avui_encoder;
+ extern const FFCodec ff_avui_decoder;
+ #if FF_API_AYUV_CODECID
+--- a/libavcodec/v4l2_fmt.h
++++ b/libavcodec/v4l2_fmt.h
+@@ -25,8 +25,26 @@
+ #define AVCODEC_V4L2_FMT_H
+ 
+ #include <stdint.h>
++#include <linux/videodev2.h>
+ #include "libavutil/pixfmt.h"
+ #include "codec_id.h"
++
++/* SC2-specific downstream capture ABI. These formats describe compressed, not CPU-linear data. */
++#ifndef V4L2_PIX_FMT_AMLOGIC_FBC8
++#define V4L2_PIX_FMT_AMLOGIC_FBC8 v4l2_fourcc('A', 'M', 'F', '8')
++#endif
++#ifndef V4L2_PIX_FMT_AMLOGIC_FBC10
++#define V4L2_PIX_FMT_AMLOGIC_FBC10 v4l2_fourcc('A', 'M', 'F', '0')
++#endif
++#ifndef V4L2_PIX_FMT_AVS2
++#define V4L2_PIX_FMT_AVS2 v4l2_fourcc('A', 'V', 'S', '2')
++#endif
++
++static inline int ff_v4l2_format_is_amlogic_fbc(uint32_t fourcc)
++{
++    return fourcc == V4L2_PIX_FMT_AMLOGIC_FBC8 ||
++           fourcc == V4L2_PIX_FMT_AMLOGIC_FBC10;
++}
+ 
+ enum AVPixelFormat ff_v4l2_format_v4l2_to_avfmt(uint32_t v4l2_fmt, enum AVCodecID avcodec);
+ uint32_t ff_v4l2_format_avcodec_to_v4l2(enum AVCodecID avcodec);
+--- a/libavcodec/v4l2_fmt.c
++++ b/libavcodec/v4l2_fmt.c
+@@ -109,12 +109,16 @@
+ #ifdef V4L2_PIX_FMT_VP9
+     { AV_FMT(NONE),        AV_CODEC(VP9),         V4L2_FMT(VP9) },
+ #endif
++    { AV_FMT(NONE),        AV_CODEC(AVS2),        V4L2_FMT(AVS2) },
+ #ifdef V4L2_PIX_FMT_HEVC
+     { AV_FMT(NONE),        AV_CODEC(HEVC),        V4L2_FMT(HEVC) },
+ #endif
+ #ifdef V4L2_PIX_FMT_VC1_ANNEX_G
+     { AV_FMT(NONE),        AV_CODEC(VC1),         V4L2_FMT(VC1_ANNEX_G) },
+ #endif
++    /* Keep linear entries first for avfmt -> V4L2 conversion. */
++    { AV_FMT(YUV420P),     AV_CODEC(RAWVIDEO),    V4L2_FMT(AMLOGIC_FBC8) },
++    { AV_FMT(YUV420P10LE), AV_CODEC(RAWVIDEO),    V4L2_FMT(AMLOGIC_FBC10) },
+ };
+ 
+ uint32_t ff_v4l2_format_avcodec_to_v4l2(enum AVCodecID avcodec)
+--- a/libavcodec/v4l2_context.c
++++ b/libavcodec/v4l2_context.c
+@@ -243,6 +243,18 @@
+             fmt1->fmt.pix.width != fmt2->fmt.pix.width ||
+             fmt1->fmt.pix.height != fmt2->fmt.pix.height);
+ 
++    if (ff_v4l2_format_is_amlogic_fbc(ff_v4l2_get_format_pixelformat(fmt1)) ||
++        ff_v4l2_format_is_amlogic_fbc(ff_v4l2_get_format_pixelformat(fmt2))) {
++        if (!V4L2_TYPE_IS_MULTIPLANAR(fmt1->type) ||
++            !V4L2_TYPE_IS_MULTIPLANAR(fmt2->type))
++            return 1;
++        /* Equal padded geometry does not imply an equal FBC allocation/depth. */
++        ret |= fmt1->fmt.pix_mp.pixelformat != fmt2->fmt.pix_mp.pixelformat ||
++               fmt1->fmt.pix_mp.num_planes != fmt2->fmt.pix_mp.num_planes ||
++               fmt1->fmt.pix_mp.plane_fmt[0].sizeimage != fmt2->fmt.pix_mp.plane_fmt[0].sizeimage ||
++               fmt1->fmt.pix_mp.plane_fmt[0].bytesperline != fmt2->fmt.pix_mp.plane_fmt[0].bytesperline;
++    }
++
+     if (ret)
+         av_log(logger(ctx), AV_LOG_DEBUG, "V4L2 %s changed: alloc=%d (%dx%d) -> (%dx%d)\n",
+             ctx->name,
+@@ -329,6 +341,7 @@
+     int ret;
+     int reinit;
+     struct v4l2_format cap_fmt = s->capture.format;
++    const struct v4l2_rect old_selection = s->capture.selection;
+ 
+     s->capture.done = 0;
+ 
+@@ -341,6 +354,14 @@
+     get_default_selection(&s->capture, &s->capture.selection);
+ 
+     reinit = ctx_resolution_changed(&s->capture, &cap_fmt);
++    if (ff_v4l2_format_is_amlogic_fbc(ff_v4l2_get_format_pixelformat(&s->capture.format)) ||
++        ff_v4l2_format_is_amlogic_fbc(ff_v4l2_get_format_pixelformat(&cap_fmt))) {
++        /* Native surfaces are also bound to the unpadded coded dimensions. */
++        reinit |= old_selection.width != s->capture.selection.width ||
++                  old_selection.height != s->capture.selection.height ||
++                  old_selection.left != s->capture.selection.left ||
++                  old_selection.top != s->capture.selection.top;
++    }
+     if ((s->quirks & FF_V4L2_QUIRK_REINIT_ALWAYS) != 0)
+         reinit = 1;
+ 
+@@ -784,7 +805,11 @@
+     uint32_t v4l2_fmt;
+     int ret;
+ 
+-    v4l2_fmt = ff_v4l2_format_avfmt_to_v4l2(pixfmt);
++    v4l2_fmt = ff_v4l2_get_format_pixelformat(fmt);
++    /* A logical YUV format must not turn a negotiated scatter buffer linear. */
++    if (!ff_v4l2_format_is_amlogic_fbc(v4l2_fmt) ||
++        ff_v4l2_format_v4l2_to_avfmt(v4l2_fmt, AV_CODEC_ID_RAWVIDEO) != pixfmt)
++        v4l2_fmt = ff_v4l2_format_avfmt_to_v4l2(pixfmt);
+     if (!v4l2_fmt)
+         return AVERROR(EINVAL);
+ 
+@@ -815,8 +840,14 @@
+ 
+     if (pixfmt != AV_PIX_FMT_NONE) {
+         ret = v4l2_try_raw_format(ctx, pixfmt);
+-        if (!ret)
++        if (!ret) {
++            const uint32_t fourcc = ff_v4l2_get_format_pixelformat(&ctx->format);
++            if (ff_v4l2_format_is_amlogic_fbc(fourcc))
++                *p = ff_v4l2_format_v4l2_to_avfmt(fourcc, AV_CODEC_ID_RAWVIDEO);
++            else
++                *p = pixfmt;
+             return 0;
++        }
+     }
+ 
+     for (;; ++fdesc.index) {
+@@ -824,15 +855,23 @@
+         if (ret)
+             return AVERROR(EINVAL);
+ 
+-        if (priv->pix_fmt != AV_PIX_FMT_NONE) {
+-            if (fdesc.pixelformat != ff_v4l2_format_avfmt_to_v4l2(priv->pix_fmt))
++        pixfmt = ff_v4l2_format_v4l2_to_avfmt(fdesc.pixelformat, AV_CODEC_ID_RAWVIDEO);
++        if (priv->pix_fmt != AV_PIX_FMT_NONE &&
++            fdesc.pixelformat != ff_v4l2_format_avfmt_to_v4l2(priv->pix_fmt) &&
++            !(ff_v4l2_format_is_amlogic_fbc(fdesc.pixelformat) && pixfmt == priv->pix_fmt))
++            continue;
++
++        if (ff_v4l2_format_is_amlogic_fbc(fdesc.pixelformat)) {
++            if (!V4L2_TYPE_IS_MULTIPLANAR(ctx->type))
+                 continue;
+-        }
+-
+-        pixfmt = ff_v4l2_format_v4l2_to_avfmt(fdesc.pixelformat, AV_CODEC_ID_RAWVIDEO);
++            ctx->format.type = ctx->type;
++            ctx->format.fmt.pix_mp.pixelformat = fdesc.pixelformat;
++        }
+         ret = v4l2_try_raw_format(ctx, pixfmt);
+         if (ret == 0) {
+-            *p = pixfmt;
++            const uint32_t fourcc = ff_v4l2_get_format_pixelformat(&ctx->format);
++            *p = ff_v4l2_format_is_amlogic_fbc(fourcc) ?
++                ff_v4l2_format_v4l2_to_avfmt(fourcc, AV_CODEC_ID_RAWVIDEO) : pixfmt;
+             return 0;
+         }
+     }
+@@ -1288,6 +1327,16 @@
+         goto fail_unlock;
+     }
+ 
++    if (V4L2_TYPE_IS_CAPTURE(ctx->type) &&
++        ff_v4l2_format_is_amlogic_fbc(ff_v4l2_get_format_pixelformat(&ctx->format))) {
++        if (!s->output_drm) {
++            ret = AVERROR(ENOSYS);
++            goto fail_unlock;
++        }
++        /* The scatter PFNs belong to the complete decoder-exported allocation. */
++        ctx->buf_mem = V4L2_MEMORY_MMAP;
++    }
++
+     memset(&qctrl, 0, sizeof(qctrl));
+     qctrl.id = V4L2_CID_MIN_BUFFERS_FOR_OUTPUT;
+     if (ioctl(s->fd, VIDIOC_QUERYCTRL, &qctrl) != 0) {
+--- a/libavcodec/v4l2_buffers.c
++++ b/libavcodec/v4l2_buffers.c
+@@ -34,6 +34,7 @@
+ #include "libavutil/pixdesc.h"
+ #include "libavutil/hwcontext.h"
+ #include "v4l2_context.h"
++#include "v4l2_fmt.h"
+ #include "v4l2_buffers.h"
+ #include "v4l2_m2m.h"
+ #include "v4l2_req_dmabufs.h"
+@@ -389,6 +390,31 @@
+         layer->planes[i].pitch = avbuf->plane_info[i].bytesperline;
+     }
+ 
++    if (ff_v4l2_format_is_amlogic_fbc(
++            ff_v4l2_get_format_pixelformat(&avbuf->context->format))) {
++        const struct v4l2_format *fmt = &avbuf->context->format;
++        const uint32_t fourcc = ff_v4l2_get_format_pixelformat(fmt);
++        const unsigned int width = ff_v4l2_get_format_width(fmt);
++        const unsigned int height = ff_v4l2_get_format_height(fmt);
++        const unsigned int offset = avbuf->planes[0].data_offset;
++
++        if (!V4L2_TYPE_IS_MULTIPLANAR(fmt->type) || avbuf->num_planes != 1 ||
++            fmt->fmt.pix_mp.num_planes != 1 || avbuf->plane_info[0].bytesperline ||
++            !width || !height || (width & 63) || (height & 63) ||
++            offset >= drm_desc->objects[0].size)
++            return NULL;
++
++        drm_desc->objects[0].format_modifier = DRM_FORMAT_MOD_AMLOGIC_FBC(
++            AMLOGIC_FBC_LAYOUT_SCATTER,
++            fourcc == V4L2_PIX_FMT_AMLOGIC_FBC8 ? AMLOGIC_FBC_OPTION_MEM_SAVING : 0);
++        layer->format = fourcc == V4L2_PIX_FMT_AMLOGIC_FBC8 ?
++            DRM_FORMAT_YUV420_8BIT : DRM_FORMAT_YUV420_10BIT;
++        /* One exported object includes the header and all PFN-addressed body pages. */
++        layer->planes[0].offset = offset;
++        layer->planes[0].pitch = width;
++        return (uint8_t *)drm_desc;
++    }
++
+     switch (avbuf->context->av_pix_fmt) {
+     case AV_PIX_FMT_0BGR:
+         layer->format = DRM_FORMAT_RGBX8888;
+@@ -525,7 +551,8 @@
+         int dma_fd = -1;
+         const uint32_t blen = ff_v4l2_buf_len(&avbuf->buf, i);
+ 
+-        if (s->db_ctl != NULL) {
++        if (s->db_ctl != NULL && !ff_v4l2_format_is_amlogic_fbc(
++                ff_v4l2_get_format_pixelformat(&avbuf->context->format))) {
+             if ((avbuf->dmabuf[i] = dmabuf_alloc(s->db_ctl, blen)) == NULL)
+                 return AVERROR(ENOMEM);
+             dma_fd = dmabuf_fd(avbuf->dmabuf[i]);
+@@ -599,6 +626,10 @@
+ {
+     int i;
+ 
++    if (!buf_to_m2mctx(avbuf)->output_drm && ff_v4l2_format_is_amlogic_fbc(
++            ff_v4l2_get_format_pixelformat(&avbuf->context->format)))
++        return AVERROR(ENOSYS);
++
+     frame->format = avbuf->context->av_pix_fmt;
+ 
+     frame->buf[0] = wrap_avbuf(avbuf);
+@@ -612,6 +643,8 @@
+             return rv;
+ 
+         frame->data[0] = (uint8_t *) v4l2_get_drm_frame(avbuf);
++        if (!frame->data[0])
++            return AVERROR(EINVAL);
+         frame->format = AV_PIX_FMT_DRM_PRIME;
+         frame->hw_frames_ctx = av_buffer_ref(avbuf->context->frames_ref);
+         return 0;
+--- a/libavcodec/v4l2_m2m.h
++++ b/libavcodec/v4l2_m2m.h
+@@ -140,6 +140,7 @@
+     int num_output_buffers;
+     int num_capture_buffers;
+     const char * dmabuf_alloc;
++    const char * video_device;
+     enum AVPixelFormat pix_fmt;
+ } V4L2m2mPriv;
+ 
+--- a/libavcodec/v4l2_m2m.c
++++ b/libavcodec/v4l2_m2m.c
+@@ -29,6 +29,7 @@
+ #include <fcntl.h>
+ #include "libavcodec/avcodec.h"
+ #include "libavutil/pixdesc.h"
++#include "libavutil/avstring.h"
+ #include "libavutil/imgutils.h"
+ #include "libavutil/pixfmt.h"
+ #include "v4l2_context.h"
+@@ -365,6 +366,15 @@
+ 
+     V4L2m2mContext *s = priv->context;
+ 
++    if (priv->video_device && *priv->video_device) {
++        if (av_strlcpy(s->devname, priv->video_device, sizeof(s->devname)) >= sizeof(s->devname))
++            return AVERROR(ENAMETOOLONG);
++        ret = v4l2_probe_driver(s);
++        if (ret)
++            return ret;
++        return v4l2_configure_contexts(s);
++    }
++
+     dirp = opendir("/dev");
+     if (!dirp)
+         return AVERROR(errno);
+--- a/libavcodec/v4l2_m2m_dec.c
++++ b/libavcodec/v4l2_m2m_dec.c
+@@ -876,8 +876,8 @@
+ check_size(AVCodecContext * const avctx, V4L2m2mContext * const s, const uint32_t fcc)
+ {
+     unsigned int i;
+-    const uint32_t w = avctx->coded_width;
+-    const uint32_t h = avctx->coded_height;
++    uint32_t w = avctx->coded_width;
++    uint32_t h = avctx->coded_height;
+ 
+     if (w == 0 || h == 0 || fcc == 0) {
+         av_log(avctx, AV_LOG_TRACE, "%s: Size %dx%d or fcc %s empty\n", __func__, w, h, av_fourcc2str(fcc));
+@@ -886,6 +886,27 @@
+     if ((s->quirks & FF_V4L2_QUIRK_ENUM_FRAMESIZES_BROKEN) != 0) {
+         av_log(avctx, AV_LOG_TRACE, "%s: Skipped (quirk): Size %dx%d, fcc %s\n", __func__, w, h, av_fourcc2str(fcc));
+         return 0;
++    }
++
++    if (ff_v4l2_format_is_amlogic_fbc(fcc)) {
++        struct v4l2_format fmt = {.type = s->capture.type};
++        int ret;
++
++        if (!V4L2_TYPE_IS_MULTIPLANAR(fmt.type))
++            return AVERROR(EINVAL);
++        fmt.fmt.pix_mp.pixelformat = fcc;
++        fmt.fmt.pix_mp.width = w;
++        fmt.fmt.pix_mp.height = h;
++        ret = ioctl(s->fd, VIDIOC_TRY_FMT, &fmt);
++        if (ret < 0)
++            return AVERROR(errno);
++        if (fmt.fmt.pix_mp.pixelformat != fcc ||
++            fmt.fmt.pix_mp.width < w || fmt.fmt.pix_mp.height < h ||
++            (fmt.fmt.pix_mp.width & 63) || (fmt.fmt.pix_mp.height & 63))
++            return AVERROR(EINVAL);
++        /* ENUM_FRAMESIZES describes padded FBC storage, not visible samples. */
++        w = fmt.fmt.pix_mp.width;
++        h = fmt.fmt.pix_mp.height;
+     }
+ 
+     for (i = 0;; ++i) {
+@@ -1145,6 +1166,12 @@
+     // Get format converts capture.av_pix_fmt back into a V4L2 format in the context
+     if ((rv = ff_v4l2_context_get_format(&s->capture, 0)) != 0)
+         goto error;
++    if (!s->output_drm && ff_v4l2_format_is_amlogic_fbc(
++            ff_v4l2_get_format_pixelformat(&s->capture.format))) {
++        av_log(avctx, AV_LOG_ERROR, "Amlogic scatter FBC requires DRM PRIME output\n");
++        rv = AVERROR(ENOSYS);
++        goto error;
++    }
+     rv = ff_v4l2_context_set_format(&s->capture);
+ 
+ error:
+@@ -1193,6 +1220,11 @@
+     output->height = capture->height = 0;
+     output->width = capture->width = 0;
+ 
++    if (avctx->codec_id == AV_CODEC_ID_VP9 || avctx->codec_id == AV_CODEC_ID_AVS2) {
++        output->width = avctx->coded_width;
++        output->height = avctx->coded_height;
++    }
++
+     output->av_codec_id = avctx->codec_id;
+     output->av_pix_fmt  = AV_PIX_FMT_NONE;
+     output->min_buf_size = max_coded_size(avctx);
+@@ -1326,6 +1358,8 @@
+ 
+ static const AVOption options[] = {
+     V4L_M2M_DEFAULT_OPTS,
++    { "video_device", "V4L2 decoder device (otherwise autodetect)",
++        OFFSET(video_device), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS },
+     { "num_capture_buffers", "Number of buffers in the capture context",
+         OFFSET(num_capture_buffers), AV_OPT_TYPE_INT, {.i64 = 20}, 2, INT_MAX, FLAGS },
+     { "pixel_format", "Pixel format to be used by the decoder", OFFSET(pix_fmt), AV_OPT_TYPE_PIXEL_FMT, {.i64 = AV_PIX_FMT_NONE}, AV_PIX_FMT_NONE, AV_PIX_FMT_NB, FLAGS },
+@@ -1379,4 +1413,5 @@
+ M2MDEC(h263,  "H.263", AV_CODEC_ID_H263,       NULL);
+ M2MDEC(vc1 ,  "VC1",   AV_CODEC_ID_VC1,        NULL);
+ M2MDEC(vp8,   "VP8",   AV_CODEC_ID_VP8,        NULL);
+-M2MDEC(vp9,   "VP9",   AV_CODEC_ID_VP9,        NULL);
++M2MDEC(vp9,   "VP9",   AV_CODEC_ID_VP9,        "vp9_superframe_split");
++M2MDEC(avs2,  "AVS2",  AV_CODEC_ID_AVS2,       NULL);

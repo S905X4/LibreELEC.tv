@@ -1,0 +1,53 @@
+From 988e7b095ee00b9f0692f6eb81d4ebbf10280684 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Mon, 19 Oct 2026 21:33:03 +0800
+Subject: [PATCH] arm64: dts: amlogic: correct SC2 HDMI register banks
+
+The vendor DT labels the windows hdmitxdwc and hdmitxtop, but the
+HDMI driver maps them by index rather than those names. reg_ops.h
+selects index 3 for TOP and index 4 for DWC. reg_ops.c routes TOP
+word accesses through index 3 and DWC byte accesses through index 4.
+With the SC2 resource array this resolves TOP to fe308000 and DWC
+to fe300000, opposite to the misleading resource names.
+
+Correct the native DWC/TOP resource order and unit address. Update
+the binding description instead of retaining the reversed-map claim.
+---
+ .../devicetree/bindings/display/amlogic,meson-dw-hdmi.yaml    | 4 ++--
+ arch/arm64/boot/dts/amlogic/meson-sc2.dtsi                    | 4 ++--
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/display/amlogic,meson-dw-hdmi.yaml b/Documentation/devicetree/bindings/display/amlogic,meson-dw-hdmi.yaml
+index e3f9a1893eda..cd60631d8c05 100644
+--- a/Documentation/devicetree/bindings/display/amlogic,meson-dw-hdmi.yaml
++++ b/Documentation/devicetree/bindings/display/amlogic,meson-dw-hdmi.yaml
+@@ -68,8 +68,8 @@ description: |
+   audio source interfaces.
+ 
+   SC2 uses the HDMI 2.0 TMDS controller, not the HDMI 2.1 FRL controller.
+-  DWC and TOP have separate direct MMIO windows; TOP precedes DWC in the
+-  physical address map. The PHY and PLL are in ANACTRL, and the HDMI system
++  DWC and TOP have separate direct MMIO windows, with TOP 0x8000 bytes
++  above DWC. The PHY and PLL are in ANACTRL, and the HDMI system
+   and pixel clocks are in CLKCTRL. Resetting the video PLL divider is also
+   required on SC2. Its PHY analog settings differ from G12A.
+ 
+diff --git a/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi b/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi
+index 427cfd7e1641..5812163ecc47 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi
++++ b/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi
+@@ -237,9 +237,9 @@ hdmi_tx_out: endpoint {
+ 			};
+ 		};
+ 
+-		hdmi_tx: hdmi-tx@fe308000 {
++		hdmi_tx: hdmi-tx@fe300000 {
+ 			compatible = "amlogic,meson-sc2-dw-hdmi";
+-			reg = <0 0xfe308000 0 0x8000>, <0 0xfe300000 0 0x8000>;
++			reg = <0 0xfe300000 0 0x8000>, <0 0xfe308000 0 0x8000>;
+ 			reg-names = "dwc", "top";
+ 			interrupts = <GIC_SPI 204 IRQ_TYPE_EDGE_RISING>;
+ 			clocks = <&clkc CLKID_HDMI>, <&clkc CLKID_HDMITX_APB>,
+-- 
+2.47.3
+

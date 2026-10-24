@@ -1,0 +1,45 @@
+From 3bb6ca7ea70bfcfd6e5104604d19db6289931967 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Mon, 19 Oct 2026 20:33:27 +0800
+Subject: [PATCH] reset: amlogic: support the SC2 audio memory arbiter
+
+SC2 retains the SM1 audio arbiter request bit layout at fe330280,
+including the fourth TODDR/FRDDR request lines and global enable bit.
+Match its native compatible to that reset map and document the binding
+so SC2 DTS does not claim another SoC identity.
+
+
+---
+ .../devicetree/bindings/reset/amlogic,meson-axg-audio-arb.yaml | 1 +
+ drivers/reset/amlogic/reset-meson-audio-arb.c                  | 3 +++
+ 2 files changed, 4 insertions(+)
+
+diff --git a/Documentation/devicetree/bindings/reset/amlogic,meson-axg-audio-arb.yaml b/Documentation/devicetree/bindings/reset/amlogic,meson-axg-audio-arb.yaml
+index bc1d284785e1..26e8dd9e2feb 100644
+--- a/Documentation/devicetree/bindings/reset/amlogic,meson-axg-audio-arb.yaml
++++ b/Documentation/devicetree/bindings/reset/amlogic,meson-axg-audio-arb.yaml
+@@ -18,6 +18,7 @@ properties:
+     enum:
+       - amlogic,meson-axg-audio-arb
+       - amlogic,meson-sm1-audio-arb
++      - amlogic,meson-sc2-audio-arb
+ 
+   reg:
+     maxItems: 1
+diff --git a/drivers/reset/amlogic/reset-meson-audio-arb.c b/drivers/reset/amlogic/reset-meson-audio-arb.c
+index 6ec253976bed..6ea7b10ed2f4 100644
+--- a/drivers/reset/amlogic/reset-meson-audio-arb.c
++++ b/drivers/reset/amlogic/reset-meson-audio-arb.c
+@@ -115,6 +115,9 @@ static const struct of_device_id meson_audio_arb_of_match[] = {
+ 	}, {
+ 		.compatible = "amlogic,meson-sm1-audio-arb",
+ 		.data = &sm1_audio_arb_match,
++	}, {
++		.compatible = "amlogic,meson-sc2-audio-arb",
++		.data = &sm1_audio_arb_match,
+ 	},
+ 	{}
+ };
+-- 
+2.47.3
+

@@ -1,0 +1,60 @@
+From b9a43417c9e4ea7baeedc737170896b334d8e586 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Mon, 19 Oct 2026 20:34:50 +0800
+Subject: [PATCH] clk: meson: decode both SC2 HDMI output dividers
+
+HDMI PLL CTRL0 contains independent two-bit OD1 and OD2 fields, not
+a single four-bit exponent. Decode and combine the two exponents for
+read-only rate reporting while preserving the existing exported clock
+IDs and no-cache behavior. The display driver still owns programming.
+
+This corrects the rate exposed after native HDMI mode setting without
+adding intermediate clock allocations or changing the consumer ABI.
+
+---
+ drivers/clk/meson/sc2.c | 26 +++++++++++++++++++-------
+ 1 file changed, 19 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/clk/meson/sc2.c b/drivers/clk/meson/sc2.c
+index 01479e7a5cef..a487e9b5488c 100644
+--- a/drivers/clk/meson/sc2.c
++++ b/drivers/clk/meson/sc2.c
+@@ -1368,16 +1368,28 @@ static struct clk_regmap sc2_hdmi_pll_dco = {
+ 	},
+ };
+ 
++static unsigned long sc2_hdmi_pll_od_recalc_rate(struct clk_hw *hw,
++					       unsigned long parent_rate)
++{
++	struct clk_regmap *clk = to_clk_regmap(hw);
++	unsigned int value;
++
++	if (regmap_read(clk->map, ANACTRL_HDMIPLL_CTRL0, &value))
++		return 0;
++
++	/* OD1 and OD2 are separate two-bit power-of-two dividers. */
++	return parent_rate >> (((value >> 16) & 3) + ((value >> 18) & 3));
++}
++
++static const struct clk_ops sc2_hdmi_pll_od_ops = {
++	.init = clk_regmap_init,
++	.recalc_rate = sc2_hdmi_pll_od_recalc_rate,
++};
++
+ static struct clk_regmap sc2_hdmi_pll_od = {
+-	.data = &(struct clk_regmap_div_data){
+-		.offset = ANACTRL_HDMIPLL_CTRL0,
+-		.shift = 16,
+-		.width = 4,
+-		.flags = CLK_DIVIDER_POWER_OF_TWO,
+-	},
+ 	.hw.init = &(struct clk_init_data){
+ 		.name = "hdmi_pll_od",
+-		.ops = &clk_regmap_divider_ro_ops,
++		.ops = &sc2_hdmi_pll_od_ops,
+ 		.parent_hws = (const struct clk_hw *[]) {
+ 			&sc2_hdmi_pll_dco.hw
+ 		},
+-- 
+2.47.3
+

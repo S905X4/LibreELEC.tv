@@ -1,0 +1,411 @@
+Subject: [PATCH] v4l2m2m: preserve native capture ownership and explicit drain
+
+SC2 single-stream legacy codecs allocate fixed 1920x1088 backing canvases.
+A midstream visible-size event changes neither plane strides nor allocations.
+Keep those surfaces and the firmware reference ownership alive; retain the
+standard capture restart for the initial event and every other driver.
+EOS events may precede dequeue of completed CAPTURE buffers. For the native
+fixed-backing driver, keep draining until a CAPTURE LAST buffer or EPIPE;
+an earlier EOS event is not permission to discard ready pictures.
+CAPTURE LAST completes native drain even when an earlier EOS event was consumed.
+A native drain timeout is an error, not proof that every picture was presented.
+SC2 H.264 SINGLE firmware presents complementary fields together. Use CBS
+slice identities to join only actual complementary field packets into one
+OUTPUT submission, retaining their original bytes and first-field timing.
+Frame-coded AUs stay unchanged; unmatched fields at input EOF are errors.
+This repairs packet/presentation accounting, not firmware DPB tail flushing.
+Pass a known MPEG4 frame interval to the native driver before queuing input;
+the MULTI firmware consumes its 96 kHz duration during context restore.
+
+--- a/libavcodec/v4l2_m2m.h
++++ b/libavcodec/v4l2_m2m.h
+@@ -127,1 +127,3 @@
+-#define FF_V4L2_QUIRK_ENUM_FRAMESIZES_BROKEN    2
++#define FF_V4L2_QUIRK_ENUM_FRAMESIZES_BROKEN    2
++#define FF_V4L2_QUIRK_FIXED_CAPTURE             4
++#define FF_V4L2_QUIRK_EXPLICIT_DRAIN            8
+--- a/libavcodec/v4l2_m2m_dec.c
++++ b/libavcodec/v4l2_m2m_dec.c
+@@ -744,5 +744,10 @@
+             if (dst_rv == AVERROR(EAGAIN) && src_rv == NQ_DRAINING) {
+-                av_log(avctx, AV_LOG_WARNING, "Timeout in drain - assume EOF");
+-                dst_rv = AVERROR_EOF;
+-                s->capture.done = 1;
++                if (s->quirks & FF_V4L2_QUIRK_EXPLICIT_DRAIN) {
++                    av_log(avctx, AV_LOG_ERROR, "Native decoder drain timed out without EOS\n");
++                    dst_rv = AVERROR(ETIMEDOUT);
++                } else {
++                    av_log(avctx, AV_LOG_WARNING, "Timeout in drain - assume EOF");
++                    dst_rv = AVERROR_EOF;
++                    s->capture.done = 1;
++                }
+             }
+@@ -1052,2 +1057,26 @@
+-    if (strcmp(cap.driver, "meson-vdec") == 0)
+-        s->quirks |= FF_V4L2_QUIRK_REINIT_ALWAYS | FF_V4L2_QUIRK_ENUM_FRAMESIZES_BROKEN;
++    if (strcmp(cap.driver, "meson-vdec") == 0)
++        s->quirks |= FF_V4L2_QUIRK_REINIT_ALWAYS | FF_V4L2_QUIRK_ENUM_FRAMESIZES_BROKEN;
++    if (strcmp(cap.driver, "meson-sc2-vdec") == 0)
++        s->quirks |= FF_V4L2_QUIRK_EXPLICIT_DRAIN;
++    if (strcmp(cap.driver, "meson-sc2-vdec") == 0 &&
++        (avctx->codec_id == AV_CODEC_ID_MPEG4 || avctx->codec_id == AV_CODEC_ID_VC1 ||
++         avctx->codec_id == AV_CODEC_ID_WMV3 || avctx->codec_id == AV_CODEC_ID_CAVS ||
++         avctx->codec_id == AV_CODEC_ID_MJPEG || avctx->codec_id == AV_CODEC_ID_MPEG1VIDEO ||
++         avctx->codec_id == AV_CODEC_ID_MPEG2VIDEO))
++        s->quirks |= FF_V4L2_QUIRK_FIXED_CAPTURE;
++    if (strcmp(cap.driver, "meson-sc2-vdec") == 0 &&
++        avctx->codec_id == AV_CODEC_ID_MPEG4 &&
++        avctx->framerate.num > 0 && avctx->framerate.den > 0) {
++        struct v4l2_streamparm parm = { .type = s->output.type };
++        parm.parm.output.timeperframe.numerator = avctx->framerate.den;
++        parm.parm.output.timeperframe.denominator = avctx->framerate.num;
++        while (ioctl(s->fd, VIDIOC_S_PARM, &parm) != 0) {
++            int err = errno;
++            if (err == EINTR)
++                continue;
++            av_log(avctx, AV_LOG_ERROR,
++                   "Native MPEG4 frame interval %d/%d rejected: %s\n",
++                   avctx->framerate.den, avctx->framerate.num, strerror(err));
++            return AVERROR(err);
++        }
++    }
+--- a/libavcodec/v4l2_context.c
++++ b/libavcodec/v4l2_context.c
+@@ -368,1 +368,22 @@
+-    s->capture.format = cap_fmt;
++    if ((s->quirks & FF_V4L2_QUIRK_FIXED_CAPTURE) && s->capture.streamon &&
++        V4L2_TYPE_IS_MULTIPLANAR(cap_fmt.type) &&
++        cap_fmt.fmt.pix_mp.pixelformat == s->capture.format.fmt.pix_mp.pixelformat &&
++        cap_fmt.fmt.pix_mp.num_planes == s->capture.format.fmt.pix_mp.num_planes) {
++        unsigned int plane;
++        int same_backing = 1;
++        for (plane = 0; plane < cap_fmt.fmt.pix_mp.num_planes; plane++) {
++            const struct v4l2_plane_pix_format *old = &s->capture.format.fmt.pix_mp.plane_fmt[plane];
++            const struct v4l2_plane_pix_format *now = &cap_fmt.fmt.pix_mp.plane_fmt[plane];
++            if (old->bytesperline != now->bytesperline || old->sizeimage != now->sizeimage)
++                same_backing = 0;
++        }
++        if (same_backing) {
++            s->capture.format = cap_fmt;
++            s->capture.width = ff_v4l2_get_format_width(&cap_fmt);
++            s->capture.height = ff_v4l2_get_format_height(&cap_fmt);
++            s->capture.sample_aspect_ratio = v4l2_get_sar(&s->capture);
++            ret = ff_set_dimensions(avctx, s->capture.width, s->capture.height);
++            return ret < 0 ? ret : 1;
++        }
++    }
++    s->capture.format = cap_fmt;
+@@ -580,9 +601,12 @@
+     av_log(avctx, AV_LOG_DEBUG, "Dq event %d\n", evt.type);
+ 
+     if (evt.type == V4L2_EVENT_EOS) {
+         av_log(avctx, AV_LOG_TRACE, "V4L2 VIDIOC_EVENT_EOS\n");
++        if ((m->quirks & FF_V4L2_QUIRK_FIXED_CAPTURE) &&
++            !ff_v4l2_ctx_eos(&m->capture))
++            return 0;
+         return AVERROR_EOF;
+     }
+ 
+     if (evt.type == V4L2_EVENT_SOURCE_CHANGE)
+         return do_source_change(m);
+@@ -627,8 +651,13 @@
+         if (ctx->done) {
+             av_log(avctx, AV_LOG_TRACE, "V4L2 %s already done\n", ctx->name);
+             return AVERROR_EOF;
+         }
++        if (is_cap && m->draining && (m->quirks & FF_V4L2_QUIRK_EXPLICIT_DRAIN) &&
++            ff_v4l2_ctx_eos(ctx)) {
++            ctx->done = 1;
++            return AVERROR_EOF;
++        }
+ 
+         // If capture && timeout == -1 then also wait for rx buffer free
+         if (is_cap && timeout == -1 && dq_ok(&m->output) && !m->draining)
+             pfd.events |= poll_out;
+@@ -644,1 +673,4 @@
++        if (is_cap && (m->quirks & FF_V4L2_QUIRK_FIXED_CAPTURE))
++            pfd.events |= poll_event;
++
+         // Timeout kludged s.t. "forever" eventually gives up & produces logging
+
+--- a/configure
++++ b/configure
+@@ -3206,7 +3206,7 @@
+ h264_rkmpp_decoder_select="h264_mp4toannexb_bsf"
+ h264_vaapi_encoder_select="atsc_a53 cbs_h264 vaapi_encode"
+ h264_v4l2m2m_decoder_deps="v4l2_m2m h264_v4l2_m2m"
+-h264_v4l2m2m_decoder_select="h264_mp4toannexb_bsf"
++h264_v4l2m2m_decoder_select="h264_mp4toannexb_bsf cbs_h264"
+ h264_v4l2m2m_encoder_deps="v4l2_m2m h264_v4l2_m2m"
+ hevc_amf_encoder_deps="amf"
+ hevc_cuvid_decoder_deps="cuvid"
+--- a/libavcodec/v4l2_m2m.h
++++ b/libavcodec/v4l2_m2m.h
+@@ -144,6 +144,7 @@
+     const char * dmabuf_alloc;
+     const char * video_device;
+     enum AVPixelFormat pix_fmt;
++    struct V4L2H264FieldPair *h264_field_pair;
+ } V4L2m2mPriv;
+ 
+ /**
+--- a/libavcodec/v4l2_m2m_dec.c
++++ b/libavcodec/v4l2_m2m_dec.c
+@@ -45,6 +45,10 @@
+ #include "v4l2_m2m.h"
+ #include "v4l2_fmt.h"
+ #include "v4l2_req_dmabufs.h"
++#if CONFIG_H264_V4L2M2M_DECODER
++#include "cbs.h"
++#include "cbs_h264.h"
++#endif
+ 
+ #if CONFIG_H264_DECODER
+ #include "h264_parse.h"
+@@ -529,6 +533,180 @@
+     return ff_v4l2_context_enqueue_packet(&s->output, pkt, header, bytes);
+ }
+ 
++#if CONFIG_H264_V4L2M2M_DECODER
++typedef struct V4L2H264FieldIdentity {
++    uint16_t frame_num;
++    uint16_t idr_pic_id;
++    uint8_t pps_id;
++    uint8_t field;
++    uint8_t bottom;
++    uint8_t idr;
++    uint8_t reference;
++} V4L2H264FieldIdentity;
++
++typedef struct V4L2H264FieldPair {
++    CodedBitstreamContext *cbs;
++    CodedBitstreamFragment fragment;
++    AVPacket first;
++    V4L2H264FieldIdentity identity;
++} V4L2H264FieldPair;
++
++static void h264_field_pair_free(V4L2m2mPriv *priv)
++{
++    V4L2H264FieldPair *pair = priv->h264_field_pair;
++
++    if (!pair)
++        return;
++    av_packet_unref(&pair->first);
++    ff_cbs_fragment_free(&pair->fragment);
++    ff_cbs_close(&pair->cbs);
++    av_freep(&priv->h264_field_pair);
++}
++
++static int h264_fields_match(const V4L2H264FieldIdentity *first,
++                             const V4L2H264FieldIdentity *second)
++{
++    /* The second field of an IDR complementary pair may be non-IDR. */
++    return first->field && second->field &&
++           first->frame_num == second->frame_num &&
++           first->reference == second->reference &&
++           first->bottom != second->bottom &&
++           (!second->idr || (first->idr &&
++                             first->idr_pic_id == second->idr_pic_id));
++}
++
++static int h264_field_append(AVPacket *first, AVPacket *next, int field)
++{
++    const int size = first->size;
++    int ret;
++
++    if (next->size > INT_MAX - size ||
++        (field && first->duration > 0 && next->duration > 0 &&
++         next->duration > INT64_MAX - first->duration))
++        return AVERROR_INVALIDDATA;
++    ret = av_grow_packet(first, next->size);
++    if (ret < 0)
++        return ret;
++    memcpy(first->data + size, next->data, next->size);
++    first->flags |= next->flags & (AV_PKT_FLAG_CORRUPT | AV_PKT_FLAG_DISCARD);
++    if (field && first->duration > 0 && next->duration > 0)
++        first->duration += next->duration;
++    av_packet_unref(next);
++    return 0;
++}
++
++/* Native SINGLE firmware presents a complementary field pair once. Submit
++ * that pair as one OUTPUT packet, preserving every coded byte and the first
++ * field's PTS/DTS/properties. Frame-coded AUs need no copy or extra latency.
++ * Return one only while retaining a first field, zero for a ready packet.
++ */
++static int h264_pair_packet(AVCodecContext *avctx, V4L2m2mContext *s)
++{
++    V4L2m2mPriv *priv = avctx->priv_data;
++    V4L2H264FieldPair *pair = priv->h264_field_pair;
++    V4L2H264FieldIdentity identity = { 0 };
++    AVPacket *pkt = &s->buf_pkt;
++    int ret, i, pictures = 0, complete = 0;
++
++    if (avctx->codec_id != AV_CODEC_ID_H264 ||
++        !(s->quirks & FF_V4L2_QUIRK_EXPLICIT_DRAIN))
++        return 0;
++
++    if (!pair) {
++        pair = av_mallocz(sizeof(*pair));
++        if (!pair)
++            return AVERROR(ENOMEM);
++        priv->h264_field_pair = pair;
++        ret = ff_cbs_init(&pair->cbs, AV_CODEC_ID_H264, avctx);
++        if (ret < 0) {
++            h264_field_pair_free(priv);
++            return ret;
++        }
++        {
++            static const CodedBitstreamUnitType types[] = {
++                H264_NAL_SPS, H264_NAL_PPS, H264_NAL_SLICE, H264_NAL_IDR_SLICE,
++            };
++            pair->cbs->decompose_unit_types = types;
++            pair->cbs->nb_decompose_unit_types = FF_ARRAY_ELEMS(types);
++        }
++        /* Normalised Annex B extradata matches the BSF's packet framing. */
++        if (s->extdata_size) {
++            ret = ff_cbs_read(pair->cbs, &pair->fragment,
++                              s->extdata_data, s->extdata_size);
++            ff_cbs_fragment_reset(&pair->fragment);
++            if (ret < 0)
++                return ret;
++        }
++    }
++    ret = ff_cbs_read_packet(pair->cbs, &pair->fragment, pkt);
++    if (ret < 0)
++        goto done;
++    for (i = 0; i < pair->fragment.nb_units; ++i) {
++        const CodedBitstreamUnit *unit = &pair->fragment.units[i];
++        const H264RawSlice *slice;
++        V4L2H264FieldIdentity next;
++
++        if (unit->type != H264_NAL_SLICE && unit->type != H264_NAL_IDR_SLICE)
++            continue;
++        if (!unit->content) {
++            ret = AVERROR_INVALIDDATA;
++            goto done;
++        }
++        slice = unit->content;
++        next = (V4L2H264FieldIdentity) {
++            .frame_num = slice->header.frame_num,
++            .idr_pic_id = slice->header.idr_pic_id,
++            .pps_id = slice->header.pic_parameter_set_id,
++            .field = slice->header.field_pic_flag,
++            .bottom = slice->header.bottom_field_flag,
++            .idr = unit->type == H264_NAL_IDR_SLICE,
++            .reference = !!slice->header.nal_unit_header.nal_ref_idc,
++        };
++        if (!pictures) {
++            identity = next;
++            pictures = 1;
++            complete = !next.field;
++        } else if (identity.frame_num == next.frame_num &&
++                   identity.pps_id == next.pps_id &&
++                   identity.field == next.field &&
++                   (!next.field || identity.bottom == next.bottom)) {
++            /* Another slice of the same picture. */
++        } else if (h264_fields_match(&identity, &next)) {
++            complete = 1;
++        } else {
++            ret = AVERROR_INVALIDDATA;
++            goto done;
++        }
++    }
++
++    if (pair->first.size) {
++        if (pictures && (complete || !h264_fields_match(&pair->identity, &identity))) {
++            av_log(avctx, AV_LOG_ERROR, "Unmatched native H264 field before next picture\n");
++            ret = AVERROR_INVALIDDATA;
++            goto done;
++        }
++        ret = h264_field_append(&pair->first, pkt, pictures);
++        if (ret < 0)
++            goto done;
++        if (pictures) {
++            av_packet_move_ref(pkt, &pair->first);
++            ret = 0;
++        } else {
++            ret = 1;
++        }
++    } else if (pictures && !complete) {
++        pair->identity = identity;
++        av_packet_move_ref(&pair->first, pkt);
++        ret = 1;
++    } else {
++        ret = 0;
++    }
++done:
++    ff_cbs_fragment_reset(&pair->fragment);
++    return ret;
++}
++#endif
++
+ static int try_enqueue_src(AVCodecContext * const avctx, V4L2m2mContext * const s, const int do_not_get)
+ {
+     int ret;
+@@ -554,10 +732,30 @@
+                 if ((ret = copy_extradata(avctx, side_data, (int)side_size, &s->extdata_data, &s->extdata_size)) < 0)
+                     av_log(avctx, AV_LOG_WARNING, "Failed to copy new extra data: %s\n", av_err2str(ret));
+                 s->extdata_sent = 0;
++#if CONFIG_H264_V4L2M2M_DECODER
++                {
++                    V4L2H264FieldPair *pair = ((V4L2m2mPriv *)avctx->priv_data)->h264_field_pair;
++                    if (pair && s->extdata_size) {
++                        ret = ff_cbs_read(pair->cbs, &pair->fragment,
++                                          s->extdata_data, s->extdata_size);
++                        ff_cbs_fragment_reset(&pair->fragment);
++                        if (ret < 0)
++                            return ret;
++                    }
++                }
++#endif
+             }
+ 
+-            if (s->buf_pkt.size != 0)
++            if (s->buf_pkt.size != 0) {
++#if CONFIG_H264_V4L2M2M_DECODER
++                ret = h264_pair_packet(avctx, s);
++                if (ret < 0)
++                    return ret;
++                if (ret > 0)
++                    continue;
++#endif
+                 break;
++            }
+ 
+             if (s->buf_pkt.side_data_elems == 0) {
+                 av_log(avctx, AV_LOG_WARNING, "Empty pkt from ff_decode_get_packet - treating as EOF\n");
+@@ -582,6 +780,13 @@
+         }
+ 
+         if (ret == AVERROR_EOF) {
++#if CONFIG_H264_V4L2M2M_DECODER
++            V4L2H264FieldPair *pair = ((V4L2m2mPriv *)avctx->priv_data)->h264_field_pair;
++            if (pair && pair->first.size) {
++                av_log(avctx, AV_LOG_ERROR, "Native H264 input ended with an unmatched field\n");
++                return AVERROR_INVALIDDATA;
++            }
++#endif
+             // EOF - enter drain mode
+             av_log(avctx, AV_LOG_TRACE, "--- EOS req: ret=%d, size=%d, started=%d, drain=%d\n",
+                    ret, s->buf_pkt.size, stream_started(s), s->draining);
+@@ -1392,6 +1597,9 @@
+ static av_cold int v4l2_decode_close(AVCodecContext *avctx)
+ {
+     int rv;
++#if CONFIG_H264_V4L2M2M_DECODER
++    h264_field_pair_free(avctx->priv_data);
++#endif
+     av_log(avctx, AV_LOG_TRACE, "<<< %s\n", __func__);
+     rv = ff_v4l2_m2m_codec_end(avctx->priv_data);
+     av_log(avctx, AV_LOG_TRACE, ">>> %s: rv=%d\n", __func__, rv);
+@@ -1423,6 +1631,9 @@
+ 
+     // Clear any buffered input packet
+     av_packet_unref(&s->buf_pkt);
++#if CONFIG_H264_V4L2M2M_DECODER
++    h264_field_pair_free(priv);
++#endif
+ 
+     // Clear a pending EOS
+     if (ff_v4l2_ctx_eos(capture)) {

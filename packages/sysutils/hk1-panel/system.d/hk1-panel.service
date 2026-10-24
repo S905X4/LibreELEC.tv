@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+[Unit]
+Description=HK1 RBOX X4 native clock and network/media indicators
+After=systemd-udevd.service
+ConditionPathExists=/sys/firmware/devicetree/base/i2c-panel/display-controller@24
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/hk1-panel --format 24
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=5
+
+[Install]
+WantedBy=multi-user.target

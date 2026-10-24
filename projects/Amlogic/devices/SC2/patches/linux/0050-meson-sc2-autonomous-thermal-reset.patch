@@ -1,0 +1,169 @@
+From 2fd4d070afef84fd36b906a139b64bb33acb0fd8 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Wed, 21 Oct 2026 04:10:52 +0800
+Subject: [PATCH] thermal: amlogic: Arm the SC2 autonomous overtemperature
+ reset
+
+The current SC2 CPU and DDR CFG2 registers both read zero. Restore the
+BSP nominal 110 C autonomous reset policy using signed trim and R1P1
+rising-code quantization, with masked writes and register readback.
+Enable the comparator logic and re-arm protection whenever the sensor
+is enabled, including resume. Leave other SoCs and software trips alone.
+
+
+---
+ .../bindings/thermal/amlogic,thermal.yaml     |  4 ++
+ drivers/thermal/amlogic_thermal.c             | 70 ++++++++++++++++++-
+ 2 files changed, 71 insertions(+), 3 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/thermal/amlogic,thermal.yaml b/Documentation/devicetree/bindings/thermal/amlogic,thermal.yaml
+index 47117900b411..5aed04e927c4 100644
+--- a/Documentation/devicetree/bindings/thermal/amlogic,thermal.yaml
++++ b/Documentation/devicetree/bindings/thermal/amlogic,thermal.yaml
+@@ -16,6 +16,10 @@ description: |
+   DDR sensors share a 500 kHz functional clock but have independent trim
+   words. SC2 calibration validity is checked before the thermal zone is
+   registered; no uncalibrated temperature estimate is provided.
++  The SC2 driver also programs the calibrated autonomous overtemperature
++  reset at a nominal 110 degrees Celsius, including on resume. This uses
++  the R1P1 rising-code quantization and does not replace the thermal zone's
++  lower software critical trip or CPU cooling policy.
+ 
+ $ref: thermal-sensor.yaml#
+ 
+diff --git a/drivers/thermal/amlogic_thermal.c b/drivers/thermal/amlogic_thermal.c
+index 2877b1a29f1b..c85bb772ce5a 100644
+--- a/drivers/thermal/amlogic_thermal.c
++++ b/drivers/thermal/amlogic_thermal.c
+@@ -45,6 +45,14 @@
+ 		 TSENSOR_CFG_REG1_DEM_EN |	\
+ 		 TSENSOR_CFG_REG1_CH_SEL)
+ 
++#define TSENSOR_CFG_REG1_IRQ_LOGIC_EN	BIT(15)
++
++#define TSENSOR_CFG_REG2			0x8
++#define TSENSOR_CFG_REG2_HI_TEMP_EN	BIT(31)
++#define TSENSOR_CFG_REG2_REBOOT_ALL_EN	BIT(30)
++#define TSENSOR_CFG_REG2_REBOOT_TIME	GENMASK(23, 16)
++#define TSENSOR_CFG_REG2_REBOOT_TEMP	GENMASK(15, 4)
++
+ #define TSENSOR_STAT0			0x40
+ 
+ #define TSENSOR_STAT9			0x64
+@@ -86,6 +94,7 @@ struct amlogic_thermal_soc_calib_data {
+  * @calibration_parameters: calibration parameters structure pointer
+  * @regmap_config: regmap config for the device
+  * @trim_resource: calibration is in a separate MMIO resource
++ * @reboot_temp: autonomous overtemperature reset threshold in milliCelsius
+  * This structure is required for configuration of amlogic thermal driver.
+  */
+ struct amlogic_thermal_data {
+@@ -93,6 +102,7 @@ struct amlogic_thermal_data {
+ 	const struct amlogic_thermal_soc_calib_data *calibration_parameters;
+ 	const struct regmap_config *regmap_config;
+ 	bool trim_resource;
++	int reboot_temp;
+ };
+ 
+ struct amlogic_thermal {
+@@ -169,24 +179,72 @@ static int amlogic_thermal_initialize(struct amlogic_thermal *pdata)
+ 	return ret;
+ }
+ 
++static int amlogic_thermal_set_reboot_temp(struct amlogic_thermal *data)
++{
++	const struct amlogic_thermal_soc_calib_data *param =
++				data->data->calibration_parameters;
++	u32 mask, value, readback;
++	s64 uptat, divisor, code, uefuse;
++	int ret;
++
++	if (!data->data->reboot_temp)
++		return 0;
++
++	uefuse = data->trim_info & TSENSOR_TRIM_SIGN_MASK ?
++		 -(s64)(data->trim_info & TSENSOR_TRIM_TEMP_MASK) :
++		 (data->trim_info & TSENSOR_TRIM_TEMP_MASK);
++	uptat = div_s64((s64)(param->B + data->data->reboot_temp / 100) *
++			BIT(16), param->A) - uefuse;
++	divisor = param->m - div_s64(param->n * uptat, BIT(16));
++	if (uptat <= 0 || divisor <= 0)
++		return -EINVAL;
++
++	/* R1P1 compares the ADC's upper 12 bits, with the BSP rising margin. */
++	code = (div_s64(uptat * 100, divisor) >> 4) + 1;
++	if (code <= 0 || code > FIELD_MAX(TSENSOR_CFG_REG2_REBOOT_TEMP))
++		return -ERANGE;
++
++	mask = TSENSOR_CFG_REG2_HI_TEMP_EN | TSENSOR_CFG_REG2_REBOOT_ALL_EN |
++		TSENSOR_CFG_REG2_REBOOT_TIME | TSENSOR_CFG_REG2_REBOOT_TEMP;
++	value = TSENSOR_CFG_REG2_HI_TEMP_EN | TSENSOR_CFG_REG2_REBOOT_ALL_EN |
++		TSENSOR_CFG_REG2_REBOOT_TIME |
++		FIELD_PREP(TSENSOR_CFG_REG2_REBOOT_TEMP, code);
++	ret = regmap_update_bits(data->regmap, TSENSOR_CFG_REG2, mask, value);
++	if (ret)
++		return ret;
++	ret = regmap_read(data->regmap, TSENSOR_CFG_REG2, &readback);
++	if (ret)
++		return ret;
++
++	return (readback & mask) == value ? 0 : -EIO;
++}
++
+ static int amlogic_thermal_enable(struct amlogic_thermal *data)
+ {
+ 	int ret;
++	u32 enable = TSENSOR_CFG_REG1_ENABLE;
+ 
+ 	if (data->data->trim_resource) {
+ 		ret = clk_set_rate(data->clk, 500000);
+ 		if (ret)
+ 			return ret;
++		enable |= TSENSOR_CFG_REG1_IRQ_LOGIC_EN;
+ 	}
+ 	ret = clk_prepare_enable(data->clk);
+ 	if (ret)
+ 		return ret;
+ 
++	ret = amlogic_thermal_set_reboot_temp(data);
++	if (ret) {
++		clk_disable_unprepare(data->clk);
++		return ret;
++	}
++
+ 	ret = regmap_update_bits(data->regmap, TSENSOR_CFG_REG1,
+-				TSENSOR_CFG_REG1_ENABLE |
++				enable |
+ 				TSENSOR_CFG_REG1_RSET_VBG |
+ 				TSENSOR_CFG_REG1_RSET_ADC,
+-				TSENSOR_CFG_REG1_ENABLE);
++				enable);
+ 	if (ret) {
+ 		clk_disable_unprepare(data->clk);
+ 		return ret;
+@@ -200,8 +258,13 @@ static int amlogic_thermal_enable(struct amlogic_thermal *data)
+ 
+ static void amlogic_thermal_disable(struct amlogic_thermal *data)
+ {
++	u32 enable = TSENSOR_CFG_REG1_ENABLE;
++
++	if (data->data->trim_resource)
++		enable |= TSENSOR_CFG_REG1_IRQ_LOGIC_EN;
++
+ 	regmap_update_bits(data->regmap, TSENSOR_CFG_REG1,
+-			   TSENSOR_CFG_REG1_ENABLE, 0);
++			   enable, 0);
+ 	clk_disable_unprepare(data->clk);
+ }
+ 
+@@ -266,6 +329,7 @@ static const struct amlogic_thermal_data amlogic_thermal_sc2_param = {
+ 	.calibration_parameters = &amlogic_thermal_g12a,
+ 	.regmap_config = &amlogic_thermal_regmap_config_g12a,
+ 	.trim_resource = true,
++	.reboot_temp = 110000,
+ };
+ 
+ static const struct of_device_id of_amlogic_thermal_match[] = {
+-- 
+2.47.3
+

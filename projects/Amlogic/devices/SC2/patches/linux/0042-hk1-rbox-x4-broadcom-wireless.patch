@@ -1,0 +1,129 @@
+From 3799fe0217045017a1d5ef388c80546490aea9a8 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Wed, 21 Oct 2026 01:06:34 +0800
+Subject: [PATCH] arm64: dts: amlogic: Select HK1 Broadcom wireless consumers
+
+The board uses BCM4339 rev1 on SDIO and routes Bluetooth over UART_E
+with the Broadcom H4 startup contract. Replace the unsupported Realtek
+board assumption with brcmfmac and the existing Broadcom family UART
+binding; do not guess an exact Bluetooth ROM.
+
+Keep GPIOX_17 low-off/high-on through shutdown-gpios. The board drives
+GPIOX_19 high; retain that state as a hog with no assigned
+
+wake IRQ or module pad role. Preserve shared LPO, RTS/CTS, 1.5 Mbaud
+maximum, SDIO power sequencing and the existing voltage/speed limits.
+
+Remove the now-unused local H5 LPO extension and its binding property;
+Broadcom already owns its optional LPO through the native driver.
+No NVRAM, HCD alias, fabricated regulator or CLM bypass is introduced.
+
+
+---
+ .../net/bluetooth/realtek,bluetooth.yaml      |  7 -----
+ .../dts/amlogic/meson-sc2-hk1-rbox-x4.dts     | 26 ++++++++++++++++---
+ drivers/bluetooth/hci_h5.c                    |  8 ------
+ 3 files changed, 23 insertions(+), 18 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/net/bluetooth/realtek,bluetooth.yaml b/Documentation/devicetree/bindings/net/bluetooth/realtek,bluetooth.yaml
+index 0729035ee43b7fb03f70ab5b1adff9f34472b964..7d567122bac9bb4cc0b5469da2c7a37367d96ab5 100644
+--- a/Documentation/devicetree/bindings/net/bluetooth/realtek,bluetooth.yaml
++++ b/Documentation/devicetree/bindings/net/bluetooth/realtek,bluetooth.yaml
+@@ -29,13 +29,6 @@ properties:
+               - realtek,rtl8821cs-bt
+           - const: realtek,rtl8723bs-bt
+ 
+-  clocks:
+-    maxItems: 1
+-    description: External low-power 32.768 kHz clock
+-
+-  clock-names:
+-    const: lpo
+-
+   device-wake-gpios:
+     maxItems: 1
+     description: GPIO specifier, used to wakeup the BT module
+diff --git a/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts b/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
+index 4b371857aece105ec015b5048da22159b0f9d541..a0d3375f1b15cfcd41b98d1a6d549cab64795c23 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
++++ b/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
+@@ -344,6 +344,20 @@ framebuffer@df800000 {
+ 	};
+ };
+ 
++&gpio {
++	/*
++	 * Stock drives this pad high; its module-side wake role is unknown.
++	 * The hog retains ownership across Bluetooth runtime/system suspend;
++	 * it is neither a Bluetooth-controlled wake output nor a wake IRQ.
++	 */
++	bluetooth-stock-output-hog {
++		gpio-hog;
++		gpios = <GPIOX_19 GPIO_ACTIVE_HIGH>;
++		output-high;
++		line-name = "bluetooth-stock-output";
++	};
++};
++
+ &uart_b {
+ 	status = "okay";
+ };
+@@ -525,6 +539,12 @@ &sd_emmc_a {
+ 	voltage-ranges = <3300 3300>;
+ 	post-power-on-delay-ms = <100>;
+ 	mmc-pwrseq = <&wifi_pwrseq>;
++
++	wifi@1 {
++		compatible = "brcm,bcm4339-fmac", "brcm,bcm4329-fmac";
++		reg = <1>;
++		brcm,board-type = "hk1,rbox-x4";
++	};
+ };
+ 
+ &pwm_ef {
+@@ -542,9 +562,9 @@ &uart_e {
+ 	uart-has-rtscts;
+ 
+ 	bluetooth {
+-		compatible = "realtek,rtl8821cs-bt", "realtek,rtl8723bs-bt";
+-		enable-gpios = <&gpio GPIOX_17 GPIO_ACTIVE_HIGH>;
+-		host-wake-gpios = <&gpio GPIOX_19 GPIO_ACTIVE_HIGH>;
++		/* Broadcom H4 family; exact Bluetooth ROM revision is not known. */
++		compatible = "brcm,bcm4329-bt";
++		shutdown-gpios = <&gpio GPIOX_17 GPIO_ACTIVE_HIGH>;
+ 		clocks = <&wifi32k>;
+ 		clock-names = "lpo";
+ 		max-speed = <1500000>;
+diff --git a/drivers/bluetooth/hci_h5.c b/drivers/bluetooth/hci_h5.c
+index 6a42f3327375c3c1426d9c162ddaa067d7a3a46c..9da2be1f3cc9c9b433d3387a7896ad8c286bf111 100644
+--- a/drivers/bluetooth/hci_h5.c
++++ b/drivers/bluetooth/hci_h5.c
+@@ -7,7 +7,6 @@
+  */
+ 
+ #include <linux/acpi.h>
+-#include <linux/clk.h>
+ #include <linux/errno.h>
+ #include <linux/gpio/consumer.h>
+ #include <linux/kernel.h>
+@@ -822,7 +821,6 @@ static int h5_serdev_probe(struct serdev_device *serdev)
+ 	struct device *dev = &serdev->dev;
+ 	struct h5 *h5;
+ 	const struct h5_device_data *data;
+-	struct clk *lpo_clk;
+ 
+ 	h5 = devm_kzalloc(dev, sizeof(*h5), GFP_KERNEL);
+ 	if (!h5)
+@@ -866,12 +864,6 @@ static int h5_serdev_probe(struct serdev_device *serdev)
+ 	if (IS_ERR(h5->device_wake_gpio))
+ 		return PTR_ERR(h5->device_wake_gpio);
+ 
+-	/* Keep the shared LPO running independently of the Wi-Fi power state. */
+-	lpo_clk = devm_clk_get_optional_enabled(dev, "lpo");
+-	if (IS_ERR(lpo_clk))
+-		return dev_err_probe(dev, PTR_ERR(lpo_clk),
+-				     "Failed to enable LPO clock\n");
+-
+ 	return hci_uart_register_device_priv(&h5->serdev_hu, &h5p,
+ 					     h5->vnd->sizeof_priv);
+ }

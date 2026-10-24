@@ -1,0 +1,80 @@
+From 2bd611734c9a746e552aa5e569395cb13e9e52be Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Fri, 23 Oct 2026 23:43:35 +0800
+Subject: [PATCH] media: meson: support AV1 128x128 superblocks and tile
+ completion
+
+Select the SAO superblock geometry from native sequence controls and verify
+the firmware sequence flag against that authority. Accept the donor PIC_END
+contract with a nonzero LCU counter: a real four-tile 320x240 picture reports
+eight, not its six geometric superblocks. Keep header, input and MMU bounds.
+
+
+---
+ .../media/platform/amlogic/meson-sc2-vdec/Kconfig |  2 +-
+ .../amlogic/meson-sc2-vdec/meson_sc2_av1.h        | 15 +++++++++------
+ 2 files changed, 10 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/media/platform/amlogic/meson-sc2-vdec/Kconfig b/drivers/media/platform/amlogic/meson-sc2-vdec/Kconfig
+index 2b671e226ec7..ab4a417a1596 100644
+--- a/drivers/media/platform/amlogic/meson-sc2-vdec/Kconfig
++++ b/drivers/media/platform/amlogic/meson-sc2-vdec/Kconfig
+@@ -18,7 +18,7 @@ config VIDEO_MESON_SC2_HEVC
+ 	  Main8 CAPTURE is contiguous NV12. HEVC Main10 CAPTURE uses the local
+ 	  proposed AMF0 Amlogic scatter-FBC ABI with exported vb2-owned header/body
+ 	  storage, not an eight-bit preview. AV1 supports fixed output size
+-	  <=1920x1088, superresolution, 64x64 superblocks and <=256 tiles.
++	  <=1920x1088, superresolution, 64x64/128x128 superblocks and <=256 tiles.
+ 	  Source frame IDs must be validated by userspace before normalization.
+ 	  Film grain, intrabc, timing models and nonidentity global motion are
+ 	  rejected explicitly.
+diff --git a/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_av1.h b/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_av1.h
+index 4e9f0ab63299..56cecccea18d 100644
+--- a/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_av1.h
++++ b/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_av1.h
+@@ -683,8 +683,7 @@ static int sc2_av1_validate(struct meson_sc2_hevc_context *ctx,
+         f->upscaled_width < width || f->upscaled_width > 1920 ||
+         (f->upscaled_width & 1) ||
+         (s->flags & (V4L2_AV1_SEQUENCE_FLAG_MONO_CHROME |
+-                     V4L2_AV1_SEQUENCE_FLAG_FILM_GRAIN_PARAMS_PRESENT |
+-                     V4L2_AV1_SEQUENCE_FLAG_USE_128X128_SUPERBLOCK)) ||
++                     V4L2_AV1_SEQUENCE_FLAG_FILM_GRAIN_PARAMS_PRESENT)) ||
+         (s->flags & (V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_X |
+                      V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_Y)) !=
+                     (V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_X |
+@@ -846,7 +845,8 @@ static void sc2_av1_program(struct meson_sc2_hevc_context *ctx,
+     sc2_write(hw, A1_SAO_CTRL9, sc2_read(hw, A1_SAO_CTRL9) | BIT(1));
+     sc2_write(hw, HEVC_SAO_CTRL5,
+               (sc2_read(hw, HEVC_SAO_CTRL5) | BIT(14)) & ~(0xffU << 16));
+-    sc2_write(hw, HEVC_SAO_CTRL0, 6);
++    sc2_write(hw, HEVC_SAO_CTRL0, 6 + !!(job->syntax->sequence->flags &
++                              V4L2_AV1_SEQUENCE_FLAG_USE_128X128_SUPERBLOCK));
+     sc2_write(hw, HEVC_CM_BODY_START_ADDR, lower_32_bits(s->dma + s->body_offset));
+     sc2_write(hw, HEVC_CM_HEADER_START_ADDR, lower_32_bits(s->dma));
+     sc2_write(hw, A1_FGS_TABLE, av1_workspace(st, GRAIN) + st->current_slot * 0x2000);
+@@ -898,7 +898,9 @@ static int sc2_av1_run(struct meson_sc2_hevc_context *ctx,
+             for (i = 0; i < 128; i++)
+                 p[i] = le16_to_cpu(raw[(i & ~3U) + 3 - (i & 3)]);
+             if (status == 0xf2) {
+-                if (++sequences != 1 || p[0] || p[56] != 8 || (p[57] & BIT(6)) ||
++                if (++sequences != 1 || p[0] || p[56] != 8 ||
++                    !!(p[57] & BIT(6)) !=
++                    !!(job->syntax->sequence->flags & V4L2_AV1_SEQUENCE_FLAG_USE_128X128_SUPERBLOCK) ||
+                     !!(p[57] & BIT(15)) !=
+                     !!(job->syntax->sequence->flags & V4L2_AV1_SEQUENCE_FLAG_ENABLE_SUPERRES))
+                     return -EPROTO;
+@@ -919,8 +921,9 @@ static int sc2_av1_run(struct meson_sc2_hevc_context *ctx,
+             continue;
+         }
+         if (status == 0xe0) {
+-            if (headers != 1 || sc2_read(hw, HEVC_ASSIST_SCRATCH_2) !=
+-                DIV_ROUND_UP(st->width, 64) * DIV_ROUND_UP(st->height, 64) ||
++            /* Multi-tile firmware counts need not equal the geometric SB count.
++             * The donor requires PIC_END plus a nonzero completed-LCU count. */
++            if (headers != 1 || !sc2_read(hw, HEVC_ASSIST_SCRATCH_2) ||
+                 sc2_read(hw, HEVC_SHIFT_BYTE_COUNT) > length + SC2_INPUT_PADDING ||
+                 (sc2_read(hw, A1_MMU_STATUS) >> 16) >
+                     DIV_ROUND_UP(job->output.destination->body_size, SZ_4K))
+-- 
+2.47.3
+

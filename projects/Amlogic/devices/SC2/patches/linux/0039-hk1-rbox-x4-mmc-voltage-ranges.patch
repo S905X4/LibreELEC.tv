@@ -1,0 +1,46 @@
+From b5a3ca554b711f32625ecbba0439cc1df51fbe0f Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Tue, 20 Oct 2026 15:34:33 +0800
+Subject: [PATCH] arm64: dts: amlogic: Describe HK1 RBOX X4 MMC voltage limits
+
+Describe nominal 3.3 V card-power capability for the board MMC hosts
+using the reference BSP high-voltage OCR range.
+
+Do not add a guessed regulator, GPIO, 1.8 V IO switch, higher frequency or
+new timing mode.
+
+---
+ arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts b/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
+index 7f1ca55b7032..63c87760582d 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
++++ b/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
+@@ -397,6 +397,7 @@ &sd_emmc_b {
+ 	bus-width = <4>;
+ 	cap-sd-highspeed;
+ 	max-frequency = <50000000>;
++	voltage-ranges = <3300 3300>;
+ 	no-1-8-v;
+ 	disable-wp;
+ 	cd-gpios = <&gpio GPIOC_6 GPIO_ACTIVE_LOW>;
+@@ -411,6 +412,7 @@ &sd_emmc_c {
+ 	bus-width = <8>;
+ 	cap-mmc-highspeed;
+ 	max-frequency = <52000000>;
++	voltage-ranges = <3300 3300>;
+ 	non-removable;
+ 	disable-wp;
+ 	no-sd;
+@@ -520,6 +522,7 @@ &sd_emmc_a {
+ 	no-1-8-v;
+ 	keep-power-in-suspend;
+ 	max-frequency = <50000000>;
++	voltage-ranges = <3300 3300>;
+ 	post-power-on-delay-ms = <100>;
+ 	mmc-pwrseq = <&wifi_pwrseq>;
+ };
+-- 
+2.47.3
+

@@ -1,0 +1,41 @@
+From fb49ce891214f9d15fdc25fb11ce52fff3005382 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Tue, 20 Oct 2026 15:34:32 +0800
+Subject: [PATCH] dt-bindings: mmc: meson-gx: Describe fixed voltage
+ capabilities
+
+Allow boards with software-transparent card supplies to describe their
+supported voltage range using the existing MMC voltage-ranges convention.
+Regulator-derived OCR capabilities retain precedence; this property does
+not control the bus IO rail.
+
+---
+ .../bindings/mmc/amlogic,meson-gx-mmc.yaml           | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/Documentation/devicetree/bindings/mmc/amlogic,meson-gx-mmc.yaml b/Documentation/devicetree/bindings/mmc/amlogic,meson-gx-mmc.yaml
+index 57646575a13f..7b06199cd7c2 100644
+--- a/Documentation/devicetree/bindings/mmc/amlogic,meson-gx-mmc.yaml
++++ b/Documentation/devicetree/bindings/mmc/amlogic,meson-gx-mmc.yaml
+@@ -54,6 +54,18 @@ properties:
+   power-domains:
+     maxItems: 1
+ 
++  voltage-ranges:
++    $ref: /schemas/types.yaml#/definitions/uint32-matrix
++    description: |
++      Supported card-power voltage range in millivolts for supplies that
++      cannot be controlled by software. A voltage mask obtained from
++      vmmc-supply takes precedence. This does not select the bus IO voltage.
++    maxItems: 1
++    items:
++      items:
++        - description: Minimum card-power voltage in millivolts.
++        - description: Maximum card-power voltage in millivolts.
++
+ required:
+   - compatible
+   - reg
+-- 
+2.47.3
+

@@ -1,0 +1,43 @@
+From cfe4da0a25b127d30fec377eb5929e690dfb14e3 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Tue, 20 Oct 2026 00:38:48 +0800
+Subject: [PATCH] pwm: meson: Quantize SC2 inverted waveforms by their leading
+ edge
+
+For an inverted 1500 ns period and 45 ns physical-high pulse at 24 MHz,
+subtracting two ceiling-rounded timestamps yields 41 ns, which floors to
+zero source cycles.
+
+Quantize the inverted leading-edge offset directly instead of
+subtracting the rounded physical-high width from the period count.
+The reported 1459 ns edge re-encodes the original 35/1 cycle waveform.
+Preserve the waveform API and ordinary leading-edge pulse behavior.
+
+
+---
+ drivers/pwm/pwm-meson.c | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/pwm/pwm-meson.c b/drivers/pwm/pwm-meson.c
+index 5bc41cd9db0d4fa35323cc5fdec7d2cea9efc7bc..a170fa479fc8bbeba436a05f1caceecb31d120ae 100644
+--- a/drivers/pwm/pwm-meson.c
++++ b/drivers/pwm/pwm-meson.c
+@@ -480,13 +480,15 @@ static int meson_sc2_pwm_round_tohw(struct pwm_chip *chip,
+ 	/* The hardware can place the high pulse at the start or end only. */
+ 	hw->inverted = wf->duty_offset_ns &&
+ 		wf->duty_offset_ns == wf->period_length_ns - wf->duty_length_ns;
+-	if (wf->duty_length_ns == wf->period_length_ns)
++	/* Quantize the leading edge, not a difference of rounded widths. */
++	if (hw->inverted)
++		high = min(mul_u64_u64_div_u64(rate, wf->duty_offset_ns,
++					     NSEC_PER_SEC), count);
++	else if (wf->duty_length_ns == wf->period_length_ns)
+ 		high = count;
+ 	else
+ 		high = min(mul_u64_u64_div_u64(rate, wf->duty_length_ns,
+ 					     NSEC_PER_SEC), count);
+-	if (hw->inverted)
+-		high = count - high;
+ 	hw->constant = !high || high == count;
+ 	if (hw->constant ? count > 0xffff :
+ 	    high > 0x10000 || count - high > 0x10000)

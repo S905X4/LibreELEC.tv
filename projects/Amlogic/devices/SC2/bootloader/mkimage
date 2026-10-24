@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: GPL-2.0
+# Deliberately no raw writes or U-Boot/FIP installation on the removable image.
+echo "image: copying SC2 removable boot files"
+mcopy -s -o "${RELEASE_DIR}/3rdparty/bootloader/s905_autoscript" ::
+mcopy -s -o "${RELEASE_DIR}/3rdparty/bootloader/amlogic" ::
+cat << EOF > "${LE_TMP}/uEnv.ini"
+bootargs=boot=UUID=${UUID_SYSTEM} disk=UUID=${UUID_STORAGE} ${EXTRA_CMDLINE}
+EOF
+mcopy -s -o "${LE_TMP}/uEnv.ini" ::
+cat << EOF > "${LE_TMP}/uEnv.live.ini"
+bootargs=boot=UUID=${UUID_SYSTEM} ${EXTRA_CMDLINE} toram live
+EOF
+mcopy -s -o "${LE_TMP}/uEnv.live.ini" ::

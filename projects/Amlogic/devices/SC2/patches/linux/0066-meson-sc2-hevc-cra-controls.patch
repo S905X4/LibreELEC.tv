@@ -1,0 +1,35 @@
+From ee5b83664638b20e2dbc2445927221e65051aaf2 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Thu, 22 Oct 2026 12:12:31 +0800
+Subject: [PATCH] media: meson-sc2: honor resolved CRA random-access state
+
+After a decoder flush, FFmpeg resolves the first CRA no-output-of-prior
+state independently of its original encoded bit. Comparing that bit to
+the authoritative Request control incorrectly rejects the new epoch.
+
+Consume the original prefix bit for payload positioning and retain the
+existing normalized writer which emits the resolved decode control.
+NAL identity, bounds, slice syntax and reference checks remain intact.
+
+---
+ .../platform/amlogic/meson-sc2-vdec/hevc_request_syntax.c  | 7 +++----
+ 1 file changed, 3 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/media/platform/amlogic/meson-sc2-vdec/hevc_request_syntax.c b/drivers/media/platform/amlogic/meson-sc2-vdec/hevc_request_syntax.c
+index 270ef034a69fa7620cb1f5af34c2846c79d6d4ad..6c505d8b4a95f3a312fdecdffbc69361c7ac42f9 100644
+--- a/drivers/media/platform/amlogic/meson-sc2-vdec/hevc_request_syntax.c
++++ b/drivers/media/platform/amlogic/meson-sc2-vdec/hevc_request_syntax.c
+@@ -642,10 +642,9 @@ static int original_prefix(const struct meson_hevc_syntax_request *request,
+ 	reader.pos = prefix + 2;
+ 	reader.end = sl->data_byte_offset;
+ 	first = read_bits(&reader, 1);
+-	if (is_irap(sl->nal_unit_type) &&
+-	    read_bits(&reader, 1) !=
+-	    !!(request->decode->flags & V4L2_HEVC_DECODE_PARAM_FLAG_NO_OUTPUT_OF_PRIOR))
+-		return fail(error, -EINVAL, "original no_output_of_prior_pics disagrees with decode control");
++	/* A parser may resolve CRA random access differently after a flush. */
++	if (is_irap(sl->nal_unit_type))
++		read_bits(&reader, 1);
+ 	if (read_ue(&reader) != pps->pic_parameter_set_id)
+ 		return fail(error, -EINVAL, "original slice PPS ID disagrees with control");
+ 	if (!first) {

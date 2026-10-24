@@ -1,0 +1,133 @@
+Subject: [PATCH] avcodec: carry SC2 Main10 scatter FBC in DRM PRIME
+
+AMF0 is an SC2-specific downstream V4L2 compressed-capture ABI, not an
+upstream-assigned fourcc. Negotiate it only for ten-bit HEVC,
+use decoder-owned MMAP/exported buffers, and emit one YU10 DRM plane with
+AMLOGIC FBC SCATTER and zero options (never MEM_SAVING). The exported
+object contains the header and every referenced body page, not a private
+header whose body disappears on decoder teardown.
+
+The nominal software format describes ten-bit samples, not linear bytes.
+Reject CPU mapping/transfer of Amlogic FBC instead of presenting compressed
+headers as YUV samples. Main8 NV12 and the existing Raspberry Pi layouts
+retain their own negotiation and descriptors.
+
+This patch follows SC2 ffmpeg-003-native-hevc-controls.patch and depends on
+the matching kernel AMF0 capture producer and Meson DRM SC2 FBC routing.
+AMF0 remains an SC2-specific downstream ABI and is not an upstream-assigned
+format.
+
+--- a/libavcodec/v4l2_request_hevc.h
++++ b/libavcodec/v4l2_request_hevc.h
+@@ -28,6 +28,12 @@
+ #endif
+ 
+ #include <linux/videodev2.h>
++
++/* SC2-specific downstream ABI; not an upstream-assigned V4L2 pixel format. */
++#ifndef V4L2_PIX_FMT_AMLOGIC_FBC10
++#define V4L2_PIX_FMT_AMLOGIC_FBC10 v4l2_fourcc('A', 'M', 'F', '0')
++#endif
++
+ #ifndef V4L2_CID_CODEC_BASE
+ #define V4L2_CID_CODEC_BASE V4L2_CID_MPEG_BASE
+ #endif
+--- a/libavcodec/v4l2_request_hevc.c
++++ b/libavcodec/v4l2_request_hevc.c
+@@ -129,7 +129,8 @@
+         }
+     }
+     else if (h->ps.sps->bit_depth == 10) {
+-        if (fmtdesc->pixelformat == V4L2_PIX_FMT_NV12_10_COL128) {
++        if (fmtdesc->pixelformat == V4L2_PIX_FMT_NV12_10_COL128 ||
++            fmtdesc->pixelformat == V4L2_PIX_FMT_AMLOGIC_FBC10) {
+             return 1;
+         }
+     }
+@@ -257,6 +258,16 @@
+         char tbuf1[5];
+         av_log(avctx, AV_LOG_ERROR, "Failed to set destination format: %s %dx%d\n", strfourcc(tbuf1, src_pix_fmt), sps->width, sps->height);
+         goto fail4;
++    }
++
++    {
++        const struct v4l2_format *const fmt = mediabufs_dst_fmt(ctx->mbufs);
++        const uint32_t fourcc = V4L2_TYPE_IS_MULTIPLANAR(fmt->type) ?
++            fmt->fmt.pix_mp.pixelformat : fmt->fmt.pix.pixelformat;
++
++        /* AMF0 embeds physical body PFNs; the decoder owns the entire object. */
++        if (fourcc == V4L2_PIX_FMT_AMLOGIC_FBC10)
++            dst_memtype = MEDIABUFS_MEMORY_MMAP;
+     }
+ 
+     if (mediabufs_src_pool_create(ctx->mbufs, ctx->dbufs, 6, src_memtype)) {
+--- a/libavcodec/v4l2_req_hevc_vx.c
++++ b/libavcodec/v4l2_req_hevc_vx.c
+@@ -110,6 +110,9 @@
+         return AV_PIX_FMT_YUV420P;
+     case V4L2_PIX_FMT_NV12:
+         return AV_PIX_FMT_NV12;
++    case V4L2_PIX_FMT_AMLOGIC_FBC10:
++        /* Logical sample depth only; the DRM modifier owns the memory layout. */
++        return AV_PIX_FMT_YUV420P10LE;
+ #if CONFIG_SAND
+     case V4L2_PIX_FMT_NV12_COL128:
+         return AV_PIX_FMT_RPI4_8;
+@@ -789,6 +792,28 @@
+     }
+ 
+     switch (pixelformat) {
++    case V4L2_PIX_FMT_AMLOGIC_FBC10:
++        if (!V4L2_TYPE_IS_MULTIPLANAR(format->type) ||
++            format->fmt.pix_mp.num_planes != 1 || bpl ||
++            !width || !height || (width & 63) || (height & 63))
++            return -1;
++        *desc = (AVDRMFrameDescriptor) {
++            .nb_objects = 1,
++            .objects = {{
++                .fd = -1,
++                /* Main10 is 4096 bytes/block, never MEM_SAVING. */
++                .format_modifier = DRM_FORMAT_MOD_AMLOGIC_FBC(
++                    AMLOGIC_FBC_LAYOUT_SCATTER, 0),
++            }},
++            .nb_layers = 1,
++            .layers = {{
++                .format = DRM_FORMAT_YUV420_10BIT,
++                .nb_planes = 1,
++                /* Header at offset zero; body PFNs are embedded in it. */
++                .planes = {{ .object_index = 0, .offset = 0, .pitch = width }},
++            }},
++        };
++        return 0;
+     case V4L2_PIX_FMT_NV12:
+         layer->format = DRM_FORMAT_NV12;
+         desc->objects[0].format_modifier = DRM_FORMAT_MOD_LINEAR;
+@@ -1185,7 +1210,10 @@
+     }
+ 
+-    // Set the drm_prime desriptor
++    // Set the drm_prime descriptor
+-    drm_from_format(&rd->drm, mediabufs_dst_fmt(ctx->mbufs));
++    if (drm_from_format(&rd->drm, mediabufs_dst_fmt(ctx->mbufs)) < 0) {
++        rv = AVERROR(EINVAL);
++        goto fail;
++    }
+     rd->drm.objects[0].fd = dmabuf_fd(qent_dst_dmabuf(rd->qe_dst, 0));
+     rd->drm.objects[0].size = dmabuf_size(qent_dst_dmabuf(rd->qe_dst, 0));
+ 
+--- a/libavutil/hwcontext_drm.c
++++ b/libavutil/hwcontext_drm.c
+@@ -138,6 +138,13 @@
+     int mmap_prot;
+     void *addr;
+ 
++    for (i = 0; i < desc->nb_objects; i++) {
++        if ((desc->objects[i].format_modifier >> 56) == DRM_FORMAT_MOD_VENDOR_AMLOGIC) {
++            av_log(hwfc, AV_LOG_ERROR, "Amlogic FBC has no CPU-linear mapping\n");
++            return AVERROR(ENOSYS);
++        }
++    }
++
+     map = av_mallocz(sizeof(*map));
+     if (!map)
+         return AVERROR(ENOMEM);

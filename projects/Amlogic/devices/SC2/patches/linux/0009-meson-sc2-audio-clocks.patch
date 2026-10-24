@@ -1,0 +1,138 @@
+From b739946dd85b61464aee05f3fd34dee6837a0ff1 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Mon, 19 Oct 2026 20:30:43 +0800
+Subject: [PATCH] clk: meson: support the SC2 audio clock topology
+
+Reuse the evidenced SM1 audio register and reset layout without
+pretending that SC2 implements the SM1 CLK81/SYSCLK divider block.
+Its peripheral gate root is the external sys_clk input, as declared
+by the SC2 vendor clock controller.
+
+Map the native SC2 provider root to pclk and reject absent divider
+IDs in both clock registration and provider lookup. Reuse existing
+clock/reset IDs and avoid a duplicate graph or probe allocations.
+
+
+---
+ .../clock/amlogic,axg-audio-clkc.yaml         |  7 +++-
+ drivers/clk/meson/axg-audio.c                 | 42 ++++++++++++++++++-
+ 2 files changed, 46 insertions(+), 3 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/clock/amlogic,axg-audio-clkc.yaml b/Documentation/devicetree/bindings/clock/amlogic,axg-audio-clkc.yaml
+index fd7982dd4ceab82389167079c2258a9acff51a76..a272683b6e118dba0280c880a3610b6f0b96700d 100644
+--- a/Documentation/devicetree/bindings/clock/amlogic,axg-audio-clkc.yaml
++++ b/Documentation/devicetree/bindings/clock/amlogic,axg-audio-clkc.yaml
+@@ -10,10 +10,13 @@ maintainers:
+   - Neil Armstrong <neil.armstrong@linaro.org>
+   - Jerome Brunet <jbrunet@baylibre.com>
+ 
+-description:
++description: |
+   The Amlogic AXG audio clock controller generates and supplies clock to the
+   other elements of the audio subsystem, such as fifos, i2s, spdif and pdm
+   devices.
++  SC2 uses the same clock and reset IDs as SM1 (axg-audio-clkc.h and
++  amlogic,meson-g12a-audio-reset.h), except that the CLK81 and SYSCLK divider
++  IDs are not implemented: its peripheral gates are fed directly by pclk.
+ 
+ properties:
+   compatible:
+@@ -21,6 +24,7 @@ properties:
+       - amlogic,axg-audio-clkc
+       - amlogic,g12a-audio-clkc
+       - amlogic,sm1-audio-clkc
++      - amlogic,sc2-audio-clkc
+ 
+   '#clock-cells':
+     const: 1
+@@ -116,6 +120,7 @@ allOf:
+             enum:
+               - amlogic,g12a-audio-clkc
+               - amlogic,sm1-audio-clkc
++              - amlogic,sc2-audio-clkc
+     then:
+       required:
+         - '#reset-cells'
+diff --git a/drivers/clk/meson/axg-audio.c b/drivers/clk/meson/axg-audio.c
+index fd7eca65226117ea796d0b09e3e14918b907543f..fdf71f97641d3a98742f562a9d03e24ecf4b2869 100644
+--- a/drivers/clk/meson/axg-audio.c
++++ b/drivers/clk/meson/axg-audio.c
+@@ -1321,8 +1321,22 @@ struct audioclk_data {
+ 	struct meson_clk_hw_data hw_clks;
+ 	const char *rst_drvname;
+ 	unsigned int max_register;
++	bool bypass_sysclk;
+ };
+ 
++static struct clk_hw *sc2_audio_clk_get(struct of_phandle_args *clkspec,
++				      void *data)
++{
++	unsigned int id = clkspec->args[0];
++
++	if (id >= AUD_CLKID_CLK81_EN && id <= AUD_CLKID_SYSCLK_B_EN)
++		return ERR_PTR(-ENOENT);
++	if (id == AUD_CLKID_TOP)
++		return &axg_aud_top;
++
++	return meson_clk_hw_get(clkspec, data);
++}
++
+ static int axg_audio_clkc_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -1364,7 +1378,15 @@ static int axg_audio_clkc_probe(struct platform_device *pdev)
+ 	for (i = AUD_CLKID_DDR_ARB; i < data->hw_clks.num; i++) {
+ 		const char *name;
+ 
+-		hw = data->hw_clks.hws[i];
++		if (data->bypass_sysclk) {
++			struct of_phandle_args spec = { .args_count = 1, .args = { i } };
++
++			hw = sc2_audio_clk_get(&spec, (void *)&data->hw_clks);
++			if (IS_ERR(hw))
++				continue;
++		} else {
++			hw = data->hw_clks.hws[i];
++		}
+ 		/* array might be sparse */
+ 		if (!hw)
+ 			continue;
+@@ -1378,7 +1400,9 @@ static int axg_audio_clkc_probe(struct platform_device *pdev)
+ 		}
+ 	}
+ 
+-	ret = devm_of_clk_add_hw_provider(dev, meson_clk_hw_get, (void *)&data->hw_clks);
++	ret = devm_of_clk_add_hw_provider(dev,
++		data->bypass_sysclk ? sc2_audio_clk_get : meson_clk_hw_get,
++		(void *)&data->hw_clks);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -1419,6 +1443,17 @@ static const struct audioclk_data sm1_audioclk_data = {
+ 	.max_register = AUDIO_EARCRX_DMAC_CLK_CTRL,
+ };
+ 
++/* Register offsets and reset bits are shared with SM1; sysclk is not. */
++static const struct audioclk_data sc2_audioclk_data = {
++	.hw_clks = {
++		.hws = sm1_audio_hw_clks,
++		.num = ARRAY_SIZE(sm1_audio_hw_clks),
++	},
++	.rst_drvname = "rst-sm1",
++	.max_register = AUDIO_EARCRX_DMAC_CLK_CTRL,
++	.bypass_sysclk = true,
++};
++
+ static const struct of_device_id clkc_match_table[] = {
+ 	{
+ 		.compatible = "amlogic,axg-audio-clkc",
+@@ -1429,6 +1464,9 @@ static const struct of_device_id clkc_match_table[] = {
+ 	}, {
+ 		.compatible = "amlogic,sm1-audio-clkc",
+ 		.data = &sm1_audioclk_data
++	}, {
++		.compatible = "amlogic,sc2-audio-clkc",
++		.data = &sc2_audioclk_data
+ 	}, {}
+ };
+ MODULE_DEVICE_TABLE(of, clkc_match_table);

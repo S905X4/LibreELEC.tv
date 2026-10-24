@@ -1,0 +1,136 @@
+From f36ff4f96555de48f8c0e4f7e40dc54b22384787 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Mon, 19 Oct 2026 22:36:18 +0800
+Subject: [PATCH] drm/meson: use secure firmware access for SC2 HDMI controls
+
+SC2 exposes protected DWC controls through the Amlogic HDMI SMC ABI.
+The generic bridge currently writes these registers through byte MMIO,
+so its encryption-disable and clock-gating updates do not take effect.
+A board probe reproduced an ignored HDCPCFG1 MMIO write and a successful
+SMC write/readback from 0x01 to the requested unencrypted value 0x03.
+
+Route only the protected SC2 clock-disable, HDCP configuration and
+HDCP2.2 control registers through encoded secure DWC selectors. Retain
+MMIO for ordinary registers and leave other Meson variants unchanged.
+Initialize HDCP2.2 to the inactive setting used by the SC2 CoreELEC
+reference driver.
+
+
+---
+ Documentation/gpu/meson.rst           | 17 +++++++++++++
+ drivers/gpu/drm/meson/meson_dw_hdmi.c | 36 +++++++++++++++++++++++++++
+ drivers/gpu/drm/meson/meson_dw_hdmi.h |  7 ++++++
+ 3 files changed, 60 insertions(+)
+
+diff --git a/Documentation/gpu/meson.rst b/Documentation/gpu/meson.rst
+index b9e2f9aa3bd803cd4a41c766044fc3a750fa757d..c105be479a8b47319ff8dd063947cb584f3dbbfe 100644
+--- a/Documentation/gpu/meson.rst
++++ b/Documentation/gpu/meson.rst
+@@ -53,3 +53,20 @@ HDMI Video Output
+ 
+ .. kernel-doc:: drivers/gpu/drm/meson/meson_dw_hdmi.c
+    :doc: HDMI Output
++
++SC2 protected HDMI registers
++----------------------------
++
++SC2 firmware protects the DWC clock-disable, HDCP configuration and HDCP2.2
++control registers. Direct byte MMIO reads are possible, but writes to those
++registers are ignored. The SC2 register callbacks use the firmware HDMI
++register services (SMC 0x82000018/0x82000019) with the encoded secure DWC
++selector, not the physical MMIO address. Other DWC registers and other
++Meson variants retain their existing access paths.
++
++The unencrypted bridge also initializes HDCP2.2 control to the inactive
++setting used by the SC2 CoreELEC reference driver, without HDCP authentication.
++On HK1 RBOX X4, a reversible probe changed HDCPCFG1 from 0x01 to 0x03 through
++SMC, while a direct MMIO write to that same register was ignored. Correct
++register readback, measured pixel clocks and active DRM scanout are not proof
++that a physical sink displays the intended pixels.
+diff --git a/drivers/gpu/drm/meson/meson_dw_hdmi.c b/drivers/gpu/drm/meson/meson_dw_hdmi.c
+index 25a1f5802241cb809bae000f9626469ed9b90b1f..bff4e6a0a3d4346f3cc67d2895068586cb716af6 100644
+--- a/drivers/gpu/drm/meson/meson_dw_hdmi.c
++++ b/drivers/gpu/drm/meson/meson_dw_hdmi.c
+@@ -5,6 +5,7 @@
+  * Copyright (C) 2015 Amlogic, Inc. All rights reserved.
+  */
+ 
++#include <linux/arm-smccc.h>
+ #include <linux/clk.h>
+ #include <linux/component.h>
+ #include <linux/kernel.h>
+@@ -245,9 +246,30 @@ static unsigned int dw_hdmi_dwc_read(struct meson_dw_hdmi *dw_hdmi,
+ 	return data;
+ }
+ 
++static bool dw_hdmi_sc2_secure_reg(unsigned int addr)
++{
++	switch (addr) {
++	case HDMITX_DWC_MC_CLKDIS:
++	case HDMITX_DWC_A_HDCPCFG0:
++	case HDMITX_DWC_A_HDCPCFG1:
++	case HDMITX_DWC_HDCP22REG_CTRL:
++		return true;
++	default:
++		return false;
++	}
++}
++
+ static unsigned int dw_hdmi_g12a_dwc_read(struct meson_dw_hdmi *dw_hdmi,
+ 					  unsigned int addr)
+ {
++	if (dw_hdmi->priv->sc2 && dw_hdmi_sc2_secure_reg(addr)) {
++		struct arm_smccc_res res;
++
++		arm_smccc_smc(0x82000018, HDMITX_DWC_SECURE_REG(addr),
++			      0, 0, 0, 0, 0, 0, &res);
++		return res.a0;
++	}
++
+ 	return readb(dw_hdmi->hdmitx + addr);
+ }
+ 
+@@ -271,6 +293,14 @@ static inline void dw_hdmi_dwc_write(struct meson_dw_hdmi *dw_hdmi,
+ static inline void dw_hdmi_g12a_dwc_write(struct meson_dw_hdmi *dw_hdmi,
+ 					  unsigned int addr, unsigned int data)
+ {
++	if (dw_hdmi->priv->sc2 && dw_hdmi_sc2_secure_reg(addr)) {
++		struct arm_smccc_res res;
++
++		arm_smccc_smc(0x82000019, HDMITX_DWC_SECURE_REG(addr),
++			      data, 0, 0, 0, 0, 0, &res);
++		return;
++	}
++
+ 	writeb(data, dw_hdmi->hdmitx + addr);
+ }
+ 
+@@ -674,6 +704,12 @@ static void meson_dw_hdmi_init(struct meson_dw_hdmi *meson_dw_hdmi)
+ 	meson_dw_hdmi->data->top_write(meson_dw_hdmi,
+ 				       HDMITX_TOP_CLK_CNTL, 0xff);
+ 
++	if (priv->sc2) {
++		/* Keep HDCP2.2 inactive for the unencrypted generic bridge. */
++		meson_dw_hdmi->data->dwc_write(meson_dw_hdmi,
++					      HDMITX_DWC_HDCP22REG_CTRL, BIT(1));
++	}
++
+ 	/* Enable normal output to PHY */
+ 	meson_dw_hdmi->data->top_write(meson_dw_hdmi, HDMITX_TOP_BIST_CNTL, BIT(12));
+ 
+diff --git a/drivers/gpu/drm/meson/meson_dw_hdmi.h b/drivers/gpu/drm/meson/meson_dw_hdmi.h
+index 08e1c14e4ea07c694f2c5fccbbf593661a8a3feb..6f86b5c431d82654fcd0c19f4a02022fe623024e 100644
+--- a/drivers/gpu/drm/meson/meson_dw_hdmi.h
++++ b/drivers/gpu/drm/meson/meson_dw_hdmi.h
+@@ -157,4 +157,11 @@
+  */
+ #define HDMITX_TOP_STAT0                        (0x00E)
+ 
++/* SC2 protected DWC registers use the firmware's encoded SMC addresses. */
++#define HDMITX_DWC_SECURE_REG(addr)              (0x11000000 | (addr))
++#define HDMITX_DWC_MC_CLKDIS                    0x4001
++#define HDMITX_DWC_A_HDCPCFG0                    0x5000
++#define HDMITX_DWC_A_HDCPCFG1                    0x5001
++#define HDMITX_DWC_HDCP22REG_CTRL                0x7904
++
+ #endif /* __MESON_DW_HDMI_H */

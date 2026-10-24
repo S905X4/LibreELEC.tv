@@ -1,0 +1,37 @@
+From 64aa465e5b40e5280fc9bba729d0992f49c639a4 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Fri, 23 Oct 2026 19:48:12 +0800
+Subject: [PATCH] media: meson: use frame-ending padding for SC2 MPEG4 drain
+
+Match vmpeg4_multi.c's incomplete-VOP padding instead of the sequence-end code that replays the last SC2 picture completion. Keep real EMPTY, latest writer and exhausted coded-token requirements unchanged. Late-B raster corruption remains separate.
+---
+ drivers/staging/media/meson/vdec/codec_mpeg4.c | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/staging/media/meson/vdec/codec_mpeg4.c b/drivers/staging/media/meson/vdec/codec_mpeg4.c
+index 38127bcef125..812fbf1ce2cd 100644
+--- a/drivers/staging/media/meson/vdec/codec_mpeg4.c
++++ b/drivers/staging/media/meson/vdec/codec_mpeg4.c
+@@ -52,7 +52,11 @@
+ #define MPEG4_INTERLACE BIT(7)
+ #define MPEG4_TOP_FIRST BIT(6)
+ 
+-static const u8 mpeg4_eos[SZ_1K] = { 0, 0, 1, 0xb1 };
++/* vmpeg4_multi.c's frame-ending padding. Sequence-end (0xb1) replays the
++ * last picture on SC2; an incomplete VOP instead produces genuine EMPTY.
++ * The padding has no coded-picture token and must never publish a picture.
++ */
++static const u8 mpeg4_padding[SZ_1K] = { 0, 0, 1, 0xb6 };
+ 
+ /* vmpeg4_save_hw_context()/vmpeg4_hw_ctx_restore(). LMEM and quantization
+  * matrices are saved by the firmware inside the persistent workspace.
+@@ -748,7 +752,8 @@ static int mpeg4_drain_step(struct amvdec_session *sess)
+ 		goto unlock;
+ 	}
+ 	if (!m->eos_queued) {
+-		ret = esparser_queue_eos(sess->core, mpeg4_eos, sizeof(mpeg4_eos));
++		ret = esparser_queue_eos(sess->core, mpeg4_padding,
++					 sizeof(mpeg4_padding));
+ 		if (ret == -EAGAIN) {
+ 			ret = 0;
+ 			goto unlock;

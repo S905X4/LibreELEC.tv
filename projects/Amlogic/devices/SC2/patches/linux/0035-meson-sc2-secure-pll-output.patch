@@ -1,0 +1,477 @@
+From c9c7080efcd2a44a906222ba0091c227a9eb1844 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Tue, 20 Oct 2026 07:17:49 +0800
+Subject: [PATCH] clk: meson: Program SC2 secure PLL output rates atomically
+
+SC2 firmware programs M, N and OD from a final output-frequency request.
+Treating the secure service as a DCO writer lets CCF split that operation
+and sends the wrong rate. A parked-CPU experiment reproduced the fault;
+only the original output-rate request restored the PLL configuration.
+
+Implement SC2-specific SYS and GP1 output operations with BSP rate tables,
+lock polling and hardware output verification. Keep their published DCO
+clocks read-only and read the actual DCO when recalculating output rates,
+rather than using a cache made stale by firmware. Remove the obsolete
+secure DCO writer without changing ordinary Meson PLL programming.
+
+
+---
+ drivers/clk/meson/clk-pll.c    | 121 ---------------------
+ drivers/clk/meson/clk-secure.h |   1 -
+ drivers/clk/meson/sc2.c        | 192 ++++++++++++++++++++++++---------
+ 3 files changed, 144 insertions(+), 170 deletions(-)
+
+diff --git a/drivers/clk/meson/clk-pll.c b/drivers/clk/meson/clk-pll.c
+index 2f7650d160f8..f43a706de351 100644
+--- a/drivers/clk/meson/clk-pll.c
++++ b/drivers/clk/meson/clk-pll.c
+@@ -5,8 +5,6 @@
+  *
+  * Copyright (c) 2018 Baylibre, SAS.
+  * Author: Jerome Brunet <jbrunet@baylibre.com>
+- *
+- * SC2 secure PLL support: Copyright (c) 2018 Amlogic, inc.
+  */
+ 
+ /*
+@@ -28,7 +26,6 @@
+  * out = in * (m + frac / frac_max) / n
+  */
+ 
+-#include <linux/arm-smccc.h>
+ #include <linux/clk-provider.h>
+ #include <linux/delay.h>
+ #include <linux/err.h>
+@@ -39,7 +36,6 @@
+ 
+ #include "clk-regmap.h"
+ #include "clk-pll.h"
+-#include "clk-secure.h"
+ 
+ static inline struct meson_clk_pll_data *
+ meson_clk_pll_data(struct clk_regmap *clk)
+@@ -470,113 +466,6 @@ static int meson_clk_pll_set_rate(struct clk_hw *hw, unsigned long rate,
+ 	return ret;
+ }
+ 
+-static int __meson_secure_clk_pll_set_rate(struct clk_hw *hw, unsigned long rate,
+-					   unsigned long parent_rate)
+-{
+-	struct arm_smccc_res res;
+-
+-	if (!strcmp(clk_hw_get_name(hw), "sys_pll_dco")) {
+-		arm_smccc_smc(CLK_SECURE_RW, SYS_PLL_STEP0, rate, 0, 0, 0, 0, 0, &res);
+-	} else if (!strcmp(clk_hw_get_name(hw), "gp1_pll_dco")) {
+-		arm_smccc_smc(CLK_SECURE_RW, GP1_PLL_STEP0, rate, 0, 0, 0, 0, 0, &res);
+-	} else {
+-		pr_err("%s: %s pll not found!!!\n", __func__, clk_hw_get_name(hw));
+-		return -EINVAL;
+-	}
+-
+-	/* waiting for 10us to rewrite */
+-	udelay(10);
+-
+-	if (!strcmp(clk_hw_get_name(hw), "sys_pll_dco"))
+-		arm_smccc_smc(CLK_SECURE_RW, SYS_PLL_STEP1, 0, 0, 0, 0, 0, 0, &res);
+-	else
+-		arm_smccc_smc(CLK_SECURE_RW, GP1_PLL_STEP1, 0, 0, 0, 0, 0, 0, &res);
+-
+-	return meson_clk_pll_wait_lock(hw);
+-}
+-
+-static int meson_secure_clk_pll_set_rate(struct clk_hw *hw, unsigned long rate,
+-					 unsigned long parent_rate)
+-{
+-	int ret = __meson_secure_clk_pll_set_rate(hw, rate, parent_rate);
+-
+-	if (ret == -ETIMEDOUT) {
+-		pr_info("%s: %s did not lock, trying to lock rate %lu again\n",
+-			__func__, clk_hw_get_name(hw), rate);
+-		ret = __meson_secure_clk_pll_set_rate(hw, rate, parent_rate);
+-	}
+-	if (!ret && meson_clk_pll_recalc_rate(hw, parent_rate) != rate)
+-		return -EIO;
+-
+-	return ret;
+-}
+-
+-static long meson_secure_clk_pll_round_rate(struct clk_hw *hw, unsigned long rate,
+-					    unsigned long *parent_rate)
+-{
+-	struct clk_regmap *clk = to_clk_regmap(hw);
+-	struct meson_clk_pll_data *pll = meson_clk_pll_data(clk);
+-	const struct pll_params_table *entry;
+-	unsigned long prate = parent_rate ? *parent_rate :
+-		clk_hw_get_rate(clk_hw_get_parent(hw));
+-	unsigned long best = 0, best_delta = ULONG_MAX;
+-
+-	/* Do not advertise arbitrary, potentially out-of-range DCO requests. */
+-	for (entry = pll->table; entry && entry->n; entry++) {
+-		unsigned long now = __pll_params_to_rate(prate, entry->m,
+-							entry->n, 0, pll);
+-		unsigned long delta = now > rate ? now - rate : rate - now;
+-
+-		if (delta < best_delta) {
+-			best = now;
+-			best_delta = delta;
+-		}
+-	}
+-
+-	return best ? best : -EINVAL;
+-}
+-
+-static int meson_secure_clk_pll_enable(struct clk_hw *hw)
+-{
+-	struct clk_regmap *clk = to_clk_regmap(hw);
+-	struct meson_clk_pll_data *pll = meson_clk_pll_data(clk);
+-	unsigned int val;
+-	struct clk_hw *parent = clk_hw_get_parent(hw);
+-	bool first_set = true;
+-	u64 rate;
+-
+-	if (meson_parm_read(clk->map, &pll->en))
+-		return 0;
+-
+-	if (!strcmp(clk_hw_get_name(hw), "sys_pll_dco") ||
+-	    !strcmp(clk_hw_get_name(hw), "gp1_pll_dco")) {
+-		regmap_read(clk->map, (&pll->en)->reg_off + (6 * 4), &val);
+-		if (val == 0x56540000)
+-			first_set = false;
+-	}
+-
+-	/*First init, just set minimal rate.*/
+-	if (first_set) {
+-		rate = __pll_params_to_rate(clk_hw_get_rate(parent), pll->table[0].m,
+-					    pll->table[0].n, 0, pll);
+-	} else {
+-		rate = meson_clk_pll_recalc_rate(hw, clk_hw_get_rate(parent));
+-		rate = meson_secure_clk_pll_round_rate(hw, rate, NULL);
+-	}
+-
+-	return meson_secure_clk_pll_set_rate(hw, rate, clk_hw_get_rate(parent));
+-}
+-
+-static void meson_secure_clk_pll_disable(struct clk_hw *hw)
+-{
+-	struct arm_smccc_res res;
+-
+-	if (!strcmp(clk_hw_get_name(hw), "sys_pll_dco"))
+-		arm_smccc_smc(CLK_SECURE_RW, SYS_PLL_DISABLE, 0, 0, 0, 0, 0, 0, &res);
+-	else
+-		arm_smccc_smc(CLK_SECURE_RW, GP1_PLL_DISABLE, 0, 0, 0, 0, 0, 0, &res);
+-}
+-
+ /*
+  * The Meson G12A PCIE PLL is fined tuned to deliver a very precise
+  * 100MHz reference clock for the PCIe Analog PHY, and thus requires
+@@ -612,16 +501,6 @@ const struct clk_ops meson_clk_pll_ro_ops = {
+ };
+ EXPORT_SYMBOL_NS_GPL(meson_clk_pll_ro_ops, "CLK_MESON");
+ 
+-const struct clk_ops meson_secure_clk_pll_ops = {
+-	.init		= clk_regmap_init,
+-	.recalc_rate	= meson_clk_pll_recalc_rate,
+-	.round_rate	= meson_secure_clk_pll_round_rate,
+-	.set_rate	= meson_secure_clk_pll_set_rate,
+-	.enable		= meson_secure_clk_pll_enable,
+-	.disable	= meson_secure_clk_pll_disable
+-};
+-EXPORT_SYMBOL_NS_GPL(meson_secure_clk_pll_ops, "CLK_MESON");
+-
+ MODULE_DESCRIPTION("Amlogic PLL driver");
+ MODULE_AUTHOR("Carlo Caione <carlo@endlessm.com>");
+ MODULE_AUTHOR("Jerome Brunet <jbrunet@baylibre.com>");
+diff --git a/drivers/clk/meson/clk-secure.h b/drivers/clk/meson/clk-secure.h
+index a3141d5eb4c2..f426fdd8b975 100644
+--- a/drivers/clk/meson/clk-secure.h
++++ b/drivers/clk/meson/clk-secure.h
+@@ -36,7 +36,6 @@
+ #define DSU_DIVIDER_SET_RATE 10
+ #define CPU_DIVIDER_SET_RATE 11
+ 
+-extern const struct clk_ops meson_secure_clk_pll_ops; /* for sc2 secure pll*/
+ extern const struct clk_ops meson_clk_regmap_secure_divider_ops;
+ extern const struct clk_ops meson_clk_regmap_secure_divider_ro_ops;
+ extern const struct clk_ops meson_clk_regmap_secure_mux_ops;
+diff --git a/drivers/clk/meson/sc2.c b/drivers/clk/meson/sc2.c
+index db7879a13966..a1fb78a7ca27 100644
+--- a/drivers/clk/meson/sc2.c
++++ b/drivers/clk/meson/sc2.c
+@@ -5,9 +5,11 @@
+  * Copyright (c) 2018 Amlogic, inc.
+  */
+ 
++#include <linux/arm-smccc.h>
+ #include <linux/clk-provider.h>
+ #include <linux/delay.h>
+ #include <linux/init.h>
++#include <linux/iopoll.h>
+ #include <linux/of_device.h>
+ #include <linux/platform_device.h>
+ #include <linux/clk.h>
+@@ -24,6 +26,123 @@
+ #include "sc2.h"
+ #include <dt-bindings/clock/amlogic,sc2-clkc.h>
+ 
++struct sc2_secure_pll_data {
++	unsigned int reg_off;
++	unsigned int smc_step;
++	const unsigned long *rates;
++	unsigned int num_rates;
++};
++
++static unsigned long sc2_secure_pll_recalc_rate(struct clk_hw *hw,
++						unsigned long parent_rate)
++{
++	struct clk_regmap *clk = to_clk_regmap(hw);
++	struct sc2_secure_pll_data *data = clk->data;
++	struct clk_hw *dco = clk_hw_get_parent(hw);
++	unsigned int val;
++
++	if (regmap_read(clk->map, data->reg_off, &val))
++		return 0;
++
++	/* Firmware changes M, N and OD together; the DCO cache can be stale. */
++	parent_rate = meson_clk_pll_ro_ops.recalc_rate(dco,
++			clk_hw_get_rate(clk_hw_get_parent(dco)));
++	return parent_rate >> ((val >> 16) & 7);
++}
++
++static long sc2_secure_pll_round_rate(struct clk_hw *hw, unsigned long rate,
++				      unsigned long *parent_rate)
++{
++	struct sc2_secure_pll_data *data = to_clk_regmap(hw)->data;
++	unsigned long best = 0, best_delta = ULONG_MAX;
++	unsigned int i;
++
++	for (i = 0; i < data->num_rates; i++) {
++		unsigned long now = data->rates[i];
++		unsigned long delta = now > rate ? now - rate : rate - now;
++
++		if (delta < best_delta) {
++			best = now;
++			best_delta = delta;
++		}
++	}
++
++	return best;
++}
++
++static int sc2_secure_pll_set_rate(struct clk_hw *hw, unsigned long rate,
++				   unsigned long parent_rate)
++{
++	struct clk_regmap *clk = to_clk_regmap(hw);
++	struct sc2_secure_pll_data *data = clk->data;
++	struct arm_smccc_res res;
++	unsigned long actual;
++	unsigned int val, i;
++	int ret;
++
++	for (i = 0; i < data->num_rates; i++)
++		if (rate == data->rates[i])
++			break;
++	if (i == data->num_rates)
++		return -EINVAL;
++
++	/* The SMC takes the final output rate, never the internal DCO rate. */
++	arm_smccc_smc(CLK_SECURE_RW, data->smc_step, rate,
++		      0, 0, 0, 0, 0, &res);
++	if ((int)res.a0 == SMCCC_RET_NOT_SUPPORTED)
++		return -EOPNOTSUPP;
++	/* The enable callback also uses this path, so settling must be atomic. */
++	udelay(10);
++	arm_smccc_smc(CLK_SECURE_RW, data->smc_step + 1,
++		      0, 0, 0, 0, 0, 0, &res);
++	if ((int)res.a0 == SMCCC_RET_NOT_SUPPORTED)
++		return -EOPNOTSUPP;
++	ret = regmap_read_poll_timeout_atomic(clk->map, data->reg_off, val,
++					      val & BIT(31), 20, 100000);
++	if (ret)
++		return ret;
++
++	actual = sc2_secure_pll_recalc_rate(hw, parent_rate);
++	if (actual != rate) {
++		pr_err("%s: firmware returned %lu Hz for %lu Hz\n",
++		       clk_hw_get_name(hw), actual, rate);
++		return -EIO;
++	}
++
++	return 0;
++}
++
++static int sc2_secure_pll_is_enabled(struct clk_hw *hw)
++{
++	struct clk_regmap *clk = to_clk_regmap(hw);
++	struct sc2_secure_pll_data *data = clk->data;
++	unsigned int val;
++
++	if (regmap_read(clk->map, data->reg_off, &val))
++		return 0;
++	return (val & (BIT(31) | BIT(29) | BIT(28))) == (BIT(31) | BIT(28));
++}
++
++static int sc2_secure_pll_enable(struct clk_hw *hw)
++{
++	unsigned long rate;
++
++	if (sc2_secure_pll_is_enabled(hw))
++		return 0;
++	rate = sc2_secure_pll_recalc_rate(hw, 0);
++	rate = sc2_secure_pll_round_rate(hw, rate, NULL);
++	return sc2_secure_pll_set_rate(hw, rate, 0);
++}
++
++static const struct clk_ops sc2_secure_pll_ops = {
++	.init = clk_regmap_init,
++	.recalc_rate = sc2_secure_pll_recalc_rate,
++	.round_rate = sc2_secure_pll_round_rate,
++	.set_rate = sc2_secure_pll_set_rate,
++	.is_enabled = sc2_secure_pll_is_enabled,
++	.enable = sc2_secure_pll_enable,
++};
++
+ static struct clk_regmap sc2_fixed_pll_dco = {
+ 	.data = &(struct meson_clk_pll_data){
+ 		.en = {
+@@ -88,30 +207,12 @@ static struct clk_regmap sc2_fixed_pll = {
+ 	},
+ };
+ 
+-/*
+- * the sys pll DCO value should be 3G~6G,
+- * otherwise the sys pll can not lock.
+- * od is for 32 bit.
+- */
+-
+-static const struct pll_params_table sc2_sys_pll_params_table[] = {
+-	PLL_PARAMS(168, 1), /*DCO=4032M OD=1008M*/
+-	PLL_PARAMS(184, 1), /*DCO=4416M OD=1104M*/
+-	PLL_PARAMS(200, 1), /*DCO=4800M OD=1200M*/
+-	PLL_PARAMS(216, 1), /*DCO=5184M OD=1296M*/
+-	PLL_PARAMS(233, 1), /*DCO=5592M OD=1398M*/
+-	PLL_PARAMS(234, 1), /*DCO=5616M OD=1404M*/
+-	PLL_PARAMS(249, 1), /*DCO=5976M OD=1494M*/
+-	PLL_PARAMS(125, 1), /*DCO=3000M OD=1500M*/
+-	PLL_PARAMS(126, 1), /*DCO=3024M OD=1512M*/
+-	PLL_PARAMS(134, 1), /*DCO=3216M OD=1608M*/
+-	PLL_PARAMS(142, 1), /*DCO=3408M OD=1704M*/
+-	PLL_PARAMS(150, 1), /*DCO=3600M OD=1800M*/
+-	PLL_PARAMS(158, 1), /*DCO=3792M OD=1896M*/
+-	PLL_PARAMS(159, 1), /*DCO=3816M OD=1908*/
+-	PLL_PARAMS(160, 1), /*DCO=3840M OD=1920M*/
+-	PLL_PARAMS(167, 1), /*DCO=4008M OD=2004M*/
+-	{ /* sentinel */ }
++/* Final rates from the SC2 BSP; secure firmware owns M, N and OD. */
++static const unsigned long sc2_sys_pll_rates[] = {
++	1008000000, 1104000000, 1200000000, 1296000000,
++	1398000000, 1404000000, 1494000000, 1500000000,
++	1512000000, 1608000000, 1704000000, 1800000000,
++	1896000000, 1908000000, 1920000000, 2004000000,
+ };
+ 
+ static struct clk_regmap sc2_sys_pll_dco = {
+@@ -131,7 +232,6 @@ static struct clk_regmap sc2_sys_pll_dco = {
+ 			.shift   = 10,
+ 			.width   = 5,
+ 		},
+-		.table = sc2_sys_pll_params_table,
+ 		.l = {
+ 			.reg_off = ANACTRL_SYSPLL_CTRL0,
+ 			.shift   = 31,
+@@ -145,29 +245,29 @@ static struct clk_regmap sc2_sys_pll_dco = {
+ 	},
+ 	.hw.init = &(struct clk_init_data){
+ 		.name = "sys_pll_dco",
+-		.ops = &meson_secure_clk_pll_ops,
++		.ops = &meson_clk_pll_ro_ops,
+ 		.parent_names = (const char *[]){ "xtal" },
+ 		.num_parents = 1,
+ 		/* This clock feeds the CPU, avoid disabling it */
+-		.flags = CLK_IS_CRITICAL,
++		.flags = CLK_IS_CRITICAL | CLK_GET_RATE_NOCACHE,
+ 	},
+ };
+ 
+ static struct clk_regmap sc2_sys_pll = {
+-	.data = &(struct clk_regmap_div_data){
+-		.offset = ANACTRL_SYSPLL_CTRL0,
+-		.shift = 16,
+-		.width = 3,
+-		.flags = CLK_DIVIDER_POWER_OF_TWO,
++	.data = &(struct sc2_secure_pll_data){
++		.reg_off = ANACTRL_SYSPLL_CTRL0,
++		.smc_step = SYS_PLL_STEP0,
++		.rates = sc2_sys_pll_rates,
++		.num_rates = ARRAY_SIZE(sc2_sys_pll_rates),
+ 	},
+ 	.hw.init = &(struct clk_init_data){
+ 		.name = "sys_pll",
+-		.ops = &clk_regmap_divider_ops,
++		.ops = &sc2_secure_pll_ops,
+ 		.parent_hws = (const struct clk_hw *[]) {
+ 			&sc2_sys_pll_dco.hw
+ 		},
+ 		.num_parents = 1,
+-		.flags = CLK_SET_RATE_PARENT,
++		.flags = CLK_IS_CRITICAL | CLK_GET_RATE_NOCACHE,
+ 	},
+ };
+ 
+@@ -427,10 +527,8 @@ static struct clk_regmap sc2_gp0_pll = {
+ 	},
+ };
+ 
+-static const struct pll_params_table sc2_gp1_pll_table[] = {
+-	PLL_PARAMS(200, 1), /*DCO=4800M OD=1200M*/
+-	PLL_PARAMS(125, 1), /*DCO=3000M OD=1500M*/
+-	{ /* sentinel */  }
++static const unsigned long sc2_gp1_pll_rates[] = {
++	1200000000, 1500000000,
+ };
+ 
+ static struct clk_regmap sc2_gp1_pll_dco = {
+@@ -465,11 +563,10 @@ static struct clk_regmap sc2_gp1_pll_dco = {
+ 			.shift   = 29,
+ 			.width   = 1,
+ 		},
+-		.table = sc2_gp1_pll_table,
+ 	},
+ 	.hw.init = &(struct clk_init_data){
+ 		.name = "gp1_pll_dco",
+-		.ops = &meson_secure_clk_pll_ops,
++		.ops = &meson_clk_pll_ro_ops,
+ 		.parent_data = &(const struct clk_parent_data) {
+ 			.fw_name = "xtal",
+ 		},
+@@ -480,21 +577,20 @@ static struct clk_regmap sc2_gp1_pll_dco = {
+ };
+ 
+ static struct clk_regmap sc2_gp1_pll = {
+-	.data = &(struct clk_regmap_div_data){
+-		.offset = ANACTRL_GP1PLL_CTRL0,
+-		.shift = 16,
+-		.width = 3,
+-		.flags = CLK_DIVIDER_POWER_OF_TWO | CLK_DIVIDER_ROUND_CLOSEST |
+-			 CLK_DIVIDER_READ_ONLY,
++	.data = &(struct sc2_secure_pll_data){
++		.reg_off = ANACTRL_GP1PLL_CTRL0,
++		.smc_step = GP1_PLL_STEP0,
++		.rates = sc2_gp1_pll_rates,
++		.num_rates = ARRAY_SIZE(sc2_gp1_pll_rates),
+ 	},
+ 	.hw.init = &(struct clk_init_data){
+ 		.name = "gp1_pll",
+-		.ops = &clk_regmap_divider_ro_ops,
++		.ops = &sc2_secure_pll_ops,
+ 		.parent_hws = (const struct clk_hw *[]) {
+ 			&sc2_gp1_pll_dco.hw
+ 		},
+ 		.num_parents = 1,
+-		.flags = CLK_GET_RATE_NOCACHE | CLK_SET_RATE_PARENT,
++		.flags = CLK_IS_CRITICAL | CLK_GET_RATE_NOCACHE,
+ 	},
+ };
+ 
+-- 
+2.47.3
+

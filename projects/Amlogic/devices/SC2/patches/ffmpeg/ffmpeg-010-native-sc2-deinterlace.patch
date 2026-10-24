@@ -1,0 +1,620 @@
+Subject: [PATCH] avfilter: native SC2 DRM PRIME field-rate hardware EI
+
+Spatial EI only; no MA/MC or software fallback. DMABUF imports and exported
+capture lifetimes remain separate across drain, seek and graph teardown.
+
+--- a/configure
++++ b/configure
+@@ -3671,6 +3671,7 @@
+ deinterlace_qsv_filter_deps="libmfx"
+ deinterlace_qsv_filter_select="qsvvpp"
+ deinterlace_vaapi_filter_deps="vaapi"
++sc2_deinterlace_filter_deps="libdrm v4l2_m2m pthreads"
+ delogo_filter_deps="gpl"
+ denoise_vaapi_filter_deps="vaapi"
+ derain_filter_select="dnn"
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -263,6 +263,7 @@
+ OBJS-$(CONFIG_DEINTERLACE_QSV_FILTER)        += vf_vpp_qsv.o
+ OBJS-$(CONFIG_DEINTERLACE_VAAPI_FILTER)      += vf_deinterlace_vaapi.o vaapi_vpp.o
+ OBJS-$(CONFIG_DEINTERLACE_V4L2M2M_FILTER)    += vf_deinterlace_v4l2m2m.o
++OBJS-$(CONFIG_SC2_DEINTERLACE_FILTER)        += vf_sc2_deinterlace.o
+ OBJS-$(CONFIG_DEJUDDER_FILTER)               += vf_dejudder.o
+ OBJS-$(CONFIG_DELOGO_FILTER)                 += vf_delogo.o
+ OBJS-$(CONFIG_DENOISE_VAAPI_FILTER)          += vf_misc_vaapi.o vaapi_vpp.o
+--- a/libavfilter/allfilters.c
++++ b/libavfilter/allfilters.c
+@@ -249,6 +249,7 @@
+ extern const AVFilter ff_vf_deshake_opencl;
+ extern const AVFilter ff_vf_despill;
+ extern const AVFilter ff_vf_deinterlace_v4l2m2m;
++extern const AVFilter ff_vf_sc2_deinterlace;
+ extern const AVFilter ff_vf_detelecine;
+ extern const AVFilter ff_vf_dilation;
+ extern const AVFilter ff_vf_dilation_opencl;
+--- a/doc/filters.texi
++++ b/doc/filters.texi
+@@ -31021,3 +31021,23 @@
+ @end table
+ 
+ @c man end MULTIMEDIA SOURCES
++
++@section sc2_deinterlace
++
++SC2-only native hardware edge interpolation at field rate. Input is linear
++NV12 DRM PRIME with two planes; output remains DRM PRIME. Each interlaced
++frame produces two progressive frames in top/bottom temporal order. A
++25-frame/s top-first source produces 50 progressive outputs/s. Output time
++base is half the input time base. Input duration, or the negotiated frame
++rate if duration is absent, defines the field interval.
++
++This is spatial edge interpolation, not temporal MA/MC or CE algorithm
++parity. The filter opens only a meson-sc2-di V4L2 device; absent hardware or
++hardware errors are errors, never software fallback. The coded allocation
++height and visible crop are negotiated separately, including 1088/1080.
++Coded geometry comes from negotiated frame/hardware-frame dimensions.
++DMABUF object sizes only bound plane extents; allocator padding is ignored.
++Input DMABUF references survive both field completions. Exported capture
++references survive graph destruction; STREAMOFF aborts pending DMA before
++input references are released. No temporal history crosses a seek because
++there is no temporal algorithm. Normal end of stream has no delayed field.
+--- /dev/null
++++ b/libavfilter/vf_sc2_deinterlace.c
+@@ -0,0 +1,556 @@
++/*
++ * Native SC2 field-rate hardware edge interpolation.
++ * Copyright (c) 2026
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++#define _GNU_SOURCE
++#include <dirent.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <poll.h>
++#include <pthread.h>
++#include <stdatomic.h>
++#include <stdio.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++#include <linux/videodev2.h>
++#include <drm_fourcc.h>
++#include "libavutil/hwcontext.h"
++#include "libavutil/hwcontext_drm.h"
++#include "libavutil/mathematics.h"
++#include "libavutil/mem.h"
++#include "libavutil/time.h"
++#include "avfilter.h"
++#include "formats.h"
++#include "internal.h"
++#include "video.h"
++
++#define SC2_BUFFERS 8
++
++typedef struct SC2Session SC2Session;
++typedef struct SC2Buffer {
++    SC2Session *session;
++    unsigned index;
++    AVDRMFrameDescriptor drm;
++} SC2Buffer;
++
++struct SC2Session {
++    atomic_uint refs;
++    pthread_mutex_t mutex;
++    int fd;
++    int streaming[2];
++    int stopped;
++    int error;
++    unsigned count;
++    int width, height, coded_height;
++    unsigned pitch[2];
++    size_t crop_left, crop_top;
++    SC2Buffer buffers[SC2_BUFFERS];
++};
++
++typedef struct SC2Context {
++    SC2Session *session;
++} SC2Context;
++
++static int sc2_ioctl(int fd, unsigned long cmd, void *arg)
++{
++    int ret;
++    do ret = ioctl(fd, cmd, arg); while (ret < 0 && errno == EINTR);
++    return ret < 0 ? AVERROR(errno) : 0;
++}
++
++static void sc2_unref(SC2Session *s)
++{
++    unsigned i, p;
++    if (atomic_fetch_sub(&s->refs, 1) != 1)
++        return;
++    for (i = 0; i < s->count; i++)
++        for (p = 0; p < 2; p++)
++            if (s->buffers[i].drm.objects[p].fd >= 0)
++                close(s->buffers[i].drm.objects[p].fd);
++    close(s->fd);
++    pthread_mutex_destroy(&s->mutex);
++    av_free(s);
++}
++
++static void sc2_stop(SC2Session *s)
++{
++    enum v4l2_buf_type type;
++    unsigned i;
++    pthread_mutex_lock(&s->mutex);
++    s->stopped = 1;
++    for (i = 0; i < 2; i++) {
++        if (!s->streaming[i])
++            continue;
++        type = i ? V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE :
++                   V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
++        sc2_ioctl(s->fd, VIDIOC_STREAMOFF, &type);
++        s->streaming[i] = 0;
++    }
++    pthread_mutex_unlock(&s->mutex);
++}
++
++static int sc2_qcapture(SC2Buffer *b)
++{
++    struct v4l2_plane planes[2] = { 0 };
++    struct v4l2_buffer v = {
++        .type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
++        .memory = V4L2_MEMORY_MMAP,
++        .index = b->index, .length = 2, .m.planes = planes,
++    };
++    return sc2_ioctl(b->session->fd, VIDIOC_QBUF, &v);
++}
++
++static void sc2_release(void *opaque, uint8_t *data)
++{
++    SC2Buffer *b = opaque;
++    SC2Session *s = b->session;
++    int ret;
++    pthread_mutex_lock(&s->mutex);
++    if (!s->stopped && (ret = sc2_qcapture(b)) < 0)
++        s->error = ret;
++    pthread_mutex_unlock(&s->mutex);
++    sc2_unref(s);
++}
++
++static int sc2_find(void)
++{
++    struct dirent *entry;
++    DIR *dir = opendir("/dev");
++    int fd = -1;
++    if (!dir)
++        return AVERROR(errno);
++    while ((entry = readdir(dir))) {
++        struct v4l2_capability cap = { 0 };
++        char path[300];
++        if (strncmp(entry->d_name, "video", 5))
++            continue;
++        snprintf(path, sizeof(path), "/dev/%s", entry->d_name);
++        fd = open(path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
++        if (fd < 0)
++            continue;
++        if (sc2_ioctl(fd, VIDIOC_QUERYCAP, &cap) >= 0 &&
++            !strcmp((const char *)cap.driver, "meson-sc2-di") &&
++            (cap.device_caps & V4L2_CAP_VIDEO_M2M_MPLANE))
++            break;
++        close(fd);
++        fd = -1;
++    }
++    closedir(dir);
++    return fd >= 0 ? fd : AVERROR(ENODEV);
++}
++
++static int sc2_layout(const AVFrame *in, int *coded_height)
++{
++    const AVDRMFrameDescriptor *d = (const void *)in->data[0];
++    const AVDRMLayerDescriptor *l;
++    size_t end;
++    unsigned p;
++    if (!d || d->nb_layers != 1 || d->nb_objects < 1 || d->nb_objects > 2)
++        return AVERROR(EINVAL);
++    l = &d->layers[0];
++    if (l->format != DRM_FORMAT_NV12 || l->nb_planes != 2)
++        return AVERROR(ENOSYS);
++    for (p = 0; p < 2; p++) {
++        int obj = l->planes[p].object_index;
++        if (obj < 0 || obj >= d->nb_objects ||
++            d->objects[obj].format_modifier != DRM_FORMAT_MOD_LINEAR ||
++            l->planes[p].offset < 0 || l->planes[p].pitch <= 0 ||
++            l->planes[p].pitch > 4096 || (l->planes[p].pitch & 31) ||
++            (l->planes[p].offset & 7) ||
++            l->planes[p].offset >= d->objects[obj].size)
++            return AVERROR(EINVAL);
++    }
++    *coded_height = in->height;
++    if (in->hw_frames_ctx) {
++        const AVHWFramesContext *frames = (const void *)in->hw_frames_ctx->data;
++        if (frames->width < in->width || frames->height < in->height)
++            return AVERROR(EINVAL);
++        *coded_height = frames->height;
++    }
++    if (*coded_height < in->height || *coded_height > 1088 ||
++        (*coded_height & 3) || in->crop_left + in->crop_right >= in->width ||
++        in->crop_top + in->crop_bottom >= in->height)
++        return AVERROR(EINVAL);
++    /* Allocation lengths can include page/64-KiB padding, never geometry. */
++    for (p = 0; p < 2; p++) {
++        int obj = l->planes[p].object_index;
++        end = (size_t)(*coded_height >> p) * l->planes[p].pitch;
++        if (end > d->objects[obj].size - l->planes[p].offset)
++            return AVERROR(EINVAL);
++    }
++    if (l->planes[1].object_index == l->planes[0].object_index &&
++        l->planes[1].offset < l->planes[0].offset +
++            (size_t)*coded_height * l->planes[0].pitch)
++        return AVERROR(EINVAL);
++    return 0;
++}
++
++static int sc2_configure(AVFilterContext *avctx, AVFrame *in, int coded_height)
++{
++    SC2Context *ctx = avctx->priv;
++    const AVDRMFrameDescriptor *d = (const void *)in->data[0];
++    const AVDRMLayerDescriptor *l = &d->layers[0];
++    SC2Session *s;
++    struct v4l2_requestbuffers req = { 0 };
++    struct v4l2_selection sel = { 0 };
++    struct v4l2_streamparm parm = { 0 };
++    struct v4l2_format fmt = { 0 };
++    unsigned i, p;
++    int ret;
++    int width = in->width - in->crop_left - in->crop_right;
++    int height = in->height - in->crop_top - in->crop_bottom;
++    if (ctx->session) {
++        sc2_stop(ctx->session);
++        sc2_unref(ctx->session);
++        ctx->session = NULL;
++    }
++    s = av_mallocz(sizeof(*s));
++    if (!s)
++        return AVERROR(ENOMEM);
++    atomic_init(&s->refs, 1);
++    pthread_mutex_init(&s->mutex, NULL);
++    s->fd = sc2_find();
++    if (s->fd < 0) {
++        ret = s->fd;
++        goto fail;
++    }
++    s->width = width;
++    s->height = height;
++    s->coded_height = coded_height;
++    s->crop_left = in->crop_left;
++    s->crop_top = in->crop_top;
++    fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
++    fmt.fmt.pix_mp.width = in->width;
++    fmt.fmt.pix_mp.height = coded_height;
++    fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12M;
++    fmt.fmt.pix_mp.field = in->top_field_first ?
++        V4L2_FIELD_INTERLACED_TB : V4L2_FIELD_INTERLACED_BT;
++    fmt.fmt.pix_mp.num_planes = 2;
++    for (p = 0; p < 2; p++) {
++        s->pitch[p] = l->planes[p].pitch;
++        fmt.fmt.pix_mp.plane_fmt[p].bytesperline = s->pitch[p];
++    }
++    if ((ret = sc2_ioctl(s->fd, VIDIOC_S_FMT, &fmt)) < 0)
++        goto fail;
++    for (p = 0; p < 2; p++)
++        if (fmt.fmt.pix_mp.plane_fmt[p].bytesperline != s->pitch[p]) {
++            ret = AVERROR(EINVAL);
++            goto fail;
++        }
++    sel.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
++    sel.target = V4L2_SEL_TGT_CROP;
++    sel.r = (struct v4l2_rect) { in->crop_left, in->crop_top, width, height };
++    if ((ret = sc2_ioctl(s->fd, VIDIOC_S_SELECTION, &sel)) < 0)
++        goto fail;
++    memset(&fmt, 0, sizeof(fmt));
++    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++    fmt.fmt.pix_mp.width = width;
++    fmt.fmt.pix_mp.height = height;
++    fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12M;
++    fmt.fmt.pix_mp.field = V4L2_FIELD_NONE;
++    fmt.fmt.pix_mp.num_planes = 2;
++    if ((ret = sc2_ioctl(s->fd, VIDIOC_S_FMT, &fmt)) < 0)
++        goto fail;
++    if (fmt.fmt.pix_mp.width != width || fmt.fmt.pix_mp.height != height ||
++        fmt.fmt.pix_mp.pixelformat != V4L2_PIX_FMT_NV12M) {
++        ret = AVERROR(EINVAL);
++        goto fail;
++    }
++    parm.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
++    if (avctx->inputs[0]->frame_rate.num > 0) {
++        parm.parm.output.timeperframe.numerator = avctx->inputs[0]->frame_rate.den;
++        parm.parm.output.timeperframe.denominator = avctx->inputs[0]->frame_rate.num;
++        if ((ret = sc2_ioctl(s->fd, VIDIOC_S_PARM, &parm)) < 0)
++            goto fail;
++    }
++    req.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
++    req.memory = V4L2_MEMORY_DMABUF;
++    req.count = 1;
++    if ((ret = sc2_ioctl(s->fd, VIDIOC_REQBUFS, &req)) < 0)
++        goto fail;
++    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++    req.memory = V4L2_MEMORY_MMAP;
++    req.count = SC2_BUFFERS;
++    if ((ret = sc2_ioctl(s->fd, VIDIOC_REQBUFS, &req)) < 0)
++        goto fail;
++    if (req.count < 2 || req.count > SC2_BUFFERS) {
++        ret = AVERROR(ENOMEM);
++        goto fail;
++    }
++    s->count = req.count;
++    for (i = 0; i < s->count; i++)
++        for (p = 0; p < 2; p++)
++            s->buffers[i].drm.objects[p].fd = -1;
++    for (i = 0; i < s->count; i++) {
++        SC2Buffer *b = &s->buffers[i];
++        struct v4l2_plane planes[2] = { 0 };
++        struct v4l2_buffer v = {
++            .type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
++            .memory = V4L2_MEMORY_MMAP, .index = i,
++            .length = 2, .m.planes = planes,
++        };
++        b->session = s;
++        b->index = i;
++        if ((ret = sc2_ioctl(s->fd, VIDIOC_QUERYBUF, &v)) < 0)
++            goto fail;
++        b->drm.nb_objects = 2;
++        b->drm.nb_layers = 1;
++        b->drm.layers[0].format = DRM_FORMAT_NV12;
++        b->drm.layers[0].nb_planes = 2;
++        for (p = 0; p < 2; p++) {
++            struct v4l2_exportbuffer exp = {
++                .type = v.type, .index = i, .plane = p,
++                .flags = O_CLOEXEC | O_RDWR,
++            };
++            if ((ret = sc2_ioctl(s->fd, VIDIOC_EXPBUF, &exp)) < 0)
++                goto fail;
++            b->drm.objects[p].fd = exp.fd;
++            b->drm.objects[p].size = planes[p].length;
++            b->drm.objects[p].format_modifier = DRM_FORMAT_MOD_LINEAR;
++            b->drm.layers[0].planes[p].object_index = p;
++            b->drm.layers[0].planes[p].pitch = fmt.fmt.pix_mp.plane_fmt[p].bytesperline;
++        }
++        if ((ret = sc2_qcapture(b)) < 0)
++            goto fail;
++    }
++    for (i = 0; i < 2; i++) {
++        enum v4l2_buf_type type = i ? V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE :
++            V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
++        if ((ret = sc2_ioctl(s->fd, VIDIOC_STREAMON, &type)) < 0)
++            goto fail;
++        s->streaming[i] = 1;
++    }
++    ctx->session = s;
++    av_log(avctx, AV_LOG_INFO, "SC2 hardware EI: %dx%d, field-rate progressive output (not MA/MC)\n",
++           width, height);
++    return 0;
++fail:
++    sc2_stop(s);
++    sc2_unref(s);
++    return ret;
++}
++
++static int sc2_dequeue(SC2Session *s, struct v4l2_buffer *v)
++{
++    int ret;
++    int64_t deadline = av_gettime_relative() + 1000000;
++    for (;;) {
++        struct pollfd pfd = { .fd = s->fd,
++            .events = V4L2_TYPE_IS_OUTPUT(v->type) ? POLLOUT : POLLIN };
++        int64_t remain;
++        ret = sc2_ioctl(s->fd, VIDIOC_DQBUF, v);
++        if (ret != AVERROR(EAGAIN))
++            return ret;
++        remain = deadline - av_gettime_relative();
++        if (remain <= 0)
++            return AVERROR(ETIMEDOUT);
++        ret = poll(&pfd, 1, (remain + 999) / 1000);
++        if (ret < 0 && errno == EINTR)
++            continue;
++        if (ret < 0)
++            return AVERROR(errno);
++        if (!ret)
++            return AVERROR(ETIMEDOUT);
++        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
++            return AVERROR(EIO);
++    }
++}
++
++static int sc2_frame(AVFilterLink *link, AVFrame *in)
++{
++    AVFilterContext *avctx = link->dst;
++    AVFilterLink *out = avctx->outputs[0];
++    SC2Context *ctx = avctx->priv;
++    SC2Session *s;
++    const AVDRMFrameDescriptor *d = (const void *)in->data[0];
++    struct v4l2_plane planes[2] = { 0 };
++    struct v4l2_buffer v = {
++        .type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
++        .memory = V4L2_MEMORY_DMABUF, .length = 2, .m.planes = planes,
++    };
++    AVFrame *result[2] = { NULL, NULL };
++    int64_t duration;
++    int coded_height, ret;
++    unsigned p, field;
++
++    if (!in->interlaced_frame) {
++        if (in->pts != AV_NOPTS_VALUE)
++            in->pts = av_rescale_q(in->pts, link->time_base, out->time_base);
++        in->best_effort_timestamp = in->pts;
++        in->duration = av_rescale_q(in->duration, link->time_base, out->time_base);
++        return ff_filter_frame(out, in);
++    }
++    if ((ret = sc2_layout(in, &coded_height)) < 0)
++        goto fail;
++    duration = in->duration;
++    if (duration <= 0 && link->frame_rate.num > 0)
++        duration = av_rescale_q(1, av_inv_q(link->frame_rate), link->time_base);
++    if (duration <= 0) {
++        ret = AVERROR(EINVAL);
++        goto fail;
++    }
++    s = ctx->session;
++    if (!s || s->coded_height != coded_height ||
++        s->width != in->width - in->crop_left - in->crop_right ||
++        s->height != in->height - in->crop_top - in->crop_bottom ||
++        s->crop_left != in->crop_left || s->crop_top != in->crop_top ||
++        s->pitch[0] != d->layers[0].planes[0].pitch ||
++        s->pitch[1] != d->layers[0].planes[1].pitch) {
++        if ((ret = sc2_configure(avctx, in, coded_height)) < 0)
++            goto fail;
++        s = ctx->session;
++    }
++    pthread_mutex_lock(&s->mutex);
++    ret = s->error;
++    pthread_mutex_unlock(&s->mutex);
++    if (ret < 0)
++        goto fail;
++    v.field = in->top_field_first ? V4L2_FIELD_INTERLACED_TB : V4L2_FIELD_INTERLACED_BT;
++    if (in->pts != AV_NOPTS_VALUE) {
++        int64_t us = av_rescale_q(in->pts, link->time_base, AV_TIME_BASE_Q);
++        v.timestamp.tv_sec = us / 1000000;
++        v.timestamp.tv_usec = us % 1000000;
++    }
++    for (p = 0; p < 2; p++) {
++        const AVDRMPlaneDescriptor *dp = &d->layers[0].planes[p];
++        const AVDRMObjectDescriptor *obj = &d->objects[dp->object_index];
++        size_t used = dp->offset + (coded_height >> p) * s->pitch[p];
++        if (used > obj->size || obj->size > UINT32_MAX) {
++            ret = AVERROR(EINVAL);
++            goto fail;
++        }
++        planes[p].m.fd = obj->fd;
++        planes[p].length = obj->size;
++        planes[p].data_offset = dp->offset;
++        planes[p].bytesused = used;
++    }
++    if ((ret = sc2_ioctl(s->fd, VIDIOC_QBUF, &v)) < 0)
++        goto fail;
++    /* Keep the input reference until both fields finish and OUTPUT dequeues. */
++    for (field = 0; field < 2; field++) {
++        SC2Buffer *b;
++        memset(planes, 0, sizeof(planes));
++        memset(&v, 0, sizeof(v));
++        v.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++        v.memory = V4L2_MEMORY_MMAP;
++        v.length = 2;
++        v.m.planes = planes;
++        if ((ret = sc2_dequeue(s, &v)) < 0)
++            goto fail;
++        if (v.index >= s->count || (v.flags & V4L2_BUF_FLAG_ERROR) ||
++            v.field != V4L2_FIELD_NONE) {
++            ret = AVERROR(EIO);
++            goto fail;
++        }
++        b = &s->buffers[v.index];
++        result[field] = av_frame_alloc();
++        if (!result[field]) {
++            ret = AVERROR(ENOMEM);
++            goto fail;
++        }
++        if ((ret = av_frame_copy_props(result[field], in)) < 0)
++            goto fail;
++        atomic_fetch_add(&s->refs, 1);
++        result[field]->buf[0] = av_buffer_create((uint8_t *)&b->drm,
++            sizeof(b->drm), sc2_release, b, AV_BUFFER_FLAG_READONLY);
++        if (!result[field]->buf[0]) {
++            sc2_release(b, NULL);
++            ret = AVERROR(ENOMEM);
++            goto fail;
++        }
++        result[field]->data[0] = (uint8_t *)&b->drm;
++        result[field]->format = AV_PIX_FMT_DRM_PRIME;
++        if (in->hw_frames_ctx) {
++            result[field]->hw_frames_ctx = av_buffer_ref(in->hw_frames_ctx);
++            if (!result[field]->hw_frames_ctx) {
++                ret = AVERROR(ENOMEM);
++                goto fail;
++            }
++        }
++        result[field]->width = s->width;
++        result[field]->height = s->height;
++        result[field]->crop_left = result[field]->crop_right = 0;
++        result[field]->crop_top = result[field]->crop_bottom = 0;
++        result[field]->interlaced_frame = 0;
++        result[field]->top_field_first = 0;
++        result[field]->repeat_pict = 0;
++        result[field]->duration = duration;
++        result[field]->pts = in->pts == AV_NOPTS_VALUE ? AV_NOPTS_VALUE :
++            av_rescale_q(in->pts, link->time_base, out->time_base) + field * duration;
++        result[field]->best_effort_timestamp = result[field]->pts;
++    }
++    memset(planes, 0, sizeof(planes));
++    memset(&v, 0, sizeof(v));
++    v.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
++    v.memory = V4L2_MEMORY_DMABUF;
++    v.length = 2;
++    v.m.planes = planes;
++    if ((ret = sc2_dequeue(s, &v)) < 0 || (v.flags & V4L2_BUF_FLAG_ERROR)) {
++        if (ret >= 0)
++            ret = AVERROR(EIO);
++        goto fail;
++    }
++    av_frame_free(&in);
++    ret = ff_filter_frame(out, result[0]);
++    result[0] = NULL;
++    if (ret < 0)
++        goto fail;
++    return ff_filter_frame(out, result[1]);
++fail:
++    if (ctx->session) {
++        sc2_stop(ctx->session);
++        sc2_unref(ctx->session);
++        ctx->session = NULL;
++    }
++    av_frame_free(&in);
++    av_frame_free(&result[0]);
++    av_frame_free(&result[1]);
++    return ret;
++}
++
++static int sc2_config_output(AVFilterLink *out)
++{
++    AVFilterLink *in = out->src->inputs[0];
++    int fd = sc2_find();
++    if (fd < 0)
++        return fd;
++    close(fd);
++    out->time_base = av_mul_q(in->time_base, (AVRational) { 1, 2 });
++    out->frame_rate = av_mul_q(in->frame_rate, (AVRational) { 2, 1 });
++    out->w = in->w;
++    out->h = in->h;
++    if (in->hw_frames_ctx) {
++        out->hw_frames_ctx = av_buffer_ref(in->hw_frames_ctx);
++        if (!out->hw_frames_ctx)
++            return AVERROR(ENOMEM);
++    }
++    return 0;
++}
++
++static void sc2_uninit(AVFilterContext *avctx)
++{
++    SC2Context *ctx = avctx->priv;
++    if (ctx->session) {
++        sc2_stop(ctx->session);
++        sc2_unref(ctx->session);
++    }
++}
++
++static const AVFilterPad sc2_inputs[] = {
++    { .name = "default", .type = AVMEDIA_TYPE_VIDEO, .filter_frame = sc2_frame },
++};
++static const AVFilterPad sc2_outputs[] = {
++    { .name = "default", .type = AVMEDIA_TYPE_VIDEO, .config_props = sc2_config_output },
++};
++const AVFilter ff_vf_sc2_deinterlace = {
++    .name = "sc2_deinterlace",
++    .description = NULL_IF_CONFIG_SMALL("SC2 hardware field-rate edge interpolation (not MA/MC)."),
++    .priv_size = sizeof(SC2Context),
++    .uninit = sc2_uninit,
++    .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
++    FILTER_INPUTS(sc2_inputs),
++    FILTER_OUTPUTS(sc2_outputs),
++    FILTER_SINGLE_PIXFMT(AV_PIX_FMT_DRM_PRIME),
++};

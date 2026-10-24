@@ -1,0 +1,63 @@
+From e4b11a34bdf9ce8237912b7b7657f9bca0d609c5 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Wed, 21 Oct 2026 04:13:50 +0800
+Subject: [PATCH] regulator: Clarify voltage stepping KUnit coverage
+
+Describe the isolated voltage tests in Kconfig and keep the OPP-pair
+assertions readable without nested multiline macro arguments.
+No regulator or CPU policy changes.
+
+---
+ drivers/regulator/Kconfig     |  2 ++
+ drivers/regulator/core-test.c | 10 ++++++----
+ 2 files changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/regulator/Kconfig b/drivers/regulator/Kconfig
+index 203e062a5c67..ce23e015dc97 100644
+--- a/drivers/regulator/Kconfig
++++ b/drivers/regulator/Kconfig
+@@ -37,6 +37,8 @@ config REGULATOR_KUNIT_TEST
+ 	help
+ 	  Exercise voltage stepping and failed consumer requests through the
+ 	  regulator API using an isolated software regulator, without hardware.
++	  Cover inherited voltage handover, short final steps, failed requests
++	  and transitions between CPU operating-point voltages.
+ 
+ config REGULATOR_FIXED_VOLTAGE
+ 	tristate "Fixed voltage regulator support"
+diff --git a/drivers/regulator/core-test.c b/drivers/regulator/core-test.c
+index c1d3e1fe3ebc..7a0885a68646 100644
+--- a/drivers/regulator/core-test.c
++++ b/drivers/regulator/core-test.c
+@@ -177,15 +177,16 @@ static void voltage_step_opp_pairs_test(struct kunit *test)
+ 	};
+ 	struct voltage_step_test *ctx = test->priv;
+ 	unsigned int i, j;
++	int ret;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(voltages); i++) {
+ 		for (j = 0; j < ARRAY_SIZE(voltages); j++) {
+ 			voltage_step_set_bounds(ctx, voltages[i]);
+-			KUNIT_ASSERT_EQ(test, regulator_set_voltage(ctx->consumer,
+-					voltages[i], voltages[i]), 0);
++			ret = regulator_set_voltage(ctx->consumer, voltages[i], voltages[i]);
++			KUNIT_ASSERT_EQ(test, ret, 0);
+ 			voltage_step_set_bounds(ctx, voltages[j]);
+-			KUNIT_ASSERT_EQ(test, regulator_set_voltage(ctx->consumer,
+-					voltages[j], voltages[j]), 0);
++			ret = regulator_set_voltage(ctx->consumer, voltages[j], voltages[j]);
++			KUNIT_ASSERT_EQ(test, ret, 0);
+ 			KUNIT_EXPECT_EQ(test, regulator_get_voltage(ctx->consumer), voltages[j]);
+ 			KUNIT_EXPECT_FALSE(test, ctx->invalid_step);
+ 		}
+@@ -205,6 +206,7 @@ static struct kunit_suite voltage_step_test_suite = {
+ 	.init = voltage_step_test_init,
+ 	.test_cases = voltage_step_test_cases,
+ };
++
+ kunit_test_suite(voltage_step_test_suite);
+ 
+ MODULE_DESCRIPTION("Regulator voltage step consumer tests");
+-- 
+2.47.3
+

@@ -1,0 +1,21 @@
+Subject: [PATCH] drmprime: pass known MPEG4 frame rate before decoder open
+
+The native SC2 MPEG4 backend negotiates its hardware frame interval during
+avcodec_open2. Standalone decoding supplies AVCodecContext::framerate, but
+Kodi previously supplied only the timestamp time base, leaving this path
+unconfigured. Pass the demuxer's positive rate/scale without inventing a
+rate for unknown or invalid hints. Leave the other codecs, including the
+HEVC/AV1 Request paths, unchanged.
+
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
+@@ -457,6 +457,9 @@ bool CDVDVideoCodecDRMPRIME::Open(CDVDStreamInfo& hints, CDVDCodecOptions& options)
+   m_pCodecContext->bits_per_coded_sample = hints.bitsperpixel;
+   m_pCodecContext->time_base.num = 1;
+   m_pCodecContext->time_base.den = DVD_TIME_BASE;
++  if (hints.codec == AV_CODEC_ID_MPEG4 && hints.fpsrate > 0 && hints.fpsscale > 0)
++    m_pCodecContext->framerate = AVRational{hints.fpsrate, hints.fpsscale};
++
+   m_pCodecContext->thread_count = CServiceBroker::GetCPUInfo()->GetCPUCount();
+ 
+   if (hints.extradata)

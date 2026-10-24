@@ -1,0 +1,134 @@
+From eb8bc945224523b6a4a70662ce94c93f3582216d Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Tue, 20 Oct 2026 00:31:40 +0800
+Subject: [PATCH] regulator: pwm: Identify live table voltages before handover
+
+Identify a unique selector from the actual waveform and every table
+entry quantized through the provider. Do not use a nearest voltage or
+assume a disabled PWM means a known rail voltage.
+
+Validate active and boot-critical rails before GPIO, adjustment or
+enable side effects, then preserve an accepted waveform. Intentionally
+disabled switchable regulators retain their initialization path. Keep
+legacy providers on exact duty matching and canonicalize inverted
+
+---
+ drivers/regulator/pwm-regulator.c | 76 +++++++++++++++++++++++++++++--
+ 1 file changed, 73 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/regulator/pwm-regulator.c b/drivers/regulator/pwm-regulator.c
+index 7434b6b22d3253d88d7acc21fe982f1e38c68e86..9179ea95c1395254c46eeaa1c893a2326cbb9ce7 100644
+--- a/drivers/regulator/pwm-regulator.c
++++ b/drivers/regulator/pwm-regulator.c
+@@ -51,14 +51,61 @@ struct pwm_voltages {
+ /*
+  * Voltage table call-backs
+  */
++static int pwm_regulator_match_waveform(struct pwm_regulator_data *drvdata,
++				      const struct pwm_waveform *actual)
++{
++	struct pwm_waveform candidate;
++	struct pwm_state state;
++	int i, match = -ENOTRECOVERABLE, ret;
++
++	if (!actual->period_length_ns)
++		return -ENOTRECOVERABLE;
++
++	for (i = 0; i < drvdata->desc.n_voltages; i++) {
++		pwm_init_state(drvdata->pwm, &state);
++		ret = pwm_set_relative_duty_cycle(&state,
++				drvdata->duty_cycle_table[i].dutycycle, 100);
++		if (ret)
++			return ret;
++		candidate.period_length_ns = state.period;
++		candidate.duty_length_ns = state.polarity == PWM_POLARITY_INVERSED ?
++					  state.period - state.duty_cycle : state.duty_cycle;
++		candidate.duty_offset_ns = state.polarity == PWM_POLARITY_INVERSED &&
++					  candidate.duty_length_ns ? state.duty_cycle : 0;
++		ret = pwm_round_waveform_might_sleep(drvdata->pwm, &candidate);
++		if (ret < 0)
++			return ret;
++		if (candidate.period_length_ns != actual->period_length_ns ||
++		    candidate.duty_length_ns != actual->duty_length_ns ||
++		    candidate.duty_offset_ns != actual->duty_offset_ns)
++			continue;
++
++		/* Never guess a voltage if two selectors have the same waveform. */
++		if (match >= 0)
++			return -ENOTRECOVERABLE;
++		match = i;
++	}
++
++	return match;
++}
++
+ static void pwm_regulator_init_state(struct regulator_dev *rdev)
+ {
+ 	struct pwm_regulator_data *drvdata = rdev_get_drvdata(rdev);
++	struct pwm_waveform actual;
+ 	struct pwm_state pwm_state;
+ 	unsigned int dutycycle;
+ 	int i;
+ 
++	if (pwmchip_supports_waveform(drvdata->pwm->chip)) {
++		i = pwm_get_waveform_might_sleep(drvdata->pwm, &actual);
++		drvdata->state = i ? i : pwm_regulator_match_waveform(drvdata, &actual);
++		return;
++	}
++
+ 	pwm_get_state(drvdata->pwm, &pwm_state);
++	if (!pwm_state.enabled || !pwm_state.period)
++		return;
+ 	dutycycle = pwm_get_relative_duty_cycle(&pwm_state, 100);
+ 
+ 	for (i = 0; i < rdev->desc->n_voltages; i++) {
+@@ -355,6 +402,7 @@ static int pwm_regulator_probe(struct platform_device *pdev)
+ 	struct regulator_config config = { };
+ 	struct device_node *np = pdev->dev.of_node;
+ 	enum gpiod_flags gpio_flags;
++	bool preserve_waveform = false;
+ 	int ret;
+ 
+ 	if (!np)
+@@ -389,6 +437,25 @@ static int pwm_regulator_probe(struct platform_device *pdev)
+ 		return dev_err_probe(&pdev->dev, PTR_ERR(drvdata->pwm),
+ 				     "Failed to get PWM\n");
+ 
++	/* Validate a live table-controlled rail before touching its output. */
++	if (drvdata->duty_cycle_table &&
++	    pwmchip_supports_waveform(drvdata->pwm->chip)) {
++		struct pwm_waveform actual;
++
++		ret = pwm_get_waveform_might_sleep(drvdata->pwm, &actual);
++		if (ret)
++			return ret;
++		if (actual.period_length_ns || init_data->constraints.boot_on ||
++		    init_data->constraints.always_on) {
++			ret = pwm_regulator_match_waveform(drvdata, &actual);
++			if (ret < 0)
++				return dev_err_probe(&pdev->dev, ret,
++						     "Cannot identify inherited PWM voltage\n");
++			drvdata->state = ret;
++			preserve_waveform = true;
++		}
++	}
++
+ 	if (init_data->constraints.boot_on || init_data->constraints.always_on)
+ 		gpio_flags = GPIOD_OUT_HIGH;
+ 	else
+@@ -400,9 +467,12 @@ static int pwm_regulator_probe(struct platform_device *pdev)
+ 		return dev_err_probe(&pdev->dev, ret, "Failed to get enable GPIO\n");
+ 	}
+ 
+-	ret = pwm_adjust_config(drvdata->pwm);
+-	if (ret)
+-		return ret;
++	/* A matched waveform already has the requested electrical output. */
++	if (!preserve_waveform) {
++		ret = pwm_adjust_config(drvdata->pwm);
++		if (ret)
++			return ret;
++	}
+ 
+ 	ret = pwm_regulator_init_boot_on(pdev, drvdata, init_data);
+ 	if (ret)
