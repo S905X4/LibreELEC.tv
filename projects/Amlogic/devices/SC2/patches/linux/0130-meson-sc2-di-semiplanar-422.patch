@@ -1,0 +1,170 @@
+From a87deeb1afa78cf848da5c23accb4b68e66db9fb Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Sat, 14 Nov 2026 13:53:14 +0800
+Subject: [PATCH] media: meson-sc2-di: support native semiplanar 422 surfaces
+
+Add standard NV16M and NV61M input and output. Keep independent
+plane pitches and full-height chroma canvas, scope and allocation.
+Use the observed mode2 writer with all-row chroma conversion and
+bypass vertical420 formatting for422 input. Preserve UYVY and420
+layout, ownership and DMA retirement policies.
+
+End420 chroma reads on the final selected field row. The prior
+full-frame endpoint admitted the opposite field last line into the
+edge repeat when chroma differed between fields. The bounded
+original-scope differential and packed-source controls isolate this
+without expanding source bounds or changing phases.
+
+RAM60-field verification retained all guards and teardown exports.
+Analytic field-constant colors and every synthesized pixel in new
+layouts matched the appropriate same-source packed422 controls.
+The initial unshifted-color oracle failures remain documented as
+invalid assumptions for directional EI, not discarded observations.
+
+Change-Id: I8163e0a9bc3b7da254dbc2171f59dba46d7cc87f
+---
+ .../platform/amlogic/meson-sc2-di/sc2-di.c    | 49 ++++++++++++++-----
+ 1 file changed, 37 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/media/platform/amlogic/meson-sc2-di/sc2-di.c b/drivers/media/platform/amlogic/meson-sc2-di/sc2-di.c
+index 4f743a55aa96..b24d656336b6 100644
+--- a/drivers/media/platform/amlogic/meson-sc2-di/sc2-di.c
++++ b/drivers/media/platform/amlogic/meson-sc2-di/sc2-di.c
+@@ -152,6 +152,11 @@ static int di_canvas(struct sc2_di *di, unsigned int id, dma_addr_t addr,
+ 		MESON_CANVAS_BLKMODE_LINEAR, 0);
+ }
+ 
++static bool di_is_420(u32 format)
++{
++	return format == V4L2_PIX_FMT_NV12M || format == V4L2_PIX_FMT_NV21M;
++}
++
+ static int di_program(struct sc2_di_ctx *ctx,
+ 		      struct vb2_v4l2_buffer *src,
+ 		      struct vb2_v4l2_buffer *dst)
+@@ -162,6 +167,8 @@ static int di_program(struct sc2_di_ctx *ctx,
+ 	const struct v4l2_pix_format_mplane *out = &ctx->fmt[1];
+ 	bool packed_in = in->pixelformat == V4L2_PIX_FMT_UYVY;
+ 	bool packed_out = out->pixelformat == V4L2_PIX_FMT_UYVY;
++	bool chroma420_in = di_is_420(in->pixelformat);
++	bool chroma420_out = di_is_420(out->pixelformat);
+ 	unsigned int bottom = (src->field == V4L2_FIELD_INTERLACED_BT) ^ ctx->field;
+ 	unsigned int p, burst_len = 2;
+ 	int ret;
+@@ -171,7 +178,7 @@ static int di_program(struct sc2_di_ctx *ctx,
+ 	 */
+ 	for (p = 0; p < in->num_planes; p++) {
+ 		u32 pitch = in->plane_fmt[p].bytesperline;
+-		u32 height = in->height >> p;
++		u32 height = in->height >> (chroma420_in ? p : 0);
+ 		dma_addr_t addr = vb2_dma_contig_plane_dma_addr(&src->vb2_buf, p) +
+ 			src->vb2_buf.planes[p].data_offset;
+ 
+@@ -186,7 +193,8 @@ static int di_program(struct sc2_di_ctx *ctx,
+ 			dst->vb2_buf.planes[p].data_offset;
+ 
+ 		ret = di_canvas(di, p + 2, addr,
+-			out->plane_fmt[p].bytesperline, out->height >> p);
++			out->plane_fmt[p].bytesperline,
++			out->height >> (chroma420_out ? p : 0));
+ 		if (ret)
+ 			return ret;
+ 	}
+@@ -197,7 +205,8 @@ static int di_program(struct sc2_di_ctx *ctx,
+ 	di_write(di, IF0_BASE + IF_GEN3, (3 << 4) | (burst_len << 1));
+ 	/* SC2 set_di_mif_v3: packed422 has no separate chroma canvas/map. */
+ 	di_write(di, IF0_BASE + IF_GEN2, packed_in ? 0 :
+-		 (in->pixelformat == V4L2_PIX_FMT_NV21M ? 1 : 2));
++		 (in->pixelformat == V4L2_PIX_FMT_NV21M ||
++		  in->pixelformat == V4L2_PIX_FMT_NV61M ? 1 : 2));
+ 	di_write(di, IF0_BASE + IF_CANVAS, di->canvas_id[0] |
+ 		 (packed_in ? 0 : (di->canvas_id[1] << 8) |
+ 		  (di->canvas_id[1] << 16)));
+@@ -208,37 +217,44 @@ static int di_program(struct sc2_di_ctx *ctx,
+ 	/* Packed chroma is fetched with luma; its separate scopes are unused. */
+ 	di_write(di, IF0_BASE + IF_CX, packed_in ? 0 :
+ 		 ((r->left / 2 + r->width / 2 - 1) << 16) | (r->left / 2));
++	/* Repeat the last selected 420 field row, not the other field's row. */
+ 	di_write(di, IF0_BASE + IF_CY, packed_in ? 0 :
+-		 ((r->top / 2 + r->height / 2 - 1) << 16) |
+-		 (r->top / 2 + bottom));
++		 ((((r->top + r->height) >> chroma420_in) - 1 -
++		   (chroma420_in && !bottom)) << 16) |
++		 ((r->top >> chroma420_in) + bottom));
+ 	di_write(di, IF0_BASE + IF_RPT, packed_in ? 0x11 : 0x1111);
+ 	di_write(di, IF0_BASE + IF_YPAT, 0x80);
+ 	di_write(di, IF0_BASE + IF_CPAT, packed_in ? 0 : 0x80);
+ 	di_write(di, IF0_BASE + IF_DUMMY, 0x00808000);
+ 	di_write(di, IF0_BASE + IF_FIFO, packed_in ? 0xc0 : 0x120);
+-	/* Packed422 bypasses vertical chroma formatting (video_mode=1). */
++	/* Both 422 layouts bypass vertical chroma formatting (video_mode=1). */
+ 	di_write(di, IF0_BASE + IF_FMT,
+ 		 BIT(21) | BIT(20) | BIT(17) |
+-		 (packed_in ? (16 << 1) : (8 << 1) | BIT(0)));
++		 (chroma420_in ? (8 << 1) | BIT(0) : (16 << 1)));
+ 	di_write(di, IF0_BASE + IF_FMT_W, (r->width << 16) | (r->width / 2));
+ 	/* The 420 formatter repeats the last chroma row at the field edge.
+ 	 * Pushing dummy pixels makes that interpolation consume neutral chroma
+-	 * instead. Keep the packed422 policy, which has no vertical formatter.
++	 * instead. Both 422 layouts have no vertical formatter or last-row repeat.
+ 	 */
+ 	di_write(di, IF0_BASE + IF_GEN,
+ 		 BIT(29) | BIT(25) | (8 << 19) | BIT(4) | BIT(0) |
+-		 (packed_in ? BIT(18) | BIT(14) : BIT(6) | BIT(1)));
++		 (chroma420_in ? BIT(6) : BIT(18)) |
++		 (packed_in ? BIT(14) : BIT(1)));
+ 	di_write(di, DIWR_X, r->width - 1);
+ 	di_write(di, DIWR_Y, r->height - 1);
+ 	di_write(di, DIWR_CANVAS, di->canvas_id[2] |
+ 		 (packed_out ? 0 : di->canvas_id[3] << 8));
+ 	/* SC2 set_wrmif_simple_v3 mode0 writes one-plane 8-bit packed422.
+ 	 * Canvas endian0 and MIF little-endian produce linear U,Y0,V,Y1.
+-	 * NV12/NV21 use mode2 with independent output chroma order.
++	 * Semiplanar 8-bit uses the observed physical mode2 Y+UV layout, not
++	 * the donor's generic video_mode=1 chooser (which selects mode3).
++	 * VCON=3 keeps every chroma row for NV16/NV61; 420 retains VCON=0.
+ 	 */
+ 	di_write(di, DIWR_CTRL, BIT(0) | BIT(2) | (2 << 26) |
+ 		 (packed_out ? (5 << 4) : BIT(3) | (3 << 4) | (2 << 22) |
+-		  (out->pixelformat == V4L2_PIX_FMT_NV12M ? BIT(17) : 0)));
++		  (chroma420_out ? 0 : (3 << 18)) |
++		  (out->pixelformat == V4L2_PIX_FMT_NV12M ||
++		   out->pixelformat == V4L2_PIX_FMT_NV16M ? BIT(17) : 0)));
+ 	di_write(di, DI_POST_GL_THD, 8 << 16);
+ 	di_write(di, DI_POST_SIZE, ((r->height - 1) << 16) | (r->width - 1));
+ 	/* post + EI + mux + DDR; blend and MC deliberately disabled. */
+@@ -552,6 +568,12 @@ static int di_enum_fmt(struct file *file, void *fh, struct v4l2_fmtdesc *f)
+ 	case 2:
+ 		f->pixelformat = V4L2_PIX_FMT_UYVY;
+ 		break;
++	case 3:
++		f->pixelformat = V4L2_PIX_FMT_NV16M;
++		break;
++	case 4:
++		f->pixelformat = V4L2_PIX_FMT_NV61M;
++		break;
+ 	default:
+ 		return -EINVAL;
+ 	}
+@@ -566,6 +588,8 @@ static int di_try_fmt(struct file *file, void *fh, struct v4l2_format *f)
+ 	u32 min_pitch;
+ 
+ 	if (p->pixelformat != V4L2_PIX_FMT_NV21M &&
++	    p->pixelformat != V4L2_PIX_FMT_NV16M &&
++	    p->pixelformat != V4L2_PIX_FMT_NV61M &&
+ 	    p->pixelformat != V4L2_PIX_FMT_UYVY)
+ 		p->pixelformat = V4L2_PIX_FMT_NV12M;
+ 	p->width = clamp_t(u32, ALIGN(p->width, 2), 32, 1920);
+@@ -580,7 +604,8 @@ static int di_try_fmt(struct file *file, void *fh, struct v4l2_format *f)
+ 		/* SC2 DIWR uses 64-byte bursts; a 32-byte-only stride aliases rows. */
+ 		p->plane_fmt[i].bytesperline = ALIGN(clamp_t(u32,
+ 			p->plane_fmt[i].bytesperline, min_pitch, 4096), alignment);
+-		p->plane_fmt[i].sizeimage = p->plane_fmt[i].bytesperline * (p->height >> i);
++		p->plane_fmt[i].sizeimage = p->plane_fmt[i].bytesperline *
++			(p->height >> (di_is_420(p->pixelformat) ? i : 0));
+ 	}
+ 	memset(&p->plane_fmt[p->num_planes], 0,
+ 	       sizeof(p->plane_fmt) - p->num_planes * sizeof(p->plane_fmt[0]));
+-- 
+2.47.3
+

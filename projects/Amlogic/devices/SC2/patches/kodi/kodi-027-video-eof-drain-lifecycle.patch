@@ -1,0 +1,477 @@
+From: hiper25 <whydonit@gmail.com>
+Subject: [PATCH] VideoPlayer: wait for decoder drain and pending presentation at EOF
+
+The compressed input queue can empty before the first native frame finishes.
+Keep an epoch-owned drain request until the decoder reports actual EOF, rather
+than closing a not-yet-synchronized video thread when message bytes reach zero.
+The parent continues handling startup/resync and seek/abort messages.
+
+Drain cooperatively on the video thread. Keep an OUTPUT_AGAIN picture until
+accepted by the renderer and send its startup notification only once, including
+after backpressure. Distinguish failed and canceled drains from real EOF; reset
+and stream changes cannot complete a replacement epoch. Do not decode again
+after terminal EOF while the renderer consumes its remaining presentations.
+
+Keep the existing 40-second bound for synchronous CloseStream only. Natural
+EOF waits on actual decoder and render state, not a timer or repeated input.
+
+--- a/xbmc/cores/VideoPlayer/DVDMessage.h
++++ b/xbmc/cores/VideoPlayer/DVDMessage.h
+@@ -10,6 +10,7 @@
+ 
+ #include "FileItem.h"
+ #include "cores/IPlayer.h"
++#include "threads/Event.h"
+ 
+ #include <atomic>
+ #include <string.h>
+@@ -93,6 +94,29 @@
+   Message m_message;
+ };
+ 
++// A drain belongs to the queued stream epoch, not to the current queue size.
++class CDVDMsgVideoDrain : public CDVDMsg
++{
++public:
++  enum class State { Pending, Complete, Failed, Canceled };
++  CDVDMsgVideoDrain() : CDVDMsg(VIDEO_DRAIN) {}
++  State GetState() const { return m_state.load(); }
++  void Finish(State state)
++  {
++    m_state.store(state);
++    m_finished.Set();
++  }
++  bool Wait()
++  {
++    // Match the existing queue-drain deadline; completion wakes immediately.
++    return m_finished.Wait(std::chrono::seconds(40)) && GetState() == State::Complete;
++  }
++
++private:
++  std::atomic<State> m_state{State::Pending};
++  CEvent m_finished;
++};
++
+ ////////////////////////////////////////////////////////////////////////////////
+ //////
+ ////// GENERAL_ Messages
+--- a/xbmc/cores/VideoPlayer/VideoPlayer.cpp
++++ b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+@@ -1539,7 +1539,8 @@
+ 
+       if (m_CurrentVideo.inited)
+       {
+-        m_VideoPlayerVideo->SendMessage(std::make_shared<CDVDMsg>(CDVDMsg::VIDEO_DRAIN));
++        m_videoDrain = std::make_shared<CDVDMsgVideoDrain>();
++        m_VideoPlayerVideo->SendMessage(m_videoDrain);
+       }
+ 
+       m_CurrentAudio.inited = false;
+@@ -1552,9 +1553,19 @@
+       // if we are caching, start playing it again
+       SetCaching(CACHESTATE_DONE);
+ 
++      if (m_videoDrain &&
++          (m_videoDrain->GetState() == CDVDMsgVideoDrain::State::Failed ||
++           m_videoDrain->GetState() == CDVDMsgVideoDrain::State::Canceled))
++      {
++        m_bAbortRequest = true;
++        break;
++      }
++
+       // while players are still playing, keep going to allow seekbacks
+       if (m_VideoPlayerAudio->HasData() ||
+-          m_VideoPlayerVideo->HasData())
++          m_VideoPlayerVideo->HasData() ||
++          (m_videoDrain && m_videoDrain->GetState() == CDVDMsgVideoDrain::State::Pending) ||
++          m_renderManager.HasPendingVideo())
+       {
+         CThread::Sleep(100ms);
+         continue;
+@@ -3709,6 +3720,7 @@
+ 
+ bool CVideoPlayer::OpenVideoStream(CDVDStreamInfo& hint, bool reset)
+ {
++  m_videoDrain.reset();
+   if (m_pInputStream && m_pInputStream->IsStreamType(DVDSTREAM_TYPE_DVD))
+   {
+     /* set aspect ratio as requested by navigator for dvd's */
+@@ -3924,6 +3936,8 @@
+     return false;
+ 
+   CLog::Log(LOGINFO, "Closing stream player {}", current.player);
++  if (current.type == STREAM_VIDEO)
++    m_videoDrain.reset();
+ 
+   if(bWaitForBuffers)
+     SetCaching(CACHESTATE_DONE);
+@@ -3947,6 +3961,7 @@
+ void CVideoPlayer::FlushBuffers(double pts, bool accurate, bool sync)
+ {
+   CLog::Log(LOGDEBUG, "CVideoPlayer::FlushBuffers - flushing buffers");
++  m_videoDrain.reset();
+ 
+   double startpts;
+   if (accurate)
+--- a/xbmc/cores/VideoPlayer/VideoPlayer.h
++++ b/xbmc/cores/VideoPlayer/VideoPlayer.h
+@@ -491,6 +491,7 @@
+ 
+   CCurrentStream m_CurrentAudio;
+   CCurrentStream m_CurrentVideo;
++  std::shared_ptr<CDVDMsgVideoDrain> m_videoDrain;
+   CCurrentStream m_CurrentSubtitle;
+   CCurrentStream m_CurrentTeletext;
+   CCurrentStream m_CurrentRadioRDS;
+--- a/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp
++++ b/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp
+@@ -164,6 +164,9 @@
+ void CVideoPlayerVideo::OpenStream(CDVDStreamInfo& hint, std::unique_ptr<CDVDVideoCodec> codec)
+ {
+   CLog::Log(LOGDEBUG, "CVideoPlayerVideo::OpenStream - open stream with codec id: {}", hint.codec);
++  FinishDrain(CDVDMsgVideoDrain::State::Canceled);
++  m_decoderDrained = false;
++  m_outputSate = OUTPUT_NORMAL;
+ 
+   m_processInfo.GetVideoBufferManager().ReleasePools();
+ 
+@@ -239,8 +242,10 @@
+   // wait until buffers are empty
+   if (bWaitForBuffers && m_speed > 0)
+   {
+-    SendMessage(std::make_shared<CDVDMsg>(CDVDMsg::VIDEO_DRAIN), 0);
+-    m_messageQueue.WaitUntilEmpty();
++    auto drain = std::make_shared<CDVDMsgVideoDrain>();
++    SendMessage(drain, 0);
++    if (!drain->Wait())
++      CLog::Log(LOGWARNING, "Video drain did not complete before close");
+   }
+ 
+   m_messageQueue.Abort();
+@@ -335,7 +340,7 @@
+     if (m_paused)
+       iPriority = 1;
+ 
+-    if (onlyPrioMsgs)
++    if (onlyPrioMsgs || m_drainRequest)
+     {
+       iPriority = 1;
+       timeout = 1ms;
+@@ -355,20 +360,12 @@
+     }
+     else if (ret == MSGQ_TIMEOUT)
+     {
+-      if (m_outputSate == OUTPUT_AGAIN &&
+-          m_picture.videoBuffer)
+-      {
+-        m_outputSate = OutputPicture(&m_picture);
+-        if (m_outputSate == OUTPUT_AGAIN)
+-        {
+-          onlyPrioMsgs = true;
+-          continue;
+-        }
+-      }
+-      // don't ask for a new frame if we can't deliver it to renderer
+-      else if ((m_speed != DVD_PLAYSPEED_PAUSE ||
+-                m_processInfo.IsFrameAdvance() ||
+-                m_syncState != IDVDStreamPlayer::SYNC_INSYNC) && !m_paused)
++      // A retained OUTPUT_AGAIN picture is retried by ProcessDecoderOutput
++      // before receiving another frame, including while draining.
++      if (!m_decoderDrained &&
++          (!m_drainRequest || m_syncState != IDVDStreamPlayer::SYNC_WAITSYNC) &&
++          (m_speed != DVD_PLAYSPEED_PAUSE || m_processInfo.IsFrameAdvance() ||
++           m_syncState != IDVDStreamPlayer::SYNC_INSYNC) && !m_paused)
+       {
+         if (ProcessDecoderOutput(frametime, pts))
+         {
+@@ -378,7 +375,7 @@
+       }
+ 
+       // if we only wanted priority messages, this isn't a stall
+-      if (iPriority)
++      if (iPriority || m_decoderDrained)
+         continue;
+ 
+       //Okey, start rendering at stream fps now instead, we are likely in a stillframe
+@@ -388,8 +385,14 @@
+         while (!m_bStop && m_pVideoCodec)
+         {
+           m_pVideoCodec->SetCodecControl(DVD_CODEC_CTRL_DRAIN);
+-          if (!ProcessDecoderOutput(frametime, pts))
++          if (!ProcessDecoderOutput(frametime, pts) || m_outputSate == OUTPUT_AGAIN ||
++              m_syncState == IDVDStreamPlayer::SYNC_WAITSYNC)
+             break;
++        }
++        if (m_outputSate == OUTPUT_AGAIN || m_syncState == IDVDStreamPlayer::SYNC_WAITSYNC)
++        {
++          onlyPrioMsgs = true;
++          continue;
+         }
+ 
+         CLog::Log(LOGDEBUG, "CVideoPlayerVideo - Stillframe detected, switching to forced {:f} fps",
+@@ -437,6 +440,9 @@
+     }
+     else if (pMsg->IsType(CDVDMsg::GENERAL_RESET))
+     {
++      FinishDrain(CDVDMsgVideoDrain::State::Canceled);
++      m_decoderDrained = false;
++      m_outputSate = OUTPUT_NORMAL;
+       if(m_pVideoCodec)
+         m_pVideoCodec->Reset();
+ 
+@@ -453,6 +459,9 @@
+     }
+     else if (pMsg->IsType(CDVDMsg::GENERAL_FLUSH)) // private message sent by (CVideoPlayerVideo::Flush())
+     {
++      FinishDrain(CDVDMsgVideoDrain::State::Canceled);
++      m_decoderDrained = false;
++      m_outputSate = OUTPUT_NORMAL;
+       bool sync = std::static_pointer_cast<CDVDMsgBool>(pMsg)->m_value;
+       if(m_pVideoCodec)
+         m_pVideoCodec->Reset();
+@@ -500,7 +509,7 @@
+         // The old decoder's drain must not announce startup for its replacement.
+         bool cont = ProcessDecoderOutput(frametime, pts, false);
+ 
+-        if (!cont)
++        if (!cont || m_outputSate == OUTPUT_AGAIN)
+           break;
+       }
+ 
+@@ -514,12 +523,8 @@
+     }
+     else if (pMsg->IsType(CDVDMsg::VIDEO_DRAIN))
+     {
+-      while (!m_bStop && m_pVideoCodec)
+-      {
+-        m_pVideoCodec->SetCodecControl(DVD_CODEC_CTRL_DRAIN);
+-        if (!ProcessDecoderOutput(frametime, pts))
+-          break;
+-      }
++      StartDrain(std::static_pointer_cast<CDVDMsgVideoDrain>(pMsg));
++      onlyPrioMsgs = true;
+     }
+     else if (pMsg->IsType(CDVDMsg::GENERAL_PAUSE))
+     {
+@@ -536,6 +541,7 @@
+     }
+     else if (pMsg->IsType(CDVDMsg::DEMUXER_PACKET))
+     {
++      m_decoderDrained = false;
+       DemuxPacket* pPacket = std::static_pointer_cast<CDVDMsgDemuxerPacket>(pMsg)->GetPacket();
+       bool bPacketDrop = std::static_pointer_cast<CDVDMsgDemuxerPacket>(pMsg)->GetPacketDrop();
+ 
+@@ -607,6 +613,8 @@
+ 
+ bool CVideoPlayerVideo::ProcessDecoderOutput(double& frametime, double& pts, bool notifyStarted)
+ {
++  if (m_outputSate == OUTPUT_AGAIN && m_picture.videoBuffer)
++    return ProcessOutput(frametime, pts, notifyStarted);
+   CDVDVideoCodec::VCReturn decoderState = m_pVideoCodec->GetPicture(&m_picture);
+ 
+   if (decoderState == CDVDVideoCodec::VC_BUFFER)
+@@ -617,6 +625,7 @@
+   // if decoder was flushed, we need to seek back again to resume rendering
+   if (decoderState == CDVDVideoCodec::VC_FLUSHED)
+   {
++    FinishDrain(CDVDMsgVideoDrain::State::Failed);
+     CLog::Log(LOGDEBUG, "CVideoPlayerVideo - video decoder was flushed");
+     while (!m_packets.empty())
+     {
+@@ -635,6 +644,7 @@
+ 
+   if (decoderState == CDVDVideoCodec::VC_REOPEN)
+   {
++    FinishDrain(CDVDMsgVideoDrain::State::Failed);
+     while (!m_packets.empty())
+     {
+       auto msg = std::static_pointer_cast<CDVDMsgDemuxerPacket>(m_packets.front().message);
+@@ -650,6 +660,7 @@
+ 
+   if (decoderState == CDVDVideoCodec::VC_FATAL)
+   {
++    FinishDrain(CDVDMsgVideoDrain::State::Failed);
+     CLog::Log(LOGERROR, "CVideoPlayerVideo - unrecoverable video decoder failure");
+     m_messageParent.Put(std::make_shared<CDVDMsg>(CDVDMsg::PLAYER_ABORT));
+     m_bStop = true;
+@@ -659,12 +670,15 @@
+   // if decoder had an error, tell it to reset to avoid more problems
+   if (decoderState == CDVDVideoCodec::VC_ERROR)
+   {
++    FinishDrain(CDVDMsgVideoDrain::State::Failed);
+     CLog::Log(LOGDEBUG, "CVideoPlayerVideo - video decoder returned error");
+     return false;
+   }
+ 
+   if (decoderState == CDVDVideoCodec::VC_EOF)
+   {
++    m_decoderDrained = true;
++    FinishDrain(CDVDMsgVideoDrain::State::Complete);
+     if (notifyStarted && m_syncState == IDVDStreamPlayer::SYNC_STARTING)
+     {
+       SStartMsg msg;
+@@ -680,7 +694,7 @@
+   // check for a new picture
+   if (decoderState == CDVDVideoCodec::VC_PICTURE)
+   {
+-    bool hasTimestamp = true;
++    m_pictureHasTimestamp = true;
+ 
+     if (!(m_picture.iFlags & DVP_FLAG_FIELD_DURATION) ||
+         m_picture.iDuration <= 0.0)
+@@ -692,7 +706,7 @@
+     if (m_picture.dts == DVD_NOPTS_VALUE && m_picture.pts == DVD_NOPTS_VALUE)
+     {
+       m_picture.pts = pts;
+-      hasTimestamp = false;
++      m_pictureHasTimestamp = false;
+     }
+     else if (m_picture.pts == DVD_NOPTS_VALUE)
+       m_picture.pts = m_picture.dts;
+@@ -752,43 +766,68 @@
+     if (m_speed != 0)
+       pts += m_picture.iDuration * m_speed / abs(m_speed);
+ 
+-    m_outputSate = OutputPicture(&m_picture);
+-
+-    if (m_outputSate == OUTPUT_AGAIN)
+-    {
+-      return true;
+-    }
+-    else if (m_outputSate == OUTPUT_ABORT)
+-    {
+-      return false;
+-    }
+-    else if ((m_outputSate == OUTPUT_DROPPED) && !(m_picture.iFlags & DVP_FLAG_DROPPED))
+-    {
+-      m_iDroppedFrames++;
+-      m_ptsTracker.Flush();
+-    }
+-
+-    if (notifyStarted && m_syncState == IDVDStreamPlayer::SYNC_STARTING &&
+-        m_outputSate != OUTPUT_DROPPED &&
+-        !(m_picture.iFlags & DVP_FLAG_DROPPED))
+-    {
+-      m_syncState = IDVDStreamPlayer::SYNC_WAITSYNC;
+-      SStartMsg msg;
+-      msg.player = VideoPlayer_VIDEO;
+-      msg.cachetime = DVD_MSEC_TO_TIME(50); //! @todo implement
+-      msg.cachetotal = DVD_MSEC_TO_TIME(100); //! @todo implement
+-      msg.timestamp = hasTimestamp ? (pts + m_renderManager.GetDelay() * 1000) : DVD_NOPTS_VALUE;
+-      m_messageParent.Put(std::make_shared<CDVDMsgType<SStartMsg>>(CDVDMsg::PLAYER_STARTED, msg));
+-    }
+-
+-    frametime = (double)DVD_TIME_BASE / m_fFrameRate;
++    return ProcessOutput(frametime, pts, notifyStarted);
+   }
+ 
+   return true;
+ }
+ 
++bool CVideoPlayerVideo::ProcessOutput(double& frametime, double& pts, bool notifyStarted)
++{
++  m_outputSate = OutputPicture(&m_picture);
++  if (m_outputSate == OUTPUT_AGAIN)
++    return true;
++  if (m_outputSate == OUTPUT_ABORT)
++  {
++    FinishDrain(CDVDMsgVideoDrain::State::Failed);
++    return false;
++  }
++  if (m_outputSate == OUTPUT_DROPPED && !(m_picture.iFlags & DVP_FLAG_DROPPED))
++  {
++    m_iDroppedFrames++;
++    m_ptsTracker.Flush();
++  }
++  if (notifyStarted && m_syncState == IDVDStreamPlayer::SYNC_STARTING &&
++      m_outputSate != OUTPUT_DROPPED && !(m_picture.iFlags & DVP_FLAG_DROPPED))
++  {
++    m_syncState = IDVDStreamPlayer::SYNC_WAITSYNC;
++    SStartMsg msg;
++    msg.player = VideoPlayer_VIDEO;
++    msg.cachetime = DVD_MSEC_TO_TIME(50);
++    msg.cachetotal = DVD_MSEC_TO_TIME(100);
++    msg.timestamp = m_pictureHasTimestamp ? pts + m_renderManager.GetDelay() * 1000
++                                          : DVD_NOPTS_VALUE;
++    m_messageParent.Put(std::make_shared<CDVDMsgType<SStartMsg>>(CDVDMsg::PLAYER_STARTED, msg));
++  }
++  frametime = (double)DVD_TIME_BASE / m_fFrameRate;
++  return true;
++}
++
++void CVideoPlayerVideo::StartDrain(std::shared_ptr<CDVDMsgVideoDrain> request)
++{
++  FinishDrain(CDVDMsgVideoDrain::State::Canceled);
++  m_drainRequest = std::move(request);
++  if (!m_pVideoCodec)
++    FinishDrain(CDVDMsgVideoDrain::State::Failed);
++  else if (m_decoderDrained)
++    FinishDrain(CDVDMsgVideoDrain::State::Complete);
++  else
++    m_pVideoCodec->SetCodecControl(DVD_CODEC_CTRL_DRAIN);
++}
++
++void CVideoPlayerVideo::FinishDrain(CDVDMsgVideoDrain::State state)
++{
++  if (m_drainRequest)
++  {
++    m_decoderDrained = state != CDVDMsgVideoDrain::State::Canceled;
++    m_drainRequest->Finish(state);
++    m_drainRequest.reset();
++  }
++}
++
+ void CVideoPlayerVideo::OnExit()
+ {
++  FinishDrain(CDVDMsgVideoDrain::State::Canceled);
+   CLog::Log(LOGINFO, "thread end: video_thread");
+ }
+ 
+--- a/xbmc/cores/VideoPlayer/VideoPlayerVideo.h
++++ b/xbmc/cores/VideoPlayer/VideoPlayerVideo.h
+@@ -91,6 +91,9 @@
+   void Process() override;
+ 
+   bool ProcessDecoderOutput(double& frametime, double& pts, bool notifyStarted = true);
++  bool ProcessOutput(double& frametime, double& pts, bool notifyStarted);
++  void StartDrain(std::shared_ptr<CDVDMsgVideoDrain> request);
++  void FinishDrain(CDVDMsgVideoDrain::State state);
+   void SendMessageBack(const std::shared_ptr<CDVDMsg>& pMsg, int priority = 0);
+   MsgQueueReturnCode GetMessage(std::shared_ptr<CDVDMsg>& pMsg,
+                                 std::chrono::milliseconds timeout,
+@@ -136,6 +139,9 @@
+   std::unique_ptr<CDVDVideoCodec> m_pVideoCodec;
+   CPtsTracker m_ptsTracker;
+   std::list<DVDMessageListItem> m_packets;
++  std::shared_ptr<CDVDMsgVideoDrain> m_drainRequest;
++  bool m_decoderDrained = false;
++  bool m_pictureHasTimestamp = false;
+   CDroppingStats m_droppingStats;
+   CRenderManager& m_renderManager;
+   VideoPicture m_picture;
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
+@@ -1261,6 +1261,13 @@
+   return true;
+ }
+ 
++bool CRenderManager::HasPendingVideo()
++{
++  std::unique_lock<CCriticalSection> lock(m_presentlock);
++  // The last picture leaves m_queued before Render consumes its presentation.
++  return !m_queued.empty() || m_presentstep != PRESENT_IDLE;
++}
++
+ void CRenderManager::CheckEnableClockSync()
+ {
+   // refresh rate can be a multiple of video fps
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.h
+@@ -114,6 +114,7 @@
+    * looking at the end of the queue.
+    */
+   bool GetStats(int &lateframes, double &pts, int &queued, int &discard);
++  bool HasPendingVideo();
+ 
+   /**
+    * Video player call this on flush in oder to discard any queued frames

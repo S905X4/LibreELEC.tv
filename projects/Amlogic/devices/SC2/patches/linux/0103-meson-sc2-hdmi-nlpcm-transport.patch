@@ -1,0 +1,901 @@
+From 18ad31a173d80fafbc5f198f8f2765139ac0b222 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Fri, 13 Nov 2026 17:16:55 +0800
+Subject: [PATCH] ASoC: meson: Carry SC2 non-PCM audio through the SPDIF
+ sampler
+
+Connect the SC2 internal SPDIF route to a second HDMI DAI, retaining
+ordinary I2S PCM and the optical backend. Keep channel-map ownership
+and stream directions per DAI. Consume IEC958 controls during prepare
+after ALSA hooks, preserve raw-data validity through unmute, and reset
+all packet state when returning to PCM. Keep HBR unsupported until its
+emitted status contract is established on SC2.
+
+The matching LibreELEC kernel package builds with this series.
+
+Change-Id: I6561733bbd1a7bd6818b9ce39768c4f9730e5e59
+---
+ .../display/amlogic,meson-dw-hdmi.yaml        |   6 +-
+ .../dts/amlogic/meson-sc2-hk1-rbox-x4.dts     |  14 +-
+ arch/arm64/boot/dts/amlogic/meson-sc2.dtsi    |   2 +-
+ .../gpu/drm/bridge/synopsys/dw-hdmi-audio.h   |   1 +
+ .../drm/bridge/synopsys/dw-hdmi-i2s-audio.c   | 168 ++++++++++++++----
+ drivers/gpu/drm/bridge/synopsys/dw-hdmi.c     |  18 +-
+ drivers/gpu/drm/bridge/synopsys/dw-hdmi.h     |  18 ++
+ drivers/gpu/drm/meson/meson_dw_hdmi.c         |   1 +
+ include/drm/bridge/dw_hdmi.h                  |   3 +
+ sound/soc/codecs/hdmi-codec.c                 |  96 ++++++----
+ sound/soc/meson/axg-spdifout.c                | 162 +++++++++++++----
+ 11 files changed, 374 insertions(+), 115 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/display/amlogic,meson-dw-hdmi.yaml b/Documentation/devicetree/bindings/display/amlogic,meson-dw-hdmi.yaml
+index cd60631d8c05..2b06d402617c 100644
+--- a/Documentation/devicetree/bindings/display/amlogic,meson-dw-hdmi.yaml
++++ b/Documentation/devicetree/bindings/display/amlogic,meson-dw-hdmi.yaml
+@@ -19,6 +19,8 @@ allOf:
+             const: amlogic,meson-sc2-dw-hdmi
+     then:
+       properties:
++        "#sound-dai-cells":
++          const: 1
+         reg:
+           minItems: 2
+         resets:
+@@ -29,6 +31,8 @@ allOf:
+         - reg-names
+     else:
+       properties:
++        "#sound-dai-cells":
++          const: 0
+         reg:
+           maxItems: 1
+         resets:
+@@ -143,7 +147,7 @@ properties:
+     const: 0
+ 
+   "#sound-dai-cells":
+-    const: 0
++    enum: [0, 1]
+ 
+   sound-name-prefix: true
+ 
+diff --git a/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts b/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
+index 16dbfc0b4523..7a24d82b7b81 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
++++ b/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
+@@ -108,9 +108,12 @@ dai-link-1 {
+ 
+ 		dai-link-2 {
+ 			sound-dai = <&spdifout_a>;
+-			codec {
++			codec-0 {
+ 				sound-dai = <&spdif_dit>;
+ 			};
++			codec-1 {
++				sound-dai = <&tohdmitx TOHDMITX_SPDIF_IN_A>;
++			};
+ 		};
+ 
+ 		dai-link-3 {
+@@ -131,7 +134,14 @@ codec {
+ 		dai-link-4 {
+ 			sound-dai = <&tohdmitx TOHDMITX_I2S_OUT>;
+ 			codec {
+-				sound-dai = <&hdmi_tx>;
++				sound-dai = <&hdmi_tx 0>;
++			};
++		};
++
++		dai-link-5 {
++			sound-dai = <&tohdmitx TOHDMITX_SPDIF_OUT>;
++			codec {
++				sound-dai = <&hdmi_tx 1>;
+ 			};
+ 		};
+ 	};
+diff --git a/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi b/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi
+index 89efc15b354e..f470a58617b8 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi
++++ b/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi
+@@ -421,7 +421,7 @@ hdmi_tx: hdmi-tx@fe300000 {
+ 			reset-names = "hdmitx_apb", "hdmitx", "hdmitx_phy", "vid_pll_div";
+ 			#address-cells = <1>;
+ 			#size-cells = <0>;
+-			#sound-dai-cells = <0>;
++			#sound-dai-cells = <1>;
+ 			status = "disabled";
+ 
+ 			port@0 {
+diff --git a/drivers/gpu/drm/bridge/synopsys/dw-hdmi-audio.h b/drivers/gpu/drm/bridge/synopsys/dw-hdmi-audio.h
+index f72d27208ebe..4149ae88188b 100644
+--- a/drivers/gpu/drm/bridge/synopsys/dw-hdmi-audio.h
++++ b/drivers/gpu/drm/bridge/synopsys/dw-hdmi-audio.h
+@@ -18,6 +18,7 @@ struct dw_hdmi_i2s_audio_data {
+ 	void (*write)(struct dw_hdmi *hdmi, u8 val, int offset);
+ 	u8 (*read)(struct dw_hdmi *hdmi, int offset);
+ 	u8 *(*get_eld)(struct dw_hdmi *hdmi);
++	bool spdif;
+ };
+ 
+ #endif
+diff --git a/drivers/gpu/drm/bridge/synopsys/dw-hdmi-i2s-audio.c b/drivers/gpu/drm/bridge/synopsys/dw-hdmi-i2s-audio.c
+index 2c903c9fe805..682394760db2 100644
+--- a/drivers/gpu/drm/bridge/synopsys/dw-hdmi-i2s-audio.c
++++ b/drivers/gpu/drm/bridge/synopsys/dw-hdmi-i2s-audio.c
+@@ -6,6 +6,7 @@
+  * Kuninori Morimoto <kuninori.morimoto.gx@renesas.com>
+  */
+ 
++#include <linux/delay.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/module.h>
+ 
+@@ -34,52 +35,109 @@ static inline u8 hdmi_read(struct dw_hdmi_i2s_audio_data *audio, int offset)
+ 	return audio->read(hdmi, offset);
+ }
+ 
+-static int dw_hdmi_i2s_hw_params(struct device *dev, void *data,
++static void dw_hdmi_audio_reset(struct dw_hdmi_i2s_audio_data *audio,
++				u8 conf0)
++{
++	u8 reset = HDMI_MC_SWRSTZ_I2SSWRST_REQ;
++
++	hdmi_write(audio, conf0 | HDMI_AUD_CONF0_SW_RESET, HDMI_AUD_CONF0);
++	hdmi_write(audio, conf0, HDMI_AUD_CONF0);
++	if (audio->spdif) {
++		reset |= HDMI_MC_SWRSTZ_SPDIFSWRST_REQ;
++		hdmi_write(audio, HDMI_AUD_SPDIF0_SW_RESET, HDMI_AUD_SPDIF0);
++		hdmi_write(audio, 0, HDMI_AUD_SPDIF0);
++	}
++	hdmi_write(audio, (u8)~reset, HDMI_MC_SWRSTZ);
++	if (audio->spdif) {
++		/* The Amlogic sampler requires another FIFO reset after MC. */
++		hdmi_write(audio, HDMI_AUD_SPDIF0_SW_RESET, HDMI_AUD_SPDIF0);
++		hdmi_write(audio, 0, HDMI_AUD_SPDIF0);
++		usleep_range(9, 11);
++	}
++}
++
++static int dw_hdmi_i2s_prepare(struct device *dev, void *data,
+ 				 struct hdmi_codec_daifmt *fmt,
+ 				 struct hdmi_codec_params *hparms)
+ {
+ 	struct dw_hdmi_i2s_audio_data *audio = data;
+ 	struct dw_hdmi *hdmi = audio->hdmi;
+-	u8 conf0 = 0;
+-	u8 conf1 = 0;
+-	u8 inputclkfs = 0;
++	bool spdif = fmt->fmt == HDMI_SPDIF;
++	bool non_pcm = hparms->iec.status[0] & IEC958_AES0_NONAUDIO;
++	u8 conf0, conf1, conf2, inputclkfs, sample_freq, sample_layout;
+ 
+-	/* it cares I2S only */
+-	if (fmt->bit_clk_provider | fmt->frame_clk_provider) {
++	if (fmt->bit_clk_provider || fmt->frame_clk_provider) {
+ 		dev_err(dev, "unsupported clock settings\n");
+ 		return -EINVAL;
+ 	}
+-
+-	/* Reset the FIFOs before applying new params */
+-	hdmi_write(audio, HDMI_AUD_CONF0_SW_RESET, HDMI_AUD_CONF0);
+-	hdmi_write(audio, (u8)~HDMI_MC_SWRSTZ_I2SSWRST_REQ, HDMI_MC_SWRSTZ);
+-
+-	inputclkfs	= HDMI_AUD_INPUTCLKFS_64FS;
+-	conf0		= (HDMI_AUD_CONF0_I2S_SELECT | HDMI_AUD_CONF0_I2S_EN0);
+-
+-	/* Enable the required i2s lanes */
+-	switch (hparms->channels) {
+-	case 7 ... 8:
+-		conf0 |= HDMI_AUD_CONF0_I2S_EN3;
+-		fallthrough;
+-	case 5 ... 6:
+-		conf0 |= HDMI_AUD_CONF0_I2S_EN2;
+-		fallthrough;
+-	case 3 ... 4:
+-		conf0 |= HDMI_AUD_CONF0_I2S_EN1;
+-		/* Fall-thru */
++	if (hparms->iec.status[0] & IEC958_AES0_PROFESSIONAL)
++		return -EINVAL;
++	if (fmt->bit_fmt == SNDRV_PCM_FORMAT_IEC958_SUBFRAME_LE ||
++	    fmt->bit_fmt == SNDRV_PCM_FORMAT_IEC958_SUBFRAME_BE)
++		return -EINVAL;
++	if (hparms->sample_width != snd_pcm_format_width(fmt->bit_fmt))
++		return -EINVAL;
++	if (hparms->channels < 2 || hparms->channels > 8)
++		return -EINVAL;
++	switch (hparms->sample_rate) {
++	case 32000:
++		sample_freq = IEC958_AES3_CON_FS_32000;
++		break;
++	case 44100:
++		sample_freq = IEC958_AES3_CON_FS_44100;
++		break;
++	case 48000:
++		sample_freq = IEC958_AES3_CON_FS_48000;
++		break;
++	case 88200:
++		sample_freq = IEC958_AES3_CON_FS_88200;
++		break;
++	case 96000:
++		sample_freq = IEC958_AES3_CON_FS_96000;
++		break;
++	case 176400:
++		sample_freq = IEC958_AES3_CON_FS_176400;
++		break;
++	case 192000:
++		sample_freq = IEC958_AES3_CON_FS_192000;
++		break;
++	default:
++		return -EINVAL;
+ 	}
++	if (non_pcm && !spdif) {
++		dev_err(dev, "compressed audio requires the S/PDIF input\n");
++		return -EOPNOTSUPP;
++	}
++	if (spdif && (!audio->spdif || hparms->channels != 2))
++		return -EINVAL;
++	/* Stereo NLPCM uses the carrier rate, not an HBR aggregate rate. */
++	if (non_pcm &&
++	    ((hparms->iec.status[3] & IEC958_AES3_CON_FS) != sample_freq ||
++	     hparms->sample_width != 16))
++		return -EINVAL;
+ 
+ 	switch (hparms->sample_width) {
+ 	case 16:
+ 		conf1 = HDMI_AUD_CONF1_WIDTH_16;
+ 		break;
++	case 20:
++		conf1 = HDMI_AUD_CONF1_WIDTH_20;
++		break;
+ 	case 24:
++		conf1 = HDMI_AUD_CONF1_WIDTH_24;
++		break;
+ 	case 32:
++		if (spdif)
++			return -EINVAL;
+ 		conf1 = HDMI_AUD_CONF1_WIDTH_24;
+ 		break;
++	default:
++		return -EINVAL;
+ 	}
+ 
++	conf0 = HDMI_AUD_CONF0_I2S_SELECT |
++		((1 << DIV_ROUND_UP(hparms->channels, 2)) - 1);
++	inputclkfs = HDMI_AUD_INPUTCLKFS_64FS;
+ 	switch (fmt->fmt) {
+ 	case HDMI_I2S:
+ 		conf1 |= HDMI_AUD_CONF1_MODE_I2S;
+@@ -96,19 +154,49 @@ static int dw_hdmi_i2s_hw_params(struct device *dev, void *data,
+ 	case HDMI_DSP_B:
+ 		conf1 |= HDMI_AUD_CONF1_MODE_BURST_2;
+ 		break;
++	case HDMI_SPDIF:
++		conf0 = 0;
++		conf1 = HDMI_AUD_CONF1_WIDTH_24;
++		inputclkfs = HDMI_AUD_INPUTCLKFS_128FS;
++		break;
+ 	default:
+ 		dev_err(dev, "unsupported format\n");
+ 		return -EINVAL;
+ 	}
+ 
+-	dw_hdmi_set_sample_rate(hdmi, hparms->sample_rate);
+-	dw_hdmi_set_channel_status(hdmi, hparms->iec.status);
++	/* Stop I2S lanes while replacing all sampler and packet state. */
++	hdmi_write(audio, conf0 & HDMI_AUD_CONF0_I2S_SELECT, HDMI_AUD_CONF0);
++	hdmi_write(audio, HDMI_AUD_INT_FIFO_EMPTY_MSK |
++		   HDMI_AUD_INT_FIFO_FULL_MSK, HDMI_AUD_INT);
++	hdmi_write(audio, conf1, HDMI_AUD_CONF1);
++	conf2 = hdmi_read(audio, HDMI_AUD_CONF2);
++	conf2 &= ~(HDMI_AUD_CONF2_HBR | HDMI_AUD_CONF2_NLPCM);
++	hdmi_write(audio, conf2, HDMI_AUD_CONF2);
++	if (audio->spdif) {
++		/* NLPCM status and validity arrive in the S/PDIF subframes. */
++		hdmi_write(audio, HDMI_AUD_SPDIF1_WIDTH_24, HDMI_AUD_SPDIF1);
++		hdmi_write(audio, HDMI_AUD_INT_FIFO_EMPTY_MSK |
++			   HDMI_AUD_INT_FIFO_FULL_MSK, HDMI_AUD_SPDIFINT);
++	}
++	hdmi_write(audio, inputclkfs, HDMI_AUD_INPUTCLKFS);
++	if (!spdif)
++		dw_hdmi_set_channel_status(hdmi, hparms->iec.status);
+ 	dw_hdmi_set_channel_count(hdmi, hparms->channels);
++	sample_layout = hdmi_read(audio, HDMI_FC_AUDSCONF);
++	sample_layout &= ~HDMI_FC_AUDSCONF_AUD_PACKET_SAMPFIT_MASK;
++	hdmi_write(audio, sample_layout, HDMI_FC_AUDSCONF);
+ 	dw_hdmi_set_channel_allocation(hdmi, hparms->cea.channel_allocation);
+-
+-	hdmi_write(audio, inputclkfs, HDMI_AUD_INPUTCLKFS);
++	/* Coding type, sample size and frequency refer to the stream. */
++	hdmi_write(audio, (hparms->cea.channels ? hparms->cea.channels - 1 : 0) <<
++		   HDMI_FC_AUDICONF0_CC_OFFSET, HDMI_FC_AUDICONF0);
++	hdmi_write(audio, 0, HDMI_FC_AUDICONF1);
++	hdmi_write(audio, 0, HDMI_FC_AUDICONF3);
++	hdmi_write(audio, 0, HDMI_FC_AUDSV);
++	hdmi_write(audio, 0, HDMI_FC_AUDSU);
+ 	hdmi_write(audio, conf0, HDMI_AUD_CONF0);
+-	hdmi_write(audio, conf1, HDMI_AUD_CONF1);
++	dw_hdmi_audio_reset(audio, conf0);
++	/* Relatch N/CTS after reset, using the carrier frame rate. */
++	dw_hdmi_set_sample_rate(hdmi, hparms->sample_rate);
+ 
+ 	return 0;
+ }
+@@ -159,11 +247,15 @@ static int dw_hdmi_i2s_get_dai_id(struct snd_soc_component *component,
+ 		return ret;
+ 
+ 	/*
+-	 * HDMI sound should be located as reg = <2>
+-	 * Then, it is sound port 0
++	 * HDMI sound is on port 2. Endpoint 0 is I2S and endpoint 1
++	 * selects the optional S/PDIF DAI.
+ 	 */
+-	if (of_ep.port == 2)
+-		return 0;
++	if (of_ep.port == 2) {
++		struct dw_hdmi_i2s_audio_data *audio = data;
++
++		if (of_ep.id == 0 || (of_ep.id == 1 && audio->spdif))
++			return of_ep.id;
++	}
+ 
+ 	return -EINVAL;
+ }
+@@ -179,7 +271,7 @@ static int dw_hdmi_i2s_hook_plugged_cb(struct device *dev, void *data,
+ }
+ 
+ static const struct hdmi_codec_ops dw_hdmi_i2s_ops = {
+-	.hw_params	= dw_hdmi_i2s_hw_params,
++	.prepare	= dw_hdmi_i2s_prepare,
+ 	.audio_startup  = dw_hdmi_i2s_audio_startup,
+ 	.audio_shutdown	= dw_hdmi_i2s_audio_shutdown,
+ 	.get_eld	= dw_hdmi_i2s_get_eld,
+@@ -197,6 +289,12 @@ static int snd_dw_hdmi_probe(struct platform_device *pdev)
+ 	memset(&pdata, 0, sizeof(pdata));
+ 	pdata.ops		= &dw_hdmi_i2s_ops;
+ 	pdata.i2s		= 1;
++	pdata.spdif		= audio->spdif;
++	pdata.no_i2s_capture	= 1;
++	pdata.no_spdif_capture	= 1;
++	pdata.i2s_formats	= SNDRV_PCM_FMTBIT_S16_LE |
++		SNDRV_PCM_FMTBIT_S20_3LE | SNDRV_PCM_FMTBIT_S24_3LE |
++		SNDRV_PCM_FMTBIT_S24_LE | SNDRV_PCM_FMTBIT_S32_LE;
+ 	pdata.max_i2s_channels	= 8;
+ 	pdata.data		= audio;
+ 
+diff --git a/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c b/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
+index 748ed62e48a6..112d1a9658e7 100644
+--- a/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
++++ b/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
+@@ -632,12 +632,21 @@ static unsigned int hdmi_compute_n(unsigned int freq, unsigned long pixel_clk)
+ void dw_hdmi_set_channel_status(struct dw_hdmi *hdmi,
+ 				u8 *channel_status)
+ {
+-	/*
+-	 * Set channel status register for frequency and word length.
+-	 * Use default values for other registers.
+-	 */
++	/* The frame composer packs consumer status fields, not AES bytes. */
++	mutex_lock(&hdmi->audio_mutex);
++	hdmi_writeb(hdmi, ((channel_status[0] >> 2) & 0x01) |
++		    ((channel_status[5] & 0x03) << 4), HDMI_FC_AUDSCHNLS0);
++	hdmi_writeb(hdmi, channel_status[1], HDMI_FC_AUDSCHNLS1);
++	hdmi_writeb(hdmi, ((channel_status[0] & 0x38) << 1) |
++		    (channel_status[2] & 0x0f), HDMI_FC_AUDSCHNLS2);
++	/* Number the left/right subframes of the four I2S lanes. */
++	hdmi_writeb(hdmi, 0x42, HDMI_FC_AUDSCHNLS3);
++	hdmi_writeb(hdmi, 0x86, HDMI_FC_AUDSCHNLS4);
++	hdmi_writeb(hdmi, 0x31, HDMI_FC_AUDSCHNLS5);
++	hdmi_writeb(hdmi, 0x75, HDMI_FC_AUDSCHNLS6);
+ 	hdmi_writeb(hdmi, channel_status[3], HDMI_FC_AUDSCHNLS7);
+ 	hdmi_writeb(hdmi, channel_status[4], HDMI_FC_AUDSCHNLS8);
++	mutex_unlock(&hdmi->audio_mutex);
+ }
+ EXPORT_SYMBOL_GPL(dw_hdmi_set_channel_status);
+ 
+@@ -3538,6 +3547,7 @@ struct dw_hdmi *dw_hdmi_probe(struct platform_device *pdev,
+ 		audio.get_eld	= hdmi_audio_get_eld;
+ 		audio.write	= hdmi_writeb;
+ 		audio.read	= hdmi_readb;
++		audio.spdif	= plat_data->spdif_input;
+ 		hdmi->enable_audio = dw_hdmi_i2s_audio_enable;
+ 		hdmi->disable_audio = dw_hdmi_i2s_audio_disable;
+ 
+diff --git a/drivers/gpu/drm/bridge/synopsys/dw-hdmi.h b/drivers/gpu/drm/bridge/synopsys/dw-hdmi.h
+index af43a0414b78..f36a52f2cae0 100644
+--- a/drivers/gpu/drm/bridge/synopsys/dw-hdmi.h
++++ b/drivers/gpu/drm/bridge/synopsys/dw-hdmi.h
+@@ -402,6 +402,8 @@
+ #define HDMI_AUD_CTS2                           0x3204
+ #define HDMI_AUD_CTS3                           0x3205
+ #define HDMI_AUD_INPUTCLKFS                     0x3206
++#define HDMI_AUD_SPDIF0                         0x3300
++#define HDMI_AUD_SPDIF1                         0x3301
+ #define HDMI_AUD_SPDIFINT			0x3302
+ #define HDMI_AUD_CONF0_HBR                      0x3400
+ #define HDMI_AUD_HBR_STATUS                     0x3401
+@@ -929,8 +931,23 @@ enum {
+ 	HDMI_AUD_CONF1_MODE_BURST_1 = 0x60,
+ 	HDMI_AUD_CONF1_MODE_BURST_2 = 0x80,
+ 	HDMI_AUD_CONF1_WIDTH_16 = 0x10,
++	HDMI_AUD_CONF1_WIDTH_20 = 0x14,
+ 	HDMI_AUD_CONF1_WIDTH_24 = 0x18,
+ 
++/* AUD_CONF2 field values */
++	HDMI_AUD_CONF2_HBR = 0x01,
++	HDMI_AUD_CONF2_NLPCM = 0x02,
++
++/* AUD_INT and AUD_SPDIFINT field values */
++	HDMI_AUD_INT_FIFO_EMPTY_MSK = 0x08,
++	HDMI_AUD_INT_FIFO_FULL_MSK = 0x04,
++
++/* AUD_SPDIF0 field values */
++	HDMI_AUD_SPDIF0_SW_RESET = 0x80,
++
++/* AUD_SPDIF1 field values */
++	HDMI_AUD_SPDIF1_WIDTH_24 = 0x18,
++
+ /* AUD_CTS3 field values */
+ 	HDMI_AUD_CTS3_N_SHIFT_OFFSET = 5,
+ 	HDMI_AUD_CTS3_N_SHIFT_MASK = 0xe0,
+@@ -995,6 +1012,7 @@ enum {
+ 	HDMI_MC_CLKDIS_PIXELCLK_DISABLE = 0x1,
+ 
+ /* MC_SWRSTZ field values */
++	HDMI_MC_SWRSTZ_SPDIFSWRST_REQ = 0x10,
+ 	HDMI_MC_SWRSTZ_I2SSWRST_REQ = 0x08,
+ 	HDMI_MC_SWRSTZ_TMDSSWRST_REQ = 0x02,
+ 
+diff --git a/drivers/gpu/drm/meson/meson_dw_hdmi.c b/drivers/gpu/drm/meson/meson_dw_hdmi.c
+index 58c9813d8830..49c0d1572e7f 100644
+--- a/drivers/gpu/drm/meson/meson_dw_hdmi.c
++++ b/drivers/gpu/drm/meson/meson_dw_hdmi.c
+@@ -789,6 +789,7 @@ static int meson_dw_hdmi_bind(struct device *dev, struct device *master,
+ 	meson_dw_hdmi->dev = dev;
+ 	meson_dw_hdmi->data = match;
+ 	dw_plat_data = &meson_dw_hdmi->dw_plat_data;
++	dw_plat_data->spdif_input = priv->sc2;
+ 
+ 	ret = devm_regulator_get_enable_optional(dev, "hdmi");
+ 	if (ret < 0 && ret != -ENODEV)
+diff --git a/include/drm/bridge/dw_hdmi.h b/include/drm/bridge/dw_hdmi.h
+index 6a46baa0737c..fd92fa1ca731 100644
+--- a/include/drm/bridge/dw_hdmi.h
++++ b/include/drm/bridge/dw_hdmi.h
+@@ -132,6 +132,9 @@ struct dw_hdmi_plat_data {
+ 	bool use_drm_infoframe;
+ 	bool ycbcr_420_allowed;
+ 
++	/* The controller S/PDIF input is connected to an audio producer. */
++	bool spdif_input;
++
+ 	/*
+ 	 * Private data passed to all the .mode_valid() and .configure_phy()
+ 	 * callback functions.
+diff --git a/sound/soc/codecs/hdmi-codec.c b/sound/soc/codecs/hdmi-codec.c
+index df32032e631f..86488e83ace2 100644
+--- a/sound/soc/codecs/hdmi-codec.c
++++ b/sound/soc/codecs/hdmi-codec.c
+@@ -278,12 +278,18 @@ static const struct hdmi_codec_cea_spk_alloc hdmi_codec_channel_alloc[] = {
+ 	  .mask = FL | FR | LFE },
+ };
+ 
++struct hdmi_codec_chmap {
++	struct hdmi_codec_priv *hcp;
++	struct snd_pcm_chmap *info;
++	unsigned int index;
++};
++
+ struct hdmi_codec_priv {
+ 	struct hdmi_codec_pdata hcd;
+ 	uint8_t eld[MAX_ELD_BYTES];
+ 	struct snd_parsed_hdmi_eld eld_parsed;
+-	struct snd_pcm_chmap *chmap_info;
+-	unsigned int chmap_idx;
++	/* Indexed by DAI_ID_I2S and DAI_ID_SPDIF. */
++	struct hdmi_codec_chmap chmap[2];
+ 	struct mutex lock;
+ 	bool busy;
+ 	struct snd_soc_jack *jack;
+@@ -343,15 +349,21 @@ static void hdmi_codec_eld_chmap(struct hdmi_codec_priv *hcp)
+ {
+ 	u8 spk_alloc;
+ 	unsigned long spk_mask;
++	unsigned int i;
+ 
+ 	spk_alloc = drm_eld_get_spk_alloc(hcp->eld);
+ 	spk_mask = hdmi_codec_spk_mask_from_alloc(spk_alloc);
+ 
+-	/* Detect if only stereo supported, else return 8 channels mappings */
+-	if ((spk_mask & ~(FL | FR)) && hcp->chmap_info->max_channels > 2)
+-		hcp->chmap_info->chmap = hdmi_codec_8ch_chmaps;
+-	else
+-		hcp->chmap_info->chmap = hdmi_codec_stereo_chmaps;
++	for (i = 0; i < ARRAY_SIZE(hcp->chmap); i++) {
++		struct snd_pcm_chmap *info = hcp->chmap[i].info;
++
++		if (!info)
++			continue;
++		if ((spk_mask & ~(FL | FR)) && info->max_channels > 2)
++			info->chmap = hdmi_codec_8ch_chmaps;
++		else
++			info->chmap = hdmi_codec_stereo_chmaps;
++	}
+ }
+ 
+ static int hdmi_codec_get_ch_alloc_table_idx(struct hdmi_codec_priv *hcp,
+@@ -381,20 +393,24 @@ static int hdmi_codec_get_ch_alloc_table_idx(struct hdmi_codec_priv *hcp,
+ static int hdmi_codec_chmap_ctl_get(struct snd_kcontrol *kcontrol,
+ 			      struct snd_ctl_elem_value *ucontrol)
+ {
+-	unsigned const char *map;
+-	unsigned int i;
++	const struct snd_pcm_chmap_elem *table;
++	unsigned int i, index;
+ 	struct snd_pcm_chmap *info = snd_kcontrol_chip(kcontrol);
+-	struct hdmi_codec_priv *hcp = info->private_data;
+-
+-	if (hcp->chmap_idx != HDMI_CODEC_CHMAP_IDX_UNKNOWN)
+-		map = info->chmap[hcp->chmap_idx].map;
++	struct hdmi_codec_chmap *chmap = info->private_data;
++	struct hdmi_codec_priv *hcp = chmap->hcp;
+ 
+-	for (i = 0; i < info->max_channels; i++) {
+-		if (hcp->chmap_idx == HDMI_CODEC_CHMAP_IDX_UNKNOWN)
+-			ucontrol->value.integer.value[i] = 0;
+-		else
+-			ucontrol->value.integer.value[i] = map[i];
+-	}
++	mutex_lock(&hcp->lock);
++	table = info->chmap;
++	index = READ_ONCE(chmap->index);
++	/* ELD may have reduced a formerly multichannel map to stereo. */
++	if ((table == hdmi_codec_stereo_chmaps && index != 0) ||
++	    (table == hdmi_codec_8ch_chmaps &&
++	     index >= ARRAY_SIZE(hdmi_codec_8ch_chmaps) - 1))
++		index = HDMI_CODEC_CHMAP_IDX_UNKNOWN;
++	for (i = 0; i < info->max_channels; i++)
++		ucontrol->value.integer.value[i] =
++			index == HDMI_CODEC_CHMAP_IDX_UNKNOWN ? 0 : table[index].map[i];
++	mutex_unlock(&hcp->lock);
+ 
+ 	return 0;
+ }
+@@ -449,8 +465,10 @@ static int hdmi_codec_startup(struct snd_pcm_substream *substream,
+ {
+ 	struct hdmi_codec_priv *hcp = snd_soc_dai_get_drvdata(dai);
+ 	bool tx = substream->stream == SNDRV_PCM_STREAM_PLAYBACK;
+-	bool has_capture = !hcp->hcd.no_i2s_capture;
+-	bool has_playback = !hcp->hcd.no_i2s_playback;
++	bool has_capture = !(dai->id == DAI_ID_SPDIF ?
++		hcp->hcd.no_spdif_capture : hcp->hcd.no_i2s_capture);
++	bool has_playback = !(dai->id == DAI_ID_SPDIF ?
++		hcp->hcd.no_spdif_playback : hcp->hcd.no_i2s_playback);
+ 	int ret = 0;
+ 
+ 	if (!((has_playback && tx) || (has_capture && !tx)))
+@@ -478,9 +496,12 @@ static int hdmi_codec_startup(struct snd_pcm_substream *substream,
+ 		snd_parse_eld(dai->dev, &hcp->eld_parsed,
+ 			      hcp->eld, sizeof(hcp->eld));
+ 
+-		ret = snd_pcm_hw_constraint_eld(substream->runtime, hcp->eld);
+-		if (ret)
+-			goto err;
++		/* S/PDIF carries IEC61937 rates, not ELD LPCM sample rates. */
++		if (dai->id == DAI_ID_I2S) {
++			ret = snd_pcm_hw_constraint_eld(substream->runtime, hcp->eld);
++			if (ret)
++				goto err;
++		}
+ 
+ 		/* Select chmap supported */
+ 		hdmi_codec_eld_chmap(hcp);
+@@ -498,13 +519,15 @@ static void hdmi_codec_shutdown(struct snd_pcm_substream *substream,
+ {
+ 	struct hdmi_codec_priv *hcp = snd_soc_dai_get_drvdata(dai);
+ 	bool tx = substream->stream == SNDRV_PCM_STREAM_PLAYBACK;
+-	bool has_capture = !hcp->hcd.no_i2s_capture;
+-	bool has_playback = !hcp->hcd.no_i2s_playback;
++	bool has_capture = !(dai->id == DAI_ID_SPDIF ?
++		hcp->hcd.no_spdif_capture : hcp->hcd.no_i2s_capture);
++	bool has_playback = !(dai->id == DAI_ID_SPDIF ?
++		hcp->hcd.no_spdif_playback : hcp->hcd.no_i2s_playback);
+ 
+ 	if (!((has_playback && tx) || (has_capture && !tx)))
+ 		return;
+ 
+-	hcp->chmap_idx = HDMI_CODEC_CHMAP_IDX_UNKNOWN;
++	WRITE_ONCE(hcp->chmap[dai->id].index, HDMI_CODEC_CHMAP_IDX_UNKNOWN);
+ 	hcp->hcd.ops->audio_shutdown(dai->dev->parent, hcp->hcd.data);
+ 
+ 	mutex_lock(&hcp->lock);
+@@ -530,7 +553,8 @@ static int hdmi_codec_fill_codec_params(struct snd_soc_dai *dai,
+ 		if (idx < 0) {
+ 			dev_err(dai->dev, "Not able to map channels to speakers (%d)\n",
+ 				idx);
+-			hcp->chmap_idx = HDMI_CODEC_CHMAP_IDX_UNKNOWN;
++			WRITE_ONCE(hcp->chmap[dai->id].index,
++				   HDMI_CODEC_CHMAP_IDX_UNKNOWN);
+ 			return idx;
+ 		}
+ 
+@@ -556,9 +580,9 @@ static int hdmi_codec_fill_codec_params(struct snd_soc_dai *dai,
+ 	hp->channels = channels;
+ 
+ 	if (pcm_audio)
+-		hcp->chmap_idx = ca_id;
++		WRITE_ONCE(hcp->chmap[dai->id].index, ca_id);
+ 	else
+-		hcp->chmap_idx = HDMI_CODEC_CHMAP_IDX_UNKNOWN;
++		WRITE_ONCE(hcp->chmap[dai->id].index, HDMI_CODEC_CHMAP_IDX_UNKNOWN);
+ 
+ 	return 0;
+ }
+@@ -800,22 +824,24 @@ static int hdmi_codec_pcm_new(struct snd_soc_pcm_runtime *rtd,
+ {
+ 	struct snd_soc_dai_driver *drv = dai->driver;
+ 	struct hdmi_codec_priv *hcp = snd_soc_dai_get_drvdata(dai);
++	struct hdmi_codec_chmap *chmap = &hcp->chmap[dai->id];
+ 	unsigned int i;
+ 	int ret;
+ 
+ 	ret =  snd_pcm_add_chmap_ctls(rtd->pcm, SNDRV_PCM_STREAM_PLAYBACK,
+ 				      NULL, drv->playback.channels_max, 0,
+-				      &hcp->chmap_info);
++				      &chmap->info);
+ 	if (ret < 0)
+ 		return ret;
+ 
+ 	/* override handlers */
+-	hcp->chmap_info->private_data = hcp;
+-	hcp->chmap_info->kctl->get = hdmi_codec_chmap_ctl_get;
++	chmap->hcp = hcp;
++	chmap->info->private_data = chmap;
++	chmap->info->kctl->get = hdmi_codec_chmap_ctl_get;
+ 
+ 	/* default chmap supported is stereo */
+-	hcp->chmap_info->chmap = hdmi_codec_stereo_chmaps;
+-	hcp->chmap_idx = HDMI_CODEC_CHMAP_IDX_UNKNOWN;
++	chmap->info->chmap = hdmi_codec_stereo_chmaps;
++	chmap->index = HDMI_CODEC_CHMAP_IDX_UNKNOWN;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(hdmi_codec_controls); i++) {
+ 		struct snd_kcontrol *kctl;
+diff --git a/sound/soc/meson/axg-spdifout.c b/sound/soc/meson/axg-spdifout.c
+index 022236c377ec..36440323ce6d 100644
+--- a/sound/soc/meson/axg-spdifout.c
++++ b/sound/soc/meson/axg-spdifout.c
+@@ -5,11 +5,14 @@
+ 
+ #include <linux/clk.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/unaligned.h>
+ #include <linux/of_platform.h>
+ #include <linux/regmap.h>
+ #include <linux/reset.h>
+ #include <sound/soc.h>
+ #include <sound/soc-dai.h>
++#include <sound/asoundef.h>
+ #include <sound/pcm_params.h>
+ #include <sound/pcm_iec958.h>
+ 
+@@ -61,6 +64,10 @@ struct axg_spdifout {
+ 	struct clk *mclk;
+ 	struct clk *pclk;
+ 	const struct axg_spdifout_match_data *data;
++	struct mutex lock;
++	u8 cs[AES_IEC958_STATUS_SIZE];
++	bool non_pcm;
++	bool muted;
+ };
+ 
+ struct axg_spdifout_match_data {
+@@ -118,11 +125,18 @@ static int axg_spdifout_mute(struct snd_soc_dai *dai, int mute, int direction)
+ {
+ 	struct axg_spdifout *priv = snd_soc_dai_get_drvdata(dai);
+ 
+-	/* Use spdif valid bit to perform digital mute */
+-	regmap_update_bits(priv->map, SPDIFOUT_CTRL0, SPDIFOUT_CTRL0_VSET,
+-			   mute ? SPDIFOUT_CTRL0_VSET : 0);
++	int ret;
+ 
+-	return 0;
++	/* Raw IEC61937 data must stay invalid as PCM, even when unmuted. */
++	mutex_lock(&priv->lock);
++	priv->muted = mute;
++	ret = regmap_update_bits(priv->map, SPDIFOUT_CTRL0,
++				 SPDIFOUT_CTRL0_VSET,
++				 (priv->muted || priv->non_pcm) ?
++				 SPDIFOUT_CTRL0_VSET : 0);
++	mutex_unlock(&priv->lock);
++
++	return ret;
+ }
+ 
+ static int axg_spdifout_sample_fmt(struct snd_pcm_hw_params *params,
+@@ -182,40 +196,52 @@ static int axg_spdifout_sample_fmt(struct snd_pcm_hw_params *params,
+ 	return 0;
+ }
+ 
+-static int axg_spdifout_set_chsts(struct snd_pcm_hw_params *params,
+-				  struct snd_soc_dai *dai)
++static int axg_spdifout_prepare(struct snd_pcm_substream *substream,
++			      struct snd_soc_dai *dai)
+ {
+ 	struct axg_spdifout *priv = snd_soc_dai_get_drvdata(dai);
+-	unsigned int offset;
++	struct snd_pcm_runtime *runtime = substream->runtime;
++	u8 cs[AES_IEC958_STATUS_SIZE];
++	bool non_pcm;
++	unsigned int i;
+ 	int ret;
+-	u8 cs[4];
+-	u32 val;
+ 
+-	ret = snd_pcm_create_iec958_consumer_hw_params(params, cs, 4);
+-	if (ret < 0) {
+-		dev_err(dai->dev, "Creating IEC958 channel status failed %d\n",
+-			ret);
+-		return ret;
++	mutex_lock(&priv->lock);
++	memcpy(cs, priv->cs, sizeof(cs));
++	ret = snd_pcm_fill_iec958_consumer(runtime, cs, sizeof(cs));
++	if (ret < 0)
++		goto out;
++
++	non_pcm = cs[0] & IEC958_AES0_NONAUDIO;
++	if (non_pcm &&
++	    (runtime->channels != 2 || snd_pcm_format_width(runtime->format) != 16 ||
++	     (cs[3] & IEC958_AES3_CON_FS) == IEC958_AES3_CON_FS_768000 ||
++	     (cs[3] & IEC958_AES3_CON_FS) == IEC958_AES3_CON_FS_705600)) {
++		ret = -EINVAL;
++		goto out;
+ 	}
+-	val = cs[0] | cs[1] << 8 | cs[2] << 16 | cs[3] << 24;
+-
+-	/* Setup channel status A bits [31 - 0]*/
+-	regmap_write(priv->map, SPDIFOUT_CHSTS0, val);
+-
+-	/* Clear channel status A bits [191 - 32] */
+-	for (offset = SPDIFOUT_CHSTS1; offset <= SPDIFOUT_CHSTS5;
+-	     offset += regmap_get_reg_stride(priv->map))
+-		regmap_write(priv->map, offset, 0);
+ 
+-	/* Setup channel status B bits [31 - 0]*/
+-	regmap_write(priv->map, SPDIFOUT_CHSTS6, val);
++	/* Both channels carry the selected 192-bit consumer status block. */
++	for (i = 0; i < sizeof(cs) / sizeof(u32); i++) {
++		u32 val = get_unaligned_le32(cs + i * sizeof(u32));
+ 
+-	/* Clear channel status B bits [191 - 32] */
+-	for (offset = SPDIFOUT_CHSTS7; offset <= SPDIFOUT_CHSTSB;
+-	     offset += regmap_get_reg_stride(priv->map))
+-		regmap_write(priv->map, offset, 0);
+-
+-	return 0;
++		ret = regmap_write(priv->map, SPDIFOUT_CHSTS0 + i * 4, val);
++		if (ret)
++			goto out;
++		ret = regmap_write(priv->map, SPDIFOUT_CHSTS6 + i * 4, val);
++		if (ret)
++			goto out;
++	}
++	ret = regmap_update_bits(priv->map, SPDIFOUT_CTRL0,
++				 SPDIFOUT_CTRL0_CHSTS_SEL |
++				 SPDIFOUT_CTRL0_VSEL | SPDIFOUT_CTRL0_VSET,
++				 (priv->muted || non_pcm) ?
++				 SPDIFOUT_CTRL0_VSET : 0);
++	if (!ret)
++		priv->non_pcm = non_pcm;
++out:
++	mutex_unlock(&priv->lock);
++	return ret;
+ }
+ 
+ static int axg_spdifout_hw_params(struct snd_pcm_substream *substream,
+@@ -239,12 +265,6 @@ static int axg_spdifout_hw_params(struct snd_pcm_substream *substream,
+ 		return ret;
+ 	}
+ 
+-	ret = axg_spdifout_set_chsts(params, dai);
+-	if (ret) {
+-		dev_err(dai->dev, "failed to setup channel status words\n");
+-		return ret;
+-	}
+-
+ 	return 0;
+ }
+ 
+@@ -293,6 +313,7 @@ static const struct snd_soc_dai_ops axg_spdifout_ops = {
+ 	.trigger	= axg_spdifout_trigger,
+ 	.mute_stream	= axg_spdifout_mute,
+ 	.hw_params	= axg_spdifout_hw_params,
++	.prepare	= axg_spdifout_prepare,
+ 	.startup	= axg_spdifout_startup,
+ 	.shutdown	= axg_spdifout_shutdown,
+ 	.no_capture_mute = 1,
+@@ -345,7 +366,70 @@ static const struct snd_soc_dapm_route axg_spdifout_dapm_routes[] = {
+ 	{ "Playback", NULL, "SRC SEL" },
+ };
+ 
++static int axg_spdifout_iec958_info(struct snd_kcontrol *kcontrol,
++				  struct snd_ctl_elem_info *uinfo)
++{
++	uinfo->type = SNDRV_CTL_ELEM_TYPE_IEC958;
++	uinfo->count = 1;
++	return 0;
++}
++
++static int axg_spdifout_iec958_mask_get(struct snd_kcontrol *kcontrol,
++				      struct snd_ctl_elem_value *ucontrol)
++{
++	memset(ucontrol->value.iec958.status, 0xff, AES_IEC958_STATUS_SIZE);
++	ucontrol->value.iec958.status[0] &= ~IEC958_AES0_PROFESSIONAL;
++	return 0;
++}
++
++static int axg_spdifout_iec958_get(struct snd_kcontrol *kcontrol,
++				 struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *c = snd_kcontrol_chip(kcontrol);
++	struct axg_spdifout *priv = snd_soc_component_get_drvdata(c);
++
++	mutex_lock(&priv->lock);
++	memcpy(ucontrol->value.iec958.status, priv->cs, sizeof(priv->cs));
++	mutex_unlock(&priv->lock);
++	return 0;
++}
++
++static int axg_spdifout_iec958_put(struct snd_kcontrol *kcontrol,
++				 struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *c = snd_kcontrol_chip(kcontrol);
++	struct axg_spdifout *priv = snd_soc_component_get_drvdata(c);
++	int changed;
++
++	if (ucontrol->value.iec958.status[0] & IEC958_AES0_PROFESSIONAL)
++		return -EINVAL;
++
++	mutex_lock(&priv->lock);
++	changed = memcmp(priv->cs, ucontrol->value.iec958.status,
++			 sizeof(priv->cs)) != 0;
++	if (changed)
++		memcpy(priv->cs, ucontrol->value.iec958.status, sizeof(priv->cs));
++	mutex_unlock(&priv->lock);
++	return changed;
++}
++
+ static const struct snd_kcontrol_new axg_spdifout_controls[] = {
++	{
++		.access = SNDRV_CTL_ELEM_ACCESS_READ,
++		.iface = SNDRV_CTL_ELEM_IFACE_PCM,
++		.device = 0,
++		.name = SNDRV_CTL_NAME_IEC958("", PLAYBACK, MASK),
++		.info = axg_spdifout_iec958_info,
++		.get = axg_spdifout_iec958_mask_get,
++	},
++	{
++		.iface = SNDRV_CTL_ELEM_IFACE_PCM,
++		.device = 0,
++		.name = SNDRV_CTL_NAME_IEC958("", PLAYBACK, DEFAULT),
++		.info = axg_spdifout_iec958_info,
++		.get = axg_spdifout_iec958_get,
++		.put = axg_spdifout_iec958_put,
++	},
+ 	SOC_DOUBLE("Playback Volume", SPDIFOUT_GAIN0,  0,  8, 255, 0),
+ 	SOC_DOUBLE("Playback Switch", SPDIFOUT_CTRL0, 22, 21, 1, 1),
+ 	SOC_SINGLE("Playback Gain Enable Switch",
+@@ -429,6 +513,10 @@ static int axg_spdifout_probe(struct platform_device *pdev)
+ 		return -ENOMEM;
+ 	platform_set_drvdata(pdev, priv);
+ 	priv->data = device_get_match_data(dev);
++	mutex_init(&priv->lock);
++	ret = snd_pcm_create_iec958_consumer_default(priv->cs, sizeof(priv->cs));
++	if (ret < 0)
++		return ret;
+ 
+ 	ret = device_reset(dev);
+ 	if (ret)
+-- 
+2.47.3
+

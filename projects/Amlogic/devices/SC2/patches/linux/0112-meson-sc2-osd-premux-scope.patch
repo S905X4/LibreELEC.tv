@@ -1,0 +1,31 @@
+From 9ee9da86c47dae03d2867c5a8c15d1a3c887555c Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Fri, 13 Nov 2026 23:13:11 +0800
+Subject: [PATCH] drm: meson: keep SC2 OSD scopes indexed before the DIN mux
+
+The SC2 donor's to_din_scope_osd_index is identity: scope registers belong to each OSD fetcher before reorder, not the selected blender DIN. Exact native stage readback and receive pixels showed OSD1 clipped to another input's scope and disabled OSD1 blanking its siblings. Preserve source geometry while independently selecting fixed DIN order; no guessed alpha, colorspace or extra registers.
+---
+ drivers/gpu/drm/meson/meson_crtc.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/meson/meson_crtc.c b/drivers/gpu/drm/meson/meson_crtc.c
+index cd6753fe7702..3a21c5b43c8a 100644
+--- a/drivers/gpu/drm/meson/meson_crtc.c
++++ b/drivers/gpu/drm/meson/meson_crtc.c
+@@ -245,10 +245,11 @@ static void meson_crtc_sc2_osd_blend(struct meson_drm *priv)
+ 			(osd->format == DRM_FORMAT_ARGB8888 ||
+ 			 osd->format == DRM_FORMAT_ABGR8888 ? BIT(28) : 0),
+ 			priv->io_base + _REG(meson_osd_regs[index].unpack_ctrl));
++		/* SC2 scopes precede reordering and are indexed by OSD, not DIN. */
+ 		writel_relaxed(osd->blend_scope_h, priv->io_base +
+-			       _REG(VIU_OSD_BLEND_DIN0_SCOPE_H + din * 2));
++			       _REG(VIU_OSD_BLEND_DIN0_SCOPE_H + index * 2));
+ 		writel_relaxed(osd->blend_scope_v, priv->io_base +
+-			       _REG(VIU_OSD_BLEND_DIN0_SCOPE_V + din * 2));
++			       _REG(VIU_OSD_BLEND_DIN0_SCOPE_V + index * 2));
+ 	}
+ 	writel_relaxed(size, priv->io_base + _REG(VIU_OSD_BLEND_BLEND0_SIZE));
+ 	writel_relaxed(size, priv->io_base + _REG(VIU_OSD_BLEND_BLEND1_SIZE));
+-- 
+2.47.3
+

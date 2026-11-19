@@ -1,0 +1,91 @@
+From: hiper25 <whydonit@gmail.com>
+Subject: [PATCH] avcodec: preserve SC2 H264 sample-layout admission
+
+The native stateful CAPTURE route exposes only8-bit4:2:0. A successful
+firmware completion must not silently relabel High10/422/444 input as
+cleanNV12. Reuse the existing CBS parser to validate actual SPSs before
+initial extradata, parameter updates or referenced pictures reach OUTPUT.
+Check syntax fields, not profile names; no coded bytes are rewritten.
+
+--- a/libavcodec/v4l2_m2m_dec.c
++++ b/libavcodec/v4l2_m2m_dec.c
+@@ -688,6 +688,52 @@
+     return ret;
+ }
+ 
++/* The SC2 stateful CAPTURE contract is 8-bit 4:2:0. Firmware accepting a
++ * profile or returning clean NV12 does not preserve other sample layouts.
++ * Reuse the pairing parser for both parameter-only updates and referenced
++ * SPSs; container profile/pix_fmt hints can be absent or stale after a splice.
++ */
++static int h264_native_sample_layout(AVCodecContext *avctx,
++                                     const V4L2H264FieldPair *pair)
++{
++    const CodedBitstreamH264Context *h264 = pair->cbs->priv_data;
++    int i;
++
++    for (i = 0; i < pair->fragment.nb_units; ++i) {
++        const CodedBitstreamUnit *unit = &pair->fragment.units[i];
++        const H264RawSPS *sps;
++
++        if (unit->type == H264_NAL_SPS) {
++            sps = unit->content;
++        } else if (unit->type == H264_NAL_SLICE || unit->type == H264_NAL_IDR_SLICE) {
++            const H264RawSlice *slice = unit->content;
++            const H264RawPPS *pps;
++            unsigned int id;
++
++            if (!slice)
++                return AVERROR_INVALIDDATA;
++            id = slice->header.pic_parameter_set_id;
++            if (id >= H264_MAX_PPS_COUNT || !(pps = h264->pps[id]) ||
++                pps->seq_parameter_set_id >= H264_MAX_SPS_COUNT)
++                return AVERROR_INVALIDDATA;
++            sps = h264->sps[pps->seq_parameter_set_id];
++        } else {
++            continue;
++        }
++        if (!sps)
++            return AVERROR_INVALIDDATA;
++        if (sps->chroma_format_idc != 1 || sps->separate_colour_plane_flag ||
++            sps->bit_depth_luma_minus8 || sps->bit_depth_chroma_minus8) {
++            av_log(avctx, AV_LOG_ERROR,
++                   "Native H264 CAPTURE requires 8-bit 4:2:0; SPS declares chroma=%u depth=%u/%u\n",
++                   sps->chroma_format_idc, 8 + sps->bit_depth_luma_minus8,
++                   8 + sps->bit_depth_chroma_minus8);
++            return AVERROR(EOPNOTSUPP);
++        }
++    }
++    return 0;
++}
++
+ /* Submit complementary fields as one OUTPUT packet, preserving every coded
+  * byte and the first field's PTS/DTS/properties. After flush, discard dependent
+  * preroll until parsed IDR or zero-count exact recovery on an intra picture;
+@@ -728,6 +774,8 @@
+         if (s->extdata_size) {
+             ret = ff_cbs_read(pair->cbs, &pair->fragment,
+                               s->extdata_data, s->extdata_size);
++            if (ret >= 0)
++                ret = h264_native_sample_layout(avctx, pair);
+             ff_cbs_fragment_reset(&pair->fragment);
+             if (ret < 0)
+                 return ret;
+@@ -736,6 +784,8 @@
+     /* Ordinary field pairing does not need to decompose SEI payloads. */
+     pair->cbs->nb_decompose_unit_types = FF_ARRAY_ELEMS(types) - !pair->need_recovery;
+     ret = ff_cbs_read_packet(pair->cbs, &pair->fragment, pkt);
++    if (ret >= 0)
++        ret = h264_native_sample_layout(avctx, pair);
+     if (ret < 0)
+         goto done;
+     for (i = 0; i < pair->fragment.nb_units; ++i) {
+@@ -900,6 +950,8 @@
+                     if (pair && s->extdata_size) {
+                         ret = ff_cbs_read(pair->cbs, &pair->fragment,
+                                           s->extdata_data, s->extdata_size);
++                        if (ret >= 0)
++                            ret = h264_native_sample_layout(avctx, pair);
+                         ff_cbs_fragment_reset(&pair->fragment);
+                         if (ret < 0)
+                             return ret;

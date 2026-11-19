@@ -1,0 +1,52 @@
+From 90e52efed13cad468b1b34baa49471bc1f28938b Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Fri, 13 Nov 2026 03:04:53 +0800
+Subject: [PATCH] drm/meson: Program the separate SC2 HDMI frontend clock
+
+SC2 has a frontend selector in HDMI_CLK_CTRL[23:20] and a separate
+gate in VID_CLK_CTRL2[9]. Copy the selected VENC source and enable that
+gate after programming the ENCP/ENCI path, matching the SC2 BSP frontend
+clock sequence. Pixel-clock routing remains independently configured.
+
+Do not rely on inherited firmware clock state during modesets. A current
+1080p sample already has gate bit 9 set, so this initialization omission
+is not claimed as the proven cause of every observed picture loss.
+
+Change-Id: I99416fcc5eee0ce1a896c737bc8caade4816424a
+---
+ drivers/gpu/drm/meson/meson_vclk.c | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/meson/meson_vclk.c b/drivers/gpu/drm/meson/meson_vclk.c
+index 2bc348f28646..064de9ded73e 100644
+--- a/drivers/gpu/drm/meson/meson_vclk.c
++++ b/drivers/gpu/drm/meson/meson_vclk.c
+@@ -919,7 +919,7 @@ static void meson_vclk_set(struct meson_drm *priv,
+ 			   unsigned int hdmi_tx_div, unsigned int venc_div,
+ 			   bool hdmi_use_enci, bool vic_alternate_clock)
+ {
+-	unsigned int m = 0, frac = 0;
++	unsigned int m = 0, frac = 0, venc_source;
+ 
+ 	/* Set HDMI-TX sys clock */
+ 	meson_vclk_update_bits(priv, HHI_HDMI_CLK_CNTL, CTS_HDMI_SYS_SEL_MASK, 0);
+@@ -1099,6 +1099,16 @@ static void meson_vclk_set(struct meson_drm *priv,
+ 		/* Enable ENCP clock gate */
+ 		meson_vclk_update_bits(priv, HHI_VID_CLK_CNTL2, CTS_ENCP_EN, CTS_ENCP_EN);
+ 
++	/* SC2 clocks the HDMI frontend separately from the transport pixels. */
++	if (priv->sc2) {
++		regmap_read(priv->hhi, meson_vclk_reg(priv, HHI_VID_CLK_DIV),
++			    &venc_source);
++		venc_source = (venc_source >> (hdmi_use_enci ? 28 : 24)) & 0xf;
++		meson_vclk_update_bits(priv, HHI_HDMI_CLK_CNTL, GENMASK(23, 20),
++				       venc_source << 20);
++		meson_vclk_update_bits(priv, HHI_VID_CLK_CNTL2, BIT(9), BIT(9));
++	}
++
+ 	meson_vclk_update_bits(priv, HHI_VID_CLK_CNTL, VCLK_EN, VCLK_EN);
+ }
+ 
+-- 
+2.47.3
+

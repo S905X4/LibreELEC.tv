@@ -1,0 +1,367 @@
+From: hiper25 <whydonit@gmail.com>
+Subject: [PATCH] avfilter: import native planar JPEG surfaces into SC2 EI
+
+Accept distinct Y/U/V planes, validate their actual extents and preserve
+all three pitches across session changes. Negotiate native semiplanar
+capture and attach matching output metadata, not the source planar layout.
+Keep the existing two-field completion and independent export lifetime.
+
+--- a/libavfilter/vf_sc2_deinterlace.c
++++ b/libavfilter/vf_sc2_deinterlace.c
+@@ -28,6 +28,38 @@
+ 
+ #define SC2_BUFFERS 8
+ 
++typedef struct SC2Format {
++    uint32_t drm, v4l2, capture_drm, capture_v4l2;
++    enum AVPixelFormat sw, capture_sw;
++    unsigned planes, chroma_shift;
++} SC2Format;
++
++static const SC2Format sc2_formats[] = {
++    { DRM_FORMAT_NV12, V4L2_PIX_FMT_NV12M,
++      DRM_FORMAT_NV12, V4L2_PIX_FMT_NV12M,
++      AV_PIX_FMT_NV12, AV_PIX_FMT_NV12, 2, 1 },
++    { DRM_FORMAT_NV21, V4L2_PIX_FMT_NV21M,
++      DRM_FORMAT_NV21, V4L2_PIX_FMT_NV21M,
++      AV_PIX_FMT_NV21, AV_PIX_FMT_NV21, 2, 1 },
++    { DRM_FORMAT_YUV420, V4L2_PIX_FMT_YUV420M,
++      DRM_FORMAT_NV12, V4L2_PIX_FMT_NV12M,
++      AV_PIX_FMT_YUV420P, AV_PIX_FMT_NV12, 3, 1 },
++    { DRM_FORMAT_YUV422, V4L2_PIX_FMT_YUV422M,
++      DRM_FORMAT_NV16, V4L2_PIX_FMT_NV16M,
++      AV_PIX_FMT_YUV422P, AV_PIX_FMT_NV16, 3, 0 },
++};
++
++static const SC2Format *sc2_format(uint32_t drm)
++{
++    switch (drm) {
++    case DRM_FORMAT_NV12:   return &sc2_formats[0];
++    case DRM_FORMAT_NV21:   return &sc2_formats[1];
++    case DRM_FORMAT_YUV420: return &sc2_formats[2];
++    case DRM_FORMAT_YUV422: return &sc2_formats[3];
++    default:               return NULL;
++    }
++}
++
+ typedef struct SC2Session SC2Session;
+ typedef struct SC2Buffer {
+     SC2Session *session;
+@@ -44,8 +76,9 @@
+     int error;
+     unsigned count;
+     int width, height, coded_height;
+-    uint32_t drm_format;
+-    unsigned pitch[2];
++    const SC2Format *format;
++    AVBufferRef *hw_frames_ctx;
++    unsigned pitch[3];
+     size_t crop_left, crop_top;
+     SC2Buffer buffers[SC2_BUFFERS];
+ };
+@@ -71,6 +104,7 @@
+             if (s->buffers[i].drm.objects[p].fd >= 0)
+                 close(s->buffers[i].drm.objects[p].fd);
+     close(s->fd);
++    av_buffer_unref(&s->hw_frames_ctx);
+     pthread_mutex_destroy(&s->mutex);
+     av_free(s);
+ }
+@@ -142,23 +176,28 @@
+     return fd >= 0 ? fd : AVERROR(ENODEV);
+ }
+ 
+-static int sc2_layout(const AVFrame *in, int *coded_height)
++static int sc2_layout(const AVFrame *in, int *coded_height,
++                      const SC2Format **format)
+ {
+     const AVDRMFrameDescriptor *d = (const void *)in->data[0];
+     const AVDRMLayerDescriptor *l;
+-    size_t end;
+-    unsigned p;
+-    if (!d || d->nb_layers != 1 || d->nb_objects < 1 || d->nb_objects > 2)
++    const SC2Format *f;
++    size_t extent[3];
++    unsigned p, q;
++    if (!d || d->nb_layers != 1 || d->nb_objects < 1 || d->nb_objects > 3)
+         return AVERROR(EINVAL);
+     l = &d->layers[0];
+-    if ((l->format != DRM_FORMAT_NV12 && l->format != DRM_FORMAT_NV21) ||
+-        l->nb_planes != 2)
++    f = sc2_format(l->format);
++    if (!f || l->nb_planes != f->planes)
+         return AVERROR(ENOSYS);
+-    for (p = 0; p < 2; p++) {
++    if (in->width < 32 || in->width > 1920 || (in->width & 1) || in->height < 32)
++        return AVERROR(EINVAL);
++    for (p = 0; p < f->planes; p++) {
+         int obj = l->planes[p].object_index;
++        int row_bytes = p && f->planes == 3 ? in->width / 2 : in->width;
+         if (obj < 0 || obj >= d->nb_objects ||
+             d->objects[obj].format_modifier != DRM_FORMAT_MOD_LINEAR ||
+-            l->planes[p].offset < 0 || l->planes[p].pitch <= 0 ||
++            l->planes[p].offset < 0 || l->planes[p].pitch < row_bytes ||
+             l->planes[p].pitch > 4096 || (l->planes[p].pitch & 31) ||
+             (l->planes[p].offset & 7) ||
+             l->planes[p].offset >= d->objects[obj].size)
+@@ -168,8 +207,9 @@
+     if (in->hw_frames_ctx) {
+         const AVHWFramesContext *frames = (const void *)in->hw_frames_ctx->data;
+         if (frames->width < in->width || frames->height < in->height ||
+-            frames->sw_format != (l->format == DRM_FORMAT_NV12 ?
+-                                  AV_PIX_FMT_NV12 : AV_PIX_FMT_NV21))
++            (frames->sw_format != f->sw &&
++             !(f->sw == AV_PIX_FMT_YUV420P && frames->sw_format == AV_PIX_FMT_YUVJ420P) &&
++             !(f->sw == AV_PIX_FMT_YUV422P && frames->sw_format == AV_PIX_FMT_YUVJ422P)))
+             return AVERROR(EINVAL);
+         *coded_height = frames->height;
+     }
+@@ -177,21 +217,27 @@
+         (*coded_height & 3) || in->crop_left + in->crop_right >= in->width ||
+         in->crop_top + in->crop_bottom >= in->height)
+         return AVERROR(EINVAL);
+-    /* Allocation lengths can include page/64-KiB padding, never geometry. */
+-    for (p = 0; p < 2; p++) {
++    /* Allocation padding does not determine geometry; both chroma planes
++     * have the same height, independent of their plane index.
++     */
++    for (p = 0; p < f->planes; p++) {
+         int obj = l->planes[p].object_index;
+-        end = (size_t)(*coded_height >> p) * l->planes[p].pitch;
+-        if (end > d->objects[obj].size - l->planes[p].offset)
++        extent[p] = (size_t)(*coded_height >> (p ? f->chroma_shift : 0)) *
++                    l->planes[p].pitch;
++        if (extent[p] > d->objects[obj].size - l->planes[p].offset)
+             return AVERROR(EINVAL);
+-    }
+-    if (l->planes[1].object_index == l->planes[0].object_index &&
+-        l->planes[1].offset < l->planes[0].offset +
+-            (size_t)*coded_height * l->planes[0].pitch)
+-        return AVERROR(EINVAL);
++        for (q = 0; q < p; q++)
++            if (obj == l->planes[q].object_index &&
++                l->planes[p].offset < l->planes[q].offset + extent[q] &&
++                l->planes[q].offset < l->planes[p].offset + extent[p])
++                return AVERROR(EINVAL);
++    }
++    *format = f;
+     return 0;
+ }
+ 
+-static int sc2_configure(AVFilterContext *avctx, AVFrame *in, int coded_height)
++static int sc2_configure(AVFilterContext *avctx, AVFrame *in, int coded_height,
++                         const SC2Format *format)
+ {
+     SC2Context *ctx = avctx->priv;
+     const AVDRMFrameDescriptor *d = (const void *)in->data[0];
+@@ -201,8 +247,6 @@
+     struct v4l2_selection sel = { 0 };
+     struct v4l2_streamparm parm = { 0 };
+     struct v4l2_format fmt = { 0 };
+-    const uint32_t pixelformat = l->format == DRM_FORMAT_NV12 ?
+-        V4L2_PIX_FMT_NV12M : V4L2_PIX_FMT_NV21M;
+     unsigned i, p;
+     int ret;
+     int width = in->width - in->crop_left - in->crop_right;
+@@ -225,28 +269,30 @@
+     s->width = width;
+     s->height = height;
+     s->coded_height = coded_height;
+-    s->drm_format = l->format;
++    s->format = format;
+     s->crop_left = in->crop_left;
+     s->crop_top = in->crop_top;
+     fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+     fmt.fmt.pix_mp.width = in->width;
+     fmt.fmt.pix_mp.height = coded_height;
+-    fmt.fmt.pix_mp.pixelformat = pixelformat;
++    fmt.fmt.pix_mp.pixelformat = format->v4l2;
+     fmt.fmt.pix_mp.field = in->top_field_first ?
+         V4L2_FIELD_INTERLACED_TB : V4L2_FIELD_INTERLACED_BT;
+-    fmt.fmt.pix_mp.num_planes = 2;
+-    for (p = 0; p < 2; p++) {
++    fmt.fmt.pix_mp.num_planes = format->planes;
++    for (p = 0; p < format->planes; p++) {
+         s->pitch[p] = l->planes[p].pitch;
+         fmt.fmt.pix_mp.plane_fmt[p].bytesperline = s->pitch[p];
+     }
+     if ((ret = sc2_ioctl(s->fd, VIDIOC_S_FMT, &fmt)) < 0)
+         goto fail;
+-    if (fmt.fmt.pix_mp.pixelformat != pixelformat ||
+-        fmt.fmt.pix_mp.num_planes != 2) {
++    if (fmt.fmt.pix_mp.pixelformat != format->v4l2 ||
++        fmt.fmt.pix_mp.width != in->width ||
++        fmt.fmt.pix_mp.height != coded_height ||
++        fmt.fmt.pix_mp.num_planes != format->planes) {
+         ret = AVERROR(EINVAL);
+         goto fail;
+     }
+-    for (p = 0; p < 2; p++)
++    for (p = 0; p < format->planes; p++)
+         if (fmt.fmt.pix_mp.plane_fmt[p].bytesperline != s->pitch[p]) {
+             ret = AVERROR(EINVAL);
+             goto fail;
+@@ -260,16 +306,38 @@
+     fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+     fmt.fmt.pix_mp.width = width;
+     fmt.fmt.pix_mp.height = height;
+-    fmt.fmt.pix_mp.pixelformat = pixelformat;
++    fmt.fmt.pix_mp.pixelformat = format->capture_v4l2;
+     fmt.fmt.pix_mp.field = V4L2_FIELD_NONE;
+     fmt.fmt.pix_mp.num_planes = 2;
+     if ((ret = sc2_ioctl(s->fd, VIDIOC_S_FMT, &fmt)) < 0)
+         goto fail;
+     if (fmt.fmt.pix_mp.width != width || fmt.fmt.pix_mp.height != height ||
+-        fmt.fmt.pix_mp.pixelformat != pixelformat ||
++        fmt.fmt.pix_mp.pixelformat != format->capture_v4l2 ||
+         fmt.fmt.pix_mp.num_planes != 2) {
+         ret = AVERROR(EINVAL);
+         goto fail;
++    }
++    if (in->hw_frames_ctx) {
++        const AVHWFramesContext *input = (const void *)in->hw_frames_ctx->data;
++        if (input->sw_format == format->capture_sw &&
++            input->width == width && input->height == height) {
++            s->hw_frames_ctx = av_buffer_ref(in->hw_frames_ctx);
++        } else {
++            s->hw_frames_ctx = av_hwframe_ctx_alloc(input->device_ref);
++            if (s->hw_frames_ctx) {
++                AVHWFramesContext *capture = (void *)s->hw_frames_ctx->data;
++                capture->format = AV_PIX_FMT_DRM_PRIME;
++                capture->sw_format = format->capture_sw;
++                capture->width = width;
++                capture->height = height;
++                if ((ret = av_hwframe_ctx_init(s->hw_frames_ctx)) < 0)
++                    goto fail;
++            }
++        }
++        if (!s->hw_frames_ctx) {
++            ret = AVERROR(ENOMEM);
++            goto fail;
++        }
+     }
+     parm.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+     if (avctx->inputs[0]->frame_rate.num > 0) {
+@@ -310,7 +378,7 @@
+             goto fail;
+         b->drm.nb_objects = 2;
+         b->drm.nb_layers = 1;
+-        b->drm.layers[0].format = s->drm_format;
++        b->drm.layers[0].format = format->capture_drm;
+         b->drm.layers[0].nb_planes = 2;
+         for (p = 0; p < 2; p++) {
+             struct v4l2_exportbuffer exp = {
+@@ -377,11 +445,12 @@
+     AVFilterLink *out = avctx->outputs[0];
+     SC2Context *ctx = avctx->priv;
+     SC2Session *s;
++    const SC2Format *format;
+     const AVDRMFrameDescriptor *d = (const void *)in->data[0];
+-    struct v4l2_plane planes[2] = { 0 };
++    struct v4l2_plane planes[3] = { 0 };
+     struct v4l2_buffer v = {
+         .type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
+-        .memory = V4L2_MEMORY_DMABUF, .length = 2, .m.planes = planes,
++        .memory = V4L2_MEMORY_DMABUF, .m.planes = planes,
+     };
+     AVFrame *result[2] = { NULL, NULL };
+     int64_t duration;
+@@ -395,7 +464,7 @@
+         in->duration = av_rescale_q(in->duration, link->time_base, out->time_base);
+         return ff_filter_frame(out, in);
+     }
+-    if ((ret = sc2_layout(in, &coded_height)) < 0)
++    if ((ret = sc2_layout(in, &coded_height, &format)) < 0)
+         goto fail;
+     duration = in->duration;
+     if (duration <= 0 && link->frame_rate.num > 0)
+@@ -405,14 +474,15 @@
+         goto fail;
+     }
+     s = ctx->session;
+-    if (!s || s->drm_format != d->layers[0].format ||
++    if (!s || s->format != format ||
+         s->coded_height != coded_height ||
+         s->width != in->width - in->crop_left - in->crop_right ||
+         s->height != in->height - in->crop_top - in->crop_bottom ||
+         s->crop_left != in->crop_left || s->crop_top != in->crop_top ||
+         s->pitch[0] != d->layers[0].planes[0].pitch ||
+-        s->pitch[1] != d->layers[0].planes[1].pitch) {
+-        if ((ret = sc2_configure(avctx, in, coded_height)) < 0)
++        s->pitch[1] != d->layers[0].planes[1].pitch ||
++        (format->planes == 3 && s->pitch[2] != d->layers[0].planes[2].pitch)) {
++        if ((ret = sc2_configure(avctx, in, coded_height, format)) < 0)
+             goto fail;
+         s = ctx->session;
+     }
+@@ -421,16 +491,18 @@
+     pthread_mutex_unlock(&s->mutex);
+     if (ret < 0)
+         goto fail;
++    v.length = format->planes;
+     v.field = in->top_field_first ? V4L2_FIELD_INTERLACED_TB : V4L2_FIELD_INTERLACED_BT;
+     if (in->pts != AV_NOPTS_VALUE) {
+         int64_t us = av_rescale_q(in->pts, link->time_base, AV_TIME_BASE_Q);
+         v.timestamp.tv_sec = us / 1000000;
+         v.timestamp.tv_usec = us % 1000000;
+     }
+-    for (p = 0; p < 2; p++) {
++    for (p = 0; p < format->planes; p++) {
+         const AVDRMPlaneDescriptor *dp = &d->layers[0].planes[p];
+         const AVDRMObjectDescriptor *obj = &d->objects[dp->object_index];
+-        size_t used = dp->offset + (coded_height >> p) * s->pitch[p];
++        size_t used = dp->offset +
++            (coded_height >> (p ? format->chroma_shift : 0)) * s->pitch[p];
+         if (used > obj->size || obj->size > UINT32_MAX) {
+             ret = AVERROR(EINVAL);
+             goto fail;
+@@ -476,8 +548,8 @@
+         }
+         result[field]->data[0] = (uint8_t *)&b->drm;
+         result[field]->format = AV_PIX_FMT_DRM_PRIME;
+-        if (in->hw_frames_ctx) {
+-            result[field]->hw_frames_ctx = av_buffer_ref(in->hw_frames_ctx);
++        if (s->hw_frames_ctx) {
++            result[field]->hw_frames_ctx = av_buffer_ref(s->hw_frames_ctx);
+             if (!result[field]->hw_frames_ctx) {
+                 ret = AVERROR(ENOMEM);
+                 goto fail;
+@@ -499,7 +571,7 @@
+     memset(&v, 0, sizeof(v));
+     v.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+     v.memory = V4L2_MEMORY_DMABUF;
+-    v.length = 2;
++    v.length = format->planes;
+     v.m.planes = planes;
+     if ((ret = sc2_dequeue(s, &v)) < 0 || (v.flags & V4L2_BUF_FLAG_ERROR)) {
+         if (ret >= 0)
+@@ -535,11 +607,9 @@
+     out->frame_rate = av_mul_q(in->frame_rate, (AVRational) { 2, 1 });
+     out->w = in->w;
+     out->h = in->h;
+-    if (in->hw_frames_ctx) {
+-        out->hw_frames_ctx = av_buffer_ref(in->hw_frames_ctx);
+-        if (!out->hw_frames_ctx)
+-            return AVERROR(ENOMEM);
+-    }
++    /* Progressive pass-through and completed DI fields may have different
++     * storage layouts. Each frame carries its own accurate hardware context.
++     */
+     return 0;
+ }
+ 
+--- a/doc/filters.texi
++++ b/doc/filters.texi
+@@ -31025,8 +31025,10 @@
+ @section sc2_deinterlace
+ 
+ SC2-only native hardware edge interpolation at field rate. Input is linear
+-NV12 DRM PRIME with two planes; output remains DRM PRIME. Each interlaced
+-frame produces two progressive frames in top/bottom temporal order. A
++NV12/NV21 or three-plane YUV420/YUV422 DRM PRIME. Semiplanar input keeps
++its layout; planar YUV420 produces NV12 and planar YUV422 produces NV16
++through native DMA, without CPU pixel conversion. Each interlaced frame
++produces two progressive frames in top/bottom temporal order. A
+ 25-frame/s top-first source produces 50 progressive outputs/s. Output time
+ base is half the input time base. Input duration, or the negotiated frame
+ rate if duration is absent, defines the field interval.

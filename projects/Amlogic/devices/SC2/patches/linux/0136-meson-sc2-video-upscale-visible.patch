@@ -1,0 +1,66 @@
+From ed2c5d01091c2c4df0ae410a0b4016c890c19e1f Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Sat, 14 Nov 2026 20:52:53 +0800
+Subject: [PATCH] drm/meson: cover SC2 SD-to-4K scaling and invisible video
+ planes
+
+The legacy5x upscale admission rejects a320x240 native decoder surface on a3840x2160 display. SC2 uses the donor Q18ratio/Q24PPSstep contract; allow up to64x to cover the64pixel source boundary while keeping downscale5x unchanged. Do not program scaler orMIF for a helper-invisible plane, including zero-sized destination state. Actual source-bound scaling and visibility tests follow in the complete candidate image.
+
+Change-Id: I01cda05713dc65acf8707f8c126d33bc0848d1e9
+---
+ drivers/gpu/drm/meson/meson_overlay.c | 16 +++++++++++++++-
+ 1 file changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/meson/meson_overlay.c b/drivers/gpu/drm/meson/meson_overlay.c
+index 051451d4ba91..1846854e0223 100644
+--- a/drivers/gpu/drm/meson/meson_overlay.c
++++ b/drivers/gpu/drm/meson/meson_overlay.c
+@@ -173,6 +173,7 @@ static int meson_overlay_atomic_check(struct drm_plane *plane,
+ 	struct drm_plane_state *new_plane_state = drm_atomic_get_new_plane_state(state,
+ 										 plane);
+ 	struct drm_crtc_state *crtc_state;
++	struct meson_drm *priv = to_meson_overlay(plane)->priv;
+ 
+ 	if (!new_plane_state->crtc)
+ 		return 0;
+@@ -182,9 +183,13 @@ static int meson_overlay_atomic_check(struct drm_plane *plane,
+ 	if (IS_ERR(crtc_state))
+ 		return PTR_ERR(crtc_state);
+ 
++	/* SC2's Q18 source/destination ratio is published as a Q24 PPS step.
++	 * Cover a 64-pixel source across the full 4K output without relaxing
++	 * the independent downscale/vertical-repeat bound.
++	 */
+ 	return drm_atomic_helper_check_plane_state(new_plane_state,
+ 						   crtc_state,
+-						   FRAC_16_16(1, 5),
++						   FRAC_16_16(1, priv->sc2 ? 64 : 5),
+ 						   FRAC_16_16(5, 1),
+ 						   true, true);
+ }
+@@ -488,6 +493,9 @@ static void meson_overlay_setup_scaler_params(struct meson_drm *priv,
+ 	vd->vpp_vsc_start_phase_step = ratio_y << 6;
+ }
+ 
++static void meson_overlay_atomic_disable(struct drm_plane *plane,
++				       struct drm_atomic_state *state);
++
+ static void meson_overlay_atomic_update(struct drm_plane *plane,
+ 					struct drm_atomic_state *state)
+ {
+@@ -503,6 +511,12 @@ static void meson_overlay_atomic_update(struct drm_plane *plane,
+ 
+ 	DRM_DEBUG_DRIVER("\n");
+ 
++	/* A clipped or zero-sized destination must not run the scaler/MIF. */
++	if (!new_state->visible) {
++		meson_overlay_atomic_disable(plane, state);
++		return;
++	}
++
+ 	interlace_mode = new_state->crtc->mode.flags & DRM_MODE_FLAG_INTERLACE;
+ 
+ 	spin_lock_irqsave(&priv->drm->event_lock, flags);
+-- 
+2.47.3
+

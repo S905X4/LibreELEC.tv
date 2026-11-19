@@ -1,0 +1,94 @@
+From d3bc467ffab398edbd21b2ed8b0dd4129e29928e Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Fri, 13 Nov 2026 03:04:53 +0800
+Subject: [PATCH] drm/meson: Configure the SC2 UHD420 FIFO and line latency
+
+SC2 uses the TM2B-generation UHD420 FIFO rather than the older async
+FIFO write-rate bit. The exact SC2 BSP clears bit 8 and sets bit 20 for
+UHD420, and delays the VSO lines by one to match the converter latency.
+The native path previously applied the older setting despite correct
+594 MHz pixel and 297 MHz TMDS negotiation.
+
+Apply the FIFO and one-line VSO adjustment only to supported SC2 UHD420
+VICs 96, 97, 106 and 107. Ordinary RGB/444, lower modes and other SoCs
+retain their existing settings. Do not assert bit 20 unconditionally,
+change the PLL recipes, or hide the modes from userspace.
+
+Authority: CE hdmi_tx_hw.c hdmi_tvenc4k2k_set and UHD420 format setup.
+Receiver acceptance and the independent restored-1080p fault are recorded
+separately; source agreement alone does not establish either outcome.
+
+Change-Id: I15bde9de4e6631c807b8a7913cc99d8e9f85fb16
+---
+ drivers/gpu/drm/meson/meson_registers.h |  1 +
+ drivers/gpu/drm/meson/meson_venc.c      | 15 ++++++++++-----
+ 2 files changed, 11 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/meson/meson_registers.h b/drivers/gpu/drm/meson/meson_registers.h
+index 9e73c15d59d4..1654e7a3125b 100644
+--- a/drivers/gpu/drm/meson/meson_registers.h
++++ b/drivers/gpu/drm/meson/meson_registers.h
+@@ -1638,6 +1638,7 @@
+ #define		VPU_HDMI_OUTPUT_CRCBY           (5 << 5)
+ #define		VPU_HDMI_WR_RATE(rate)          (((rate & 0x1f) - 1) << 8)
+ #define		VPU_HDMI_RD_RATE(rate)          (((rate & 0x1f) - 1) << 12)
++#define		VPU_HDMI_SC2_UHD420_FIFO         BIT(20)
+ #define ENCI_INFO_READ 0x271c
+ #define ENCP_INFO_READ 0x271d
+ #define ENCT_INFO_READ 0x271e
+diff --git a/drivers/gpu/drm/meson/meson_venc.c b/drivers/gpu/drm/meson/meson_venc.c
+index 3ffed1cc9b35..dce3c03bb7a9 100644
+--- a/drivers/gpu/drm/meson/meson_venc.c
++++ b/drivers/gpu/drm/meson/meson_venc.c
+@@ -959,6 +959,8 @@ void meson_venc_hdmi_mode_set(struct meson_drm *priv, int vic,
+ 	bool use_enci = false;
+ 	bool venc_repeat = false;
+ 	bool hdmi_repeat = false;
++	bool sc2_uhd420 = priv->sc2 && yuv420_mode &&
++		(vic == 96 || vic == 97 || vic == 106 || vic == 107);
+ 	unsigned int venc_hdmi_latency = 2;
+ 	unsigned long total_pixels_venc = 0;
+ 	unsigned long active_pixels_venc = 0;
+@@ -973,6 +975,7 @@ void meson_venc_hdmi_mode_set(struct meson_drm *priv, int vic,
+ 	unsigned long hs_begin = 0;
+ 	unsigned long hs_end = 0;
+ 	unsigned long vs_adjust = 0;
++	unsigned int vs_adjust_420 = sc2_uhd420 ? 1 : 0;
+ 	unsigned long vs_bline_evn = 0;
+ 	unsigned long vs_eline_evn = 0;
+ 	unsigned long vs_bline_odd = 0;
+@@ -1466,16 +1469,16 @@ void meson_venc_hdmi_mode_set(struct meson_drm *priv, int vic,
+ 		writel_relaxed(hs_end,
+ 				priv->io_base + _REG(ENCP_DVI_HSO_END));
+ 
+-		/* Program Vsync timing for even field */
+-		if (de_v_begin_even >=
++		/* SC2's UHD420 line buffer delays active pixels by one line. */
++		if (de_v_begin_even + vs_adjust_420 >=
+ 				(sof_lines + vsync_lines + (1 - vs_adjust)))
+-			vs_bline_evn = de_v_begin_even
++			vs_bline_evn = de_v_begin_even + vs_adjust_420
+ 					- sof_lines
+ 					- vsync_lines
+ 					- (1 - vs_adjust);
+ 		else
+ 			vs_bline_evn = mode->vtotal
+-					+ de_v_begin_even
++					+ de_v_begin_even + vs_adjust_420
+ 					- sof_lines
+ 					- vsync_lines
+ 					- (1 - vs_adjust);
+@@ -1541,7 +1544,9 @@ void meson_venc_hdmi_mode_set(struct meson_drm *priv, int vic,
+ 	 * Write rate to the async FIFO between VENC and HDMI.
+ 	 * One write every 2 wr_clk.
+ 	 */
+-	if (venc_repeat || yuv420_mode)
++	if (sc2_uhd420)
++		reg |= VPU_HDMI_SC2_UHD420_FIFO;
++	else if (venc_repeat || yuv420_mode)
+ 		reg |= VPU_HDMI_WR_RATE(2);
+ 
+ 	/*
+-- 
+2.47.3
+

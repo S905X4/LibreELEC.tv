@@ -1,0 +1,26 @@
+Subject: [PATCH] avcodec: omit undecoded HEVC references from native DPB
+
+A CRA entered after flush can retain unavailable pre-access pictures as
+software DPB placeholders. They have no submitted capture timestamp and
+cannot identify a native reference surface. Omit them from the exported
+DPB; an actually used missing reference still resolves to index 0xff and
+is rejected by native control validation rather than fabricated.
+
+--- a/libavcodec/v4l2_req_hevc_vx.c
++++ b/libavcodec/v4l2_req_hevc_vx.c
+@@ -333,9 +333,14 @@ fill_dpb_entries(const HEVCContext * const h, struct v4l2_hevc_dpb_entry * const entries)
+     for (i = 0; i < FF_ARRAY_ELEMS(h->DPB); i++) {
+         const HEVCFrame * const frame = &h->DPB[i];
+         if (frame != pic && (frame->flags & (HEVC_FRAME_FLAG_LONG_REF | HEVC_FRAME_FLAG_SHORT_REF))) {
++            const uint64_t timestamp = frame_capture_dpb(frame->frame);
++            /* Missing pre-CRA pictures have no submitted native surface. */
++            if (!timestamp)
++                continue;
++
+             struct v4l2_hevc_dpb_entry * const entry = entries + n++;
+ 
+-            entry->timestamp = frame_capture_dpb(frame->frame);
++            entry->timestamp = timestamp;
+ #if HEVC_CTRLS_VERSION <= 2
+             entry->rps = find_frame_rps_type(h, entry->timestamp);
+ #else

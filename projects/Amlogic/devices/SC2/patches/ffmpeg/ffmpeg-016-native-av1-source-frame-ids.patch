@@ -1,0 +1,110 @@
+From: hiper25 <whydonit@gmail.com>
+Subject: [PATCH] avcodec/cbs_av1: validate source frame IDs before normalization
+
+Enforce the AV1 frame-ID length, modular progression, selected reference-ID
+and show-existing display-ID requirements before userspace resolves native
+references to timestamps. Clear previous-ID authority on flush, retain it
+across non-key show-existing, and update it only after a complete header.
+
+Native AV1 controls omit the source ID lengths and reference deltas. Erasing
+those optional wire IDs is reconstruction-equivalent only after the source
+parser has performed their missing-reference checks. No new native ABI.
+
+diff --git a/libavcodec/cbs_av1.h b/libavcodec/cbs_av1.h
+--- a/libavcodec/cbs_av1.h
++++ b/libavcodec/cbs_av1.h
+@@ -446,6 +446,8 @@
+     int upscaled_width;
+     int render_width;
+     int render_height;
++    int frame_id;
++    int frame_id_valid;
+ 
+     int num_planes;
+     int coded_lossless;
+diff --git a/libavcodec/cbs_av1.c b/libavcodec/cbs_av1.c
+--- a/libavcodec/cbs_av1.c
++++ b/libavcodec/cbs_av1.c
+@@ -1287,6 +1287,7 @@
+     priv->operating_point_idc = 0;
+     priv->seen_frame_header = 0;
+     priv->tile_num = 0;
++    priv->frame_id_valid = 0;
+ }
+ 
+ static void cbs_av1_close(CodedBitstreamContext *ctx)
+diff --git a/libavcodec/cbs_av1_syntax_template.c b/libavcodec/cbs_av1_syntax_template.c
+--- a/libavcodec/cbs_av1_syntax_template.c
++++ b/libavcodec/cbs_av1_syntax_template.c
+@@ -267,6 +267,11 @@
+     if (current->frame_id_numbers_present_flag) {
+         fb(4, delta_frame_id_length_minus_2);
+         fb(3, additional_frame_id_length_minus_1);
++        if (current->delta_frame_id_length_minus_2 +
++            current->additional_frame_id_length_minus_1 + 3 > 16) {
++            av_log(ctx->log_ctx, AV_LOG_ERROR, "Frame ID length exceeds 16 bits.\n");
++            return AVERROR_INVALIDDATA;
++        }
+     }
+ 
+     flag(use_128x128_superblock);
+@@ -1348,8 +1353,13 @@
+                    frame_presentation_time);
+             }
+ 
+-            if (seq->frame_id_numbers_present_flag)
++            if (seq->frame_id_numbers_present_flag) {
+                 fb(id_len, display_frame_id);
++                if (current->display_frame_id != ref->frame_id) {
++                    av_log(ctx->log_ctx, AV_LOG_ERROR, "Display frame ID does not match retained frame.\n");
++                    return AVERROR_INVALIDDATA;
++                }
++            }
+ 
+             infer(frame_type, ref->frame_type);
+             if (current->frame_type == AV1_FRAME_KEY) {
+@@ -1426,6 +1436,15 @@
+ 
+     if (seq->frame_id_numbers_present_flag) {
+         fb(id_len, current_frame_id);
++        if (priv->frame_id_valid &&
++            (current->frame_type != AV1_FRAME_KEY || !current->show_frame)) {
++            unsigned int diff = (current->current_frame_id - priv->frame_id) &
++                                ((1U << id_len) - 1);
++            if (!diff || diff >= (1U << (id_len - 1))) {
++                av_log(ctx->log_ctx, AV_LOG_ERROR, "Invalid current frame ID progression.\n");
++                return AVERROR_INVALIDDATA;
++            }
++        }
+ 
+         diff_len = seq->delta_frame_id_length_minus_2 + 2;
+         for (i = 0; i < AV1_NUM_REF_FRAMES; i++) {
+@@ -1530,8 +1549,17 @@
+             if (!current->frame_refs_short_signaling)
+                 fbs(3, ref_frame_idx[i], 1, i);
+             if (seq->frame_id_numbers_present_flag) {
++                const AV1ReferenceFrameState *ref = &priv->ref[current->ref_frame_idx[i]];
++                unsigned int expected;
++
+                 fbs(seq->delta_frame_id_length_minus_2 + 2,
+                     delta_frame_id_minus1[i], 1, i);
++                expected = (current->current_frame_id - current->delta_frame_id_minus1[i] - 1) &
++                           ((1U << id_len) - 1);
++                if (!ref->valid || ref->frame_id != expected) {
++                    av_log(ctx->log_ctx, AV_LOG_ERROR, "Reference frame ID does not match retained frame.\n");
++                    return AVERROR_INVALIDDATA;
++                }
+             }
+         }
+ 
+@@ -1648,6 +1676,10 @@
+            priv->tile_rows, priv->tile_cols);
+ 
+ update_refs:
++    if (!current->show_existing_frame || current->frame_type == AV1_FRAME_KEY) {
++        priv->frame_id = current->current_frame_id;
++        priv->frame_id_valid = seq->frame_id_numbers_present_flag;
++    }
+     for (i = 0; i < AV1_NUM_REF_FRAMES; i++) {
+         if (current->refresh_frame_flags & (1 << i)) {
+             priv->ref[i] = (AV1ReferenceFrameState) {

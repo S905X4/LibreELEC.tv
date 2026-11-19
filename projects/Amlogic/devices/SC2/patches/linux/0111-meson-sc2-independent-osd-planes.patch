@@ -1,0 +1,1669 @@
+From 70b04e60e269b939bd3f4d27c1f0b4fdf83b021a Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Fri, 13 Nov 2026 22:59:01 +0800
+Subject: [PATCH] drm: meson: add independent SC2 VIU1 OSD2 and OSD3 planes
+
+Give each VIU1 RGB fetcher its own canvas, shadow, scaler, MAFBC surface and immutable blend order. Migrate OSD1 with aggregate decoder ownership so disabling or changing one surface cannot reset an active sibling. Preserve existing vblank/RDMA and framebuffer/fence retention, OSD1 singleton policy and full supported modifiers. Exact VIU2 output routing remains separate. Object build succeeds; actual surface acceptance is recorded separately.
+---
+ drivers/gpu/drm/meson/meson_crtc.c      | 260 ++++++++++++++---
+ drivers/gpu/drm/meson/meson_drv.c       |  19 +-
+ drivers/gpu/drm/meson/meson_drv.h       |  74 +++--
+ drivers/gpu/drm/meson/meson_osd_afbcd.c | 141 +++++----
+ drivers/gpu/drm/meson/meson_osd_afbcd.h |   3 +
+ drivers/gpu/drm/meson/meson_plane.c     | 368 +++++++++++++++---------
+ drivers/gpu/drm/meson/meson_registers.h |   8 +
+ drivers/gpu/drm/meson/meson_viu.c       | 154 ++++++++--
+ drivers/gpu/drm/meson/meson_viu.h       |  18 ++
+ 9 files changed, 738 insertions(+), 307 deletions(-)
+
+diff --git a/drivers/gpu/drm/meson/meson_crtc.c b/drivers/gpu/drm/meson/meson_crtc.c
+index 14747e85e25a..cd6753fe7702 100644
+--- a/drivers/gpu/drm/meson/meson_crtc.c
++++ b/drivers/gpu/drm/meson/meson_crtc.c
+@@ -15,6 +15,7 @@
+ #include <drm/drm_atomic.h>
+ #include <drm/drm_atomic_helper.h>
+ #include <drm/drm_device.h>
++#include <drm/drm_fourcc.h>
+ #include <drm/drm_print.h>
+ #include <drm/drm_probe_helper.h>
+ #include <drm/drm_vblank.h>
+@@ -150,6 +151,171 @@ static void meson_crtc_atomic_enable(struct drm_crtc *crtc,
+ 	drm_crtc_vblank_on(crtc);
+ }
+ 
++static void meson_crtc_write_osd_scaler(struct meson_drm *priv,
++				       unsigned int index,
++				       const struct meson_osd_state *osd)
++{
++	u32 base = meson_osd_regs[index].sc_base;
++
++	/* All three SC2 PPS banks have the same offsets 0..11. */
++	writel_relaxed(osd->sc_v_phase_step, priv->io_base + _REG(base));
++	writel_relaxed(osd->sc_v_ini_phase, priv->io_base + _REG(base + 1));
++	writel_relaxed(osd->sc_v_ctrl0, priv->io_base + _REG(base + 2));
++	writel_relaxed(osd->sc_h_phase_step, priv->io_base + _REG(base + 3));
++	writel_relaxed(osd->sc_h_ini_phase, priv->io_base + _REG(base + 4));
++	writel_relaxed(osd->sc_h_ctrl0, priv->io_base + _REG(base + 5));
++	writel_relaxed(osd->sc_ctrl0, priv->io_base + _REG(base + 8));
++	writel_relaxed(osd->sc_i_wh_m1, priv->io_base + _REG(base + 9));
++	writel_relaxed(osd->sc_o_h_start_end, priv->io_base + _REG(base + 10));
++	writel_relaxed(osd->sc_o_v_start_end, priv->io_base + _REG(base + 11));
++}
++
++static void meson_crtc_sc2_output_scaler(struct meson_drm *priv, bool enabled)
++{
++	const struct drm_display_mode *mode = &priv->crtc->state->mode;
++	u32 base = meson_osd_regs[0].sc_base;
++	bool interlace = enabled && (mode->flags & DRM_MODE_FLAG_INTERLACE);
++
++	if (enabled && priv->viu.osd[0].enabled) {
++		meson_crtc_write_osd_scaler(priv, 0, &priv->viu.osd[0]);
++		return;
++	}
++	/* Without a primary FB, the composition domain is the full mode. */
++	writel_relaxed(interlace ? 2 << 24 : 0, priv->io_base + _REG(base));
++	writel_relaxed(interlace ? 0x80008000 : 0, priv->io_base + _REG(base + 1));
++	writel_relaxed(interlace ? BIT(25) | BIT(24) | BIT(23) |
++			(1 << 16) | (4 << 11) | (1 << 8) | (4 << 3) | 4 : 0,
++			priv->io_base + _REG(base + 2));
++	writel_relaxed(0, priv->io_base + _REG(base + 3));
++	writel_relaxed(0, priv->io_base + _REG(base + 4));
++	writel_relaxed(0, priv->io_base + _REG(base + 5));
++	writel_relaxed(interlace ? BIT(3) | BIT(2) : 0,
++			priv->io_base + _REG(base + 8));
++	writel_relaxed(interlace ? (mode->hdisplay - 1) << 16 |
++			(mode->vdisplay - 1) : 0, priv->io_base + _REG(base + 9));
++	writel_relaxed(interlace ? mode->hdisplay - 1 : 0,
++			priv->io_base + _REG(base + 10));
++	writel_relaxed(interlace ? mode->vdisplay / 2 - 1 : 0,
++			priv->io_base + _REG(base + 11));
++}
++
++static void meson_crtc_sc2_osd_blend(struct meson_drm *priv)
++{
++	const struct drm_display_mode *mode = &priv->crtc->state->mode;
++	u32 size = priv->viu.osd[0].enabled ? priv->viu.osd[0].blend0_size :
++		   mode->vdisplay << 16 | mode->hdisplay;
++	u32 control = VIU_OSD_BLEND_HOLD_LINES(4);
++	unsigned int count = 0, index, input = 0;
++	bool bypass;
++
++	for (index = 0; index < MESON_MAX_OSDS; index++)
++		count += priv->viu.osd[index].enabled;
++	bypass = count == 1 && priv->viu.osd[0].enabled;
++	/* Unused inputs must remain transparent, including the shift workaround. */
++	for (index = 0; index < 4; index++) {
++		writel_relaxed(0, priv->io_base +
++			       _REG(VIU_OSD_BLEND_DIN0_SCOPE_H + index * 2));
++		writel_relaxed(0xffffffff, priv->io_base +
++			       _REG(VIU_OSD_BLEND_DIN0_SCOPE_V + index * 2));
++	}
++	if (!bypass) {
++		/* BSP ABC: DIN0 is top, DIN2 middle, DIN3 bottom. */
++		control |= VIU_OSD_BLEND_BLEN2_PREMULT_EN(3) |
++			   VIU_OSD_BLEND_DIN_EN(5);
++	} else {
++		/* Preserve the deployed single-OSD bypass path. */
++		control |= VIU_OSD_BLEND_BLEN2_PREMULT_EN(1) |
++			   VIU_OSD_BLEND_DIN0_BYPASS_TO_DOUT0 |
++			   VIU_OSD_BLEND1_DIN3_BYPASS_TO_DOUT1 |
++			   VIU_OSD_BLEND1_DOUT_BYPASS_TO_BLEND2;
++	}
++	for (index = MESON_MAX_OSDS; index-- > 0;) {
++		const struct meson_osd_state *osd = &priv->viu.osd[index];
++		unsigned int din;
++
++		if (!osd->enabled)
++			continue;
++		din = !input ? 0 : input == count - 1 ? 3 : 2;
++		input++;
++		control |= VIU_OSD_BLEND_REORDER(din, index + 1) |
++			   VIU_OSD_BLEND_DIN_EN(BIT(din));
++		/* BSP divides premultiplied pixels before blend0/1 multiplication. */
++		writel_bits_relaxed(BIT(28), bypass ?
++			priv->viu.osd1_bypass_alpha_div :
++			(osd->format == DRM_FORMAT_ARGB8888 ||
++			 osd->format == DRM_FORMAT_ABGR8888 ? BIT(28) : 0),
++			priv->io_base + _REG(meson_osd_regs[index].unpack_ctrl));
++		writel_relaxed(osd->blend_scope_h, priv->io_base +
++			       _REG(VIU_OSD_BLEND_DIN0_SCOPE_H + din * 2));
++		writel_relaxed(osd->blend_scope_v, priv->io_base +
++			       _REG(VIU_OSD_BLEND_DIN0_SCOPE_V + din * 2));
++	}
++	writel_relaxed(size, priv->io_base + _REG(VIU_OSD_BLEND_BLEND0_SIZE));
++	writel_relaxed(size, priv->io_base + _REG(VIU_OSD_BLEND_BLEND1_SIZE));
++	writel_relaxed(control, priv->io_base + _REG(VIU_OSD_BLEND_CTRL));
++	writel_relaxed(bypass ? priv->viu.osd1_bypass_blend_ctrl1 :
++			BIT(0) | (3 << 4) | (3 << 16),
++			priv->io_base + _REG(VIU_OSD_BLEND_CTRL1));
++	writel_relaxed(OSD_BLEND_PATH_SEL_ENABLE |
++			(count ? OSD_BLEND_POSTBLD_SRC_OSD1 : 0) |
++			(count && !bypass ? VD_BLEND_POSTBLD_PREMULT_EN : 0),
++			priv->io_base + _REG(OSD1_BLEND_SRC_CTRL));
++	meson_crtc_sc2_output_scaler(priv, count != 0);
++}
++
++static void meson_crtc_sc2_update_osds(struct meson_drm *priv)
++{
++	u32 surface_mask = 0;
++	unsigned int index, word;
++	bool commit = false;
++
++	for (index = 0; index < MESON_MAX_OSDS; index++) {
++		const struct meson_osd_state *osd = &priv->viu.osd[index];
++
++		commit |= osd->commit;
++		if (osd->enabled && osd->afbcd)
++			surface_mask |= BIT(index);
++	}
++	if (!commit)
++		return;
++
++	/* One replay table and one decoder command own the entire OSD commit. */
++	meson_rdma_reset(priv);
++	for (index = 0; index < MESON_MAX_OSDS; index++) {
++		struct meson_osd_state *osd = &priv->viu.osd[index];
++		const struct meson_osd_regs *regs = &meson_osd_regs[index];
++
++		osd->commit = false;
++		if (!osd->enabled) {
++			writel_bits_relaxed(OSD_ENABLE | OSD_BLK0_ENABLE, 0,
++					    priv->io_base + _REG(regs->ctrl_stat));
++			meson_viu_osd_afbc_select(priv, index, false);
++			if (index)
++				writel_relaxed(0, priv->io_base + _REG(regs->sc_base + 8));
++			continue;
++		}
++		writel_relaxed(osd->ctrl_stat | (osd->afbcd ? OSD_MEM_LINEAR_ADDR : 0),
++			       priv->io_base + _REG(regs->ctrl_stat));
++		writel_relaxed(osd->ctrl_stat2, priv->io_base + _REG(regs->ctrl_stat2));
++		for (word = 0; word < ARRAY_SIZE(regs->blk0_cfg); word++)
++			writel_relaxed(osd->blk0_cfg[word],
++				       priv->io_base + _REG(regs->blk0_cfg[word]));
++		if (osd->afbcd) {
++			writel_relaxed(osd->blk1_cfg4, priv->io_base + _REG(regs->blk1_cfg4));
++			writel_relaxed(osd->blk2_cfg4, priv->io_base + _REG(regs->blk2_cfg4));
++		} else {
++			meson_canvas_config(priv->canvas, priv->canvas_id_osd[index],
++				osd->addr, osd->stride, osd->height,
++				MESON_CANVAS_WRAP_NONE, MESON_CANVAS_BLKMODE_LINEAR, 0);
++		}
++		meson_viu_osd_afbc_select(priv, index, osd->afbcd);
++		if (index)
++			meson_crtc_write_osd_scaler(priv, index, osd);
++	}
++	meson_crtc_sc2_osd_blend(priv);
++	meson_afbcd_sc2_update(priv, surface_mask);
++}
++
+ static void meson_crtc_disable_osd1(struct meson_crtc *meson_crtc)
+ {
+ 	struct meson_drm *priv = meson_crtc->priv;
+@@ -215,9 +381,17 @@ static void meson_crtc_atomic_disable(struct drm_crtc *crtc,
+ 	drm_crtc_vblank_off(crtc);
+ 
+ 	spin_lock_irq(&crtc->dev->event_lock);
+-	priv->viu.osd1_enabled = false;
+-	priv->viu.osd1_commit = false;
+-	meson_crtc_disable_osd1(meson_crtc);
++	if (priv->sc2) {
++		for (i = 0; i < MESON_MAX_OSDS; i++) {
++			priv->viu.osd[i].enabled = false;
++			priv->viu.osd[i].commit = true;
++		}
++		meson_crtc_sc2_update_osds(priv);
++	} else {
++		priv->viu.osd[0].enabled = false;
++		priv->viu.osd[0].commit = false;
++		meson_crtc_disable_osd1(meson_crtc);
++	}
+ 	for (i = 0; i < (priv->sc2 ? 2 : 1); i++) {
+ 		priv->viu.video[i].enabled = false;
+ 		priv->viu.video[i].commit = false;
+@@ -256,8 +430,9 @@ static void meson_crtc_atomic_flush(struct drm_crtc *crtc,
+ 	 * shadow, so the IRQ must not signal this flip before atomic_flush.
+ 	 */
+ 	spin_lock_irqsave(&crtc->dev->event_lock, flags);
+-	if (drm_atomic_get_new_plane_state(state, priv->primary_plane))
+-		priv->viu.osd1_commit = true;
++	for (i = 0; i < (priv->sc2 ? MESON_MAX_OSDS : 1); i++)
++		if (drm_atomic_get_new_plane_state(state, priv->osd_planes[i]))
++			priv->viu.osd[i].commit = true;
+ 	for (i = 0; i < (priv->sc2 ? 2 : 1); i++)
+ 		if (drm_atomic_get_new_plane_state(state, priv->overlay_planes[i]))
+ 			priv->viu.video[i].commit = true;
+@@ -288,13 +463,13 @@ static void meson_crtc_enable_osd1(struct meson_drm *priv)
+ 
+ static void meson_crtc_g12a_enable_osd1_afbc(struct meson_drm *priv)
+ {
+-	writel_relaxed(priv->viu.osd1_blk2_cfg4,
++	writel_relaxed(priv->viu.osd[0].blk2_cfg4,
+ 		       priv->io_base + _REG(VIU_OSD1_BLK2_CFG_W4));
+ 
+ 	writel_bits_relaxed(OSD_MEM_LINEAR_ADDR, OSD_MEM_LINEAR_ADDR,
+ 			    priv->io_base + _REG(VIU_OSD1_CTRL_STAT));
+ 
+-	writel_relaxed(priv->viu.osd1_blk1_cfg4,
++	writel_relaxed(priv->viu.osd[0].blk1_cfg4,
+ 		       priv->io_base + _REG(VIU_OSD1_BLK1_CFG_W4));
+ 
+ 	meson_viu_g12a_enable_osd1_afbc(priv);
+@@ -308,16 +483,16 @@ static void meson_crtc_g12a_enable_osd1_afbc(struct meson_drm *priv)
+ 
+ static void meson_g12a_crtc_enable_osd1(struct meson_drm *priv)
+ {
+-	writel_relaxed(priv->viu.osd_blend_din0_scope_h,
++	writel_relaxed(priv->viu.osd[0].blend_scope_h,
+ 		       priv->io_base +
+ 		       _REG(VIU_OSD_BLEND_DIN0_SCOPE_H));
+-	writel_relaxed(priv->viu.osd_blend_din0_scope_v,
++	writel_relaxed(priv->viu.osd[0].blend_scope_v,
+ 		       priv->io_base +
+ 		       _REG(VIU_OSD_BLEND_DIN0_SCOPE_V));
+-	writel_relaxed(priv->viu.osb_blend0_size,
++	writel_relaxed(priv->viu.osd[0].blend0_size,
+ 		       priv->io_base +
+ 		       _REG(VIU_OSD_BLEND_BLEND0_SIZE));
+-	writel_relaxed(priv->viu.osb_blend1_size,
++	writel_relaxed(priv->viu.osd[0].blend1_size,
+ 		       priv->io_base +
+ 		       _REG(VIU_OSD_BLEND_BLEND1_SIZE));
+ 	writel_bits_relaxed(3 << 8, 3 << 8,
+@@ -598,29 +773,31 @@ void meson_crtc_irq(struct meson_drm *priv)
+ 	drm_crtc_handle_vblank(priv->crtc);
+ 
+ 	spin_lock_irqsave(&priv->drm->event_lock, flags);
+-	if (priv->viu.osd1_commit && !priv->viu.osd1_enabled) {
++	if (priv->sc2)
++		meson_crtc_sc2_update_osds(priv);
++	if (!priv->sc2 && priv->viu.osd[0].commit && !priv->viu.osd[0].enabled) {
+ 		meson_crtc_disable_osd1(meson_crtc);
+-		priv->viu.osd1_commit = false;
++		priv->viu.osd[0].commit = false;
+ 	}
+ 
+ 	/* Update the OSD registers */
+-	if (priv->viu.osd1_enabled && priv->viu.osd1_commit) {
+-		writel_relaxed(priv->viu.osd1_ctrl_stat,
++	if (!priv->sc2 && priv->viu.osd[0].enabled && priv->viu.osd[0].commit) {
++		writel_relaxed(priv->viu.osd[0].ctrl_stat,
+ 				priv->io_base + _REG(VIU_OSD1_CTRL_STAT));
+-		writel_relaxed(priv->viu.osd1_ctrl_stat2,
++		writel_relaxed(priv->viu.osd[0].ctrl_stat2,
+ 				priv->io_base + _REG(VIU_OSD1_CTRL_STAT2));
+-		writel_relaxed(priv->viu.osd1_blk0_cfg[0],
++		writel_relaxed(priv->viu.osd[0].blk0_cfg[0],
+ 				priv->io_base + _REG(VIU_OSD1_BLK0_CFG_W0));
+-		writel_relaxed(priv->viu.osd1_blk0_cfg[1],
++		writel_relaxed(priv->viu.osd[0].blk0_cfg[1],
+ 				priv->io_base + _REG(VIU_OSD1_BLK0_CFG_W1));
+-		writel_relaxed(priv->viu.osd1_blk0_cfg[2],
++		writel_relaxed(priv->viu.osd[0].blk0_cfg[2],
+ 				priv->io_base + _REG(VIU_OSD1_BLK0_CFG_W2));
+-		writel_relaxed(priv->viu.osd1_blk0_cfg[3],
++		writel_relaxed(priv->viu.osd[0].blk0_cfg[3],
+ 				priv->io_base + _REG(VIU_OSD1_BLK0_CFG_W3));
+-		writel_relaxed(priv->viu.osd1_blk0_cfg[4],
++		writel_relaxed(priv->viu.osd[0].blk0_cfg[4],
+ 				priv->io_base + _REG(VIU_OSD1_BLK0_CFG_W4));
+ 
+-		if (priv->viu.osd1_afbcd) {
++		if (priv->viu.osd[0].afbcd) {
+ 			if (meson_crtc->enable_osd1_afbc)
+ 				meson_crtc->enable_osd1_afbc(priv);
+ 		} else if (meson_crtc->osd1_afbcd) {
+@@ -630,32 +807,32 @@ void meson_crtc_irq(struct meson_drm *priv)
+ 			priv->afbcd.ops->disable(priv);
+ 		}
+ 
+-		writel_relaxed(priv->viu.osd_sc_ctrl0,
++		writel_relaxed(priv->viu.osd[0].sc_ctrl0,
+ 				priv->io_base + _REG(VPP_OSD_SC_CTRL0));
+-		writel_relaxed(priv->viu.osd_sc_i_wh_m1,
++		writel_relaxed(priv->viu.osd[0].sc_i_wh_m1,
+ 				priv->io_base + _REG(VPP_OSD_SCI_WH_M1));
+-		writel_relaxed(priv->viu.osd_sc_o_h_start_end,
++		writel_relaxed(priv->viu.osd[0].sc_o_h_start_end,
+ 				priv->io_base + _REG(VPP_OSD_SCO_H_START_END));
+-		writel_relaxed(priv->viu.osd_sc_o_v_start_end,
++		writel_relaxed(priv->viu.osd[0].sc_o_v_start_end,
+ 				priv->io_base + _REG(VPP_OSD_SCO_V_START_END));
+-		writel_relaxed(priv->viu.osd_sc_v_ini_phase,
++		writel_relaxed(priv->viu.osd[0].sc_v_ini_phase,
+ 				priv->io_base + _REG(VPP_OSD_VSC_INI_PHASE));
+-		writel_relaxed(priv->viu.osd_sc_v_phase_step,
++		writel_relaxed(priv->viu.osd[0].sc_v_phase_step,
+ 				priv->io_base + _REG(VPP_OSD_VSC_PHASE_STEP));
+-		writel_relaxed(priv->viu.osd_sc_h_ini_phase,
++		writel_relaxed(priv->viu.osd[0].sc_h_ini_phase,
+ 				priv->io_base + _REG(VPP_OSD_HSC_INI_PHASE));
+-		writel_relaxed(priv->viu.osd_sc_h_phase_step,
++		writel_relaxed(priv->viu.osd[0].sc_h_phase_step,
+ 				priv->io_base + _REG(VPP_OSD_HSC_PHASE_STEP));
+-		writel_relaxed(priv->viu.osd_sc_h_ctrl0,
++		writel_relaxed(priv->viu.osd[0].sc_h_ctrl0,
+ 				priv->io_base + _REG(VPP_OSD_HSC_CTRL0));
+-		writel_relaxed(priv->viu.osd_sc_v_ctrl0,
++		writel_relaxed(priv->viu.osd[0].sc_v_ctrl0,
+ 				priv->io_base + _REG(VPP_OSD_VSC_CTRL0));
+ 
+-		if (!priv->viu.osd1_afbcd)
+-			meson_canvas_config(priv->canvas, priv->canvas_id_osd1,
+-					    priv->viu.osd1_addr,
+-					    priv->viu.osd1_stride,
+-					    priv->viu.osd1_height,
++		if (!priv->viu.osd[0].afbcd)
++			meson_canvas_config(priv->canvas, priv->canvas_id_osd[0],
++					    priv->viu.osd[0].addr,
++					    priv->viu.osd[0].stride,
++					    priv->viu.osd[0].height,
+ 					    MESON_CANVAS_WRAP_NONE,
+ 					    MESON_CANVAS_BLKMODE_LINEAR, 0);
+ 
+@@ -663,7 +840,7 @@ void meson_crtc_irq(struct meson_drm *priv)
+ 		if (meson_crtc->enable_osd1)
+ 			meson_crtc->enable_osd1(priv);
+ 
+-		if (priv->viu.osd1_afbcd) {
++		if (priv->viu.osd[0].afbcd) {
+ 			/* SC2 does not need the G12A per-frame reset workaround. */
+ 			if (!priv->sc2 || !meson_crtc->osd1_afbcd)
+ 				priv->afbcd.ops->reset(priv);
+@@ -671,9 +848,9 @@ void meson_crtc_irq(struct meson_drm *priv)
+ 			priv->afbcd.ops->enable(priv);
+ 		}
+ 
+-		meson_crtc->osd1_afbcd = priv->viu.osd1_afbcd;
++		meson_crtc->osd1_afbcd = priv->viu.osd[0].afbcd;
+ 
+-		priv->viu.osd1_commit = false;
++		priv->viu.osd[0].commit = false;
+ 	}
+ 
+ 	for (i = 0; i < (priv->sc2 ? 2 : 1); i++)
+@@ -700,7 +877,8 @@ void meson_crtc_irq(struct meson_drm *priv)
+ 			       priv->io_base + _REG(pps->vsc_phase_ctrl));
+ 	}
+ 
+-	meson_crtc->vsync_forced = meson_crtc->osd1_afbcd ||
++	meson_crtc->vsync_forced = (priv->sc2 ? priv->afbcd.active_mask != 0 :
++		meson_crtc->osd1_afbcd) ||
+ 		meson_crtc->video[0].interlace || meson_crtc->video[1].interlace;
+ 	if (meson_crtc->event) {
+ 		drm_crtc_send_vblank_event(priv->crtc, meson_crtc->event);
+diff --git a/drivers/gpu/drm/meson/meson_drv.c b/drivers/gpu/drm/meson/meson_drv.c
+index b30f22f60e9d..a51264dacada 100644
+--- a/drivers/gpu/drm/meson/meson_drv.c
++++ b/drivers/gpu/drm/meson/meson_drv.c
+@@ -166,7 +166,8 @@ static void meson_vpu_init(struct meson_drm *priv)
+ 				   GENMASK(21, 14) | GENMASK(25, 24) |
+ 				   GENMASK(31, 30), 0);
+ 		regmap_update_bits(priv->pwrctrl, 0x5c,
+-				   GENMASK(13, 8) | GENMASK(17, 16), 0);
++				   GENMASK(5, 4) | GENMASK(13, 8) |
++				   GENMASK(17, 16), 0);
+ 		regmap_update_bits(priv->pwrctrl, 0x64, GENMASK(13, 12), 0);
+ 	}
+ 
+@@ -220,6 +221,7 @@ static int meson_drv_bind_master(struct device *dev, bool has_components)
+ 	struct regmap_config map_config = meson_regmap_config;
+ 	void __iomem *regs;
+ 	unsigned int video_canvases = 0;
++	unsigned int osd_canvases = 0;
+ 	int ret, i;
+ 
+ 	/* Checks if an output connector is available */
+@@ -322,9 +324,12 @@ static int meson_drv_bind_master(struct device *dev, bool has_components)
+ 		goto free_drm;
+ 	}
+ 
+-	ret = meson_canvas_alloc(priv->canvas, &priv->canvas_id_osd1);
+-	if (ret)
+-		goto free_drm;
++	for (i = 0; i < (priv->sc2 ? MESON_MAX_OSDS : 1); i++) {
++		ret = meson_canvas_alloc(priv->canvas, &priv->canvas_id_osd[i]);
++		if (ret)
++			goto free_canvas_vd;
++		osd_canvases++;
++	}
+ 	for (i = 0; i < (priv->sc2 ? 6 : 3); i++) {
+ 		ret = meson_canvas_alloc(priv->canvas,
+ 					 &priv->canvas_id_vd[i / 3][i % 3]);
+@@ -442,7 +447,8 @@ static int meson_drv_bind_master(struct device *dev, bool has_components)
+ 		meson_canvas_free(priv->canvas,
+ 			priv->canvas_id_vd[video_canvases / 3][video_canvases % 3]);
+ 	}
+-	meson_canvas_free(priv->canvas, priv->canvas_id_osd1);
++	while (osd_canvases)
++		meson_canvas_free(priv->canvas, priv->canvas_id_osd[--osd_canvases]);
+ free_drm:
+ 	drm_dev_put(drm);
+ 
+@@ -473,7 +479,8 @@ static void meson_drv_unbind(struct device *dev)
+ 	drm_atomic_helper_shutdown(drm);
+ 	free_irq(priv->vsync_irq, drm);
+ 	if (priv->canvas) {
+-		meson_canvas_free(priv->canvas, priv->canvas_id_osd1);
++		for (i = 0; i < (priv->sc2 ? MESON_MAX_OSDS : 1); i++)
++			meson_canvas_free(priv->canvas, priv->canvas_id_osd[i]);
+ 		for (i = 0; i < (priv->sc2 ? 6 : 3); i++)
+ 			meson_canvas_free(priv->canvas,
+ 					  priv->canvas_id_vd[i / 3][i % 3]);
+diff --git a/drivers/gpu/drm/meson/meson_drv.h b/drivers/gpu/drm/meson/meson_drv.h
+index 9c86e5528062..71b02b9d7f38 100644
+--- a/drivers/gpu/drm/meson/meson_drv.h
++++ b/drivers/gpu/drm/meson/meson_drv.h
+@@ -112,6 +112,41 @@ struct meson_video_state {
+ 	uint32_t vpp_blend_vd2_v_start_end;
+ };
+ 
++#define MESON_MAX_OSDS 3
++
++/* One fetcher, canvas and decoder surface per VIU1 OSD. */
++struct meson_osd_state {
++	bool enabled;
++	bool interlace;
++	bool commit;
++	bool afbcd;
++	u64 modifier;
++	u32 format;
++	u32 ctrl_stat;
++	u32 ctrl_stat2;
++	u32 blk0_cfg[5];
++	u32 blk1_cfg4;
++	u32 blk2_cfg4;
++	u32 addr;
++	u32 stride;
++	u32 height;
++	u32 width;
++	u32 sc_ctrl0;
++	u32 sc_i_wh_m1;
++	u32 sc_o_h_start_end;
++	u32 sc_o_v_start_end;
++	u32 sc_v_ini_phase;
++	u32 sc_v_phase_step;
++	u32 sc_h_ini_phase;
++	u32 sc_h_phase_step;
++	u32 sc_h_ctrl0;
++	u32 sc_v_ctrl0;
++	u32 blend_scope_h;
++	u32 blend_scope_v;
++	u32 blend0_size;
++	u32 blend1_size;
++};
++
+ struct meson_drm {
+ 	struct device *dev;
+ 	enum vpu_compatible compat;
+@@ -124,12 +159,13 @@ struct meson_drm {
+ 	int vsync_irq;
+ 
+ 	struct meson_canvas *canvas;
+-	u8 canvas_id_osd1;
++	u8 canvas_id_osd[MESON_MAX_OSDS];
+ 	u8 canvas_id_vd[2][3];
+ 
+ 	struct drm_device *drm;
+ 	struct drm_crtc *crtc;
+ 	struct drm_plane *primary_plane;
++	struct drm_plane *osd_planes[MESON_MAX_OSDS];
+ 	struct drm_plane *overlay_planes[2];
+ 	void *encoders[MESON_ENC_LAST];
+ 
+@@ -137,33 +173,11 @@ struct meson_drm {
+ 
+ 	/* Components Data */
+ 	struct {
+-		bool osd1_enabled;
+-		bool osd1_interlace;
+-		bool osd1_commit;
+-		bool osd1_afbcd;
+-		uint32_t osd1_ctrl_stat;
+-		uint32_t osd1_ctrl_stat2;
+-		uint32_t osd1_blk0_cfg[5];
+-		uint32_t osd1_blk1_cfg4;
+-		uint32_t osd1_blk2_cfg4;
+-		uint32_t osd1_addr;
+-		uint32_t osd1_stride;
+-		uint32_t osd1_height;
+-		uint32_t osd1_width;
+-		uint32_t osd_sc_ctrl0;
+-		uint32_t osd_sc_i_wh_m1;
+-		uint32_t osd_sc_o_h_start_end;
+-		uint32_t osd_sc_o_v_start_end;
+-		uint32_t osd_sc_v_ini_phase;
+-		uint32_t osd_sc_v_phase_step;
+-		uint32_t osd_sc_h_ini_phase;
+-		uint32_t osd_sc_h_phase_step;
+-		uint32_t osd_sc_h_ctrl0;
+-		uint32_t osd_sc_v_ctrl0;
+-		uint32_t osd_blend_din0_scope_h;
+-		uint32_t osd_blend_din0_scope_v;
+-		uint32_t osb_blend0_size;
+-		uint32_t osb_blend1_size;
++		struct meson_osd_state osd[MESON_MAX_OSDS];
++		/* Preserve the deployed OSD1-only bypass across composition changes. */
++		u32 osd1_bypass_alpha_div;
++		u32 osd1_bypass_blend_ctrl1;
++		bool osd1_bypass_initialized;
+ 
+ 		struct meson_video_state video[2];
+ 	} viu;
+@@ -183,8 +197,8 @@ struct meson_drm {
+ 
+ 	struct {
+ 		struct meson_afbcd_ops *ops;
+-		u64 modifier;
+-		u32 format;
++		/* Applied shared decoder ownership; never reset an active sibling. */
++		u32 active_mask;
+ 	} afbcd;
+ };
+ 
+diff --git a/drivers/gpu/drm/meson/meson_osd_afbcd.c b/drivers/gpu/drm/meson/meson_osd_afbcd.c
+index 5c18fecebce3..a31f7c331878 100644
+--- a/drivers/gpu/drm/meson/meson_osd_afbcd.c
++++ b/drivers/gpu/drm/meson/meson_osd_afbcd.c
+@@ -121,40 +121,40 @@ static int meson_gxm_afbcd_setup(struct meson_drm *priv)
+ 	u32 mode = FIELD_PREP(OSD1_AFBCD_MIF_URGENT, 3) |
+ 		   FIELD_PREP(OSD1_AFBCD_HOLD_LINE_NUM, 4) |
+ 		   FIELD_PREP(OSD1_AFBCD_RGBA_EXCHAN_CTRL, 0x34) |
+-		   meson_gxm_afbcd_pixel_fmt(priv->afbcd.modifier,
+-					     priv->afbcd.format);
++		   meson_gxm_afbcd_pixel_fmt(priv->viu.osd[0].modifier,
++					     priv->viu.osd[0].format);
+ 
+-	if (priv->afbcd.modifier & AFBC_FORMAT_MOD_SPARSE)
++	if (priv->viu.osd[0].modifier & AFBC_FORMAT_MOD_SPARSE)
+ 		mode |= OSD1_AFBCD_HREG_HALF_BLOCK;
+ 
+-	if (priv->afbcd.modifier & AFBC_FORMAT_MOD_SPLIT)
++	if (priv->viu.osd[0].modifier & AFBC_FORMAT_MOD_SPLIT)
+ 		mode |= OSD1_AFBCD_HREG_BLOCK_SPLIT;
+ 
+ 	writel_relaxed(mode, priv->io_base + _REG(OSD1_AFBCD_MODE));
+ 
+ 	writel_relaxed(FIELD_PREP(OSD1_AFBCD_HREG_VSIZE_IN,
+-				  priv->viu.osd1_width) |
++				  priv->viu.osd[0].width) |
+ 		       FIELD_PREP(OSD1_AFBCD_HREG_HSIZE_IN,
+-				  priv->viu.osd1_height),
++				  priv->viu.osd[0].height),
+ 		       priv->io_base + _REG(OSD1_AFBCD_SIZE_IN));
+ 
+-	writel_relaxed(priv->viu.osd1_addr >> 4,
++	writel_relaxed(priv->viu.osd[0].addr >> 4,
+ 		       priv->io_base + _REG(OSD1_AFBCD_HDR_PTR));
+-	writel_relaxed(priv->viu.osd1_addr >> 4,
++	writel_relaxed(priv->viu.osd[0].addr >> 4,
+ 		       priv->io_base + _REG(OSD1_AFBCD_FRAME_PTR));
+ 	/* TOFIX: bits 31:24 are not documented, nor the meaning of 0xe4 */
+-	writel_relaxed((0xe4 << 24) | (priv->viu.osd1_addr & 0xffffff),
++	writel_relaxed((0xe4 << 24) | (priv->viu.osd[0].addr & 0xffffff),
+ 		       priv->io_base + _REG(OSD1_AFBCD_CHROMA_PTR));
+ 
+-	if (priv->viu.osd1_width <= 128)
++	if (priv->viu.osd[0].width <= 128)
+ 		conv_lbuf_len = 32;
+-	else if (priv->viu.osd1_width <= 256)
++	else if (priv->viu.osd[0].width <= 256)
+ 		conv_lbuf_len = 64;
+-	else if (priv->viu.osd1_width <= 512)
++	else if (priv->viu.osd[0].width <= 512)
+ 		conv_lbuf_len = 128;
+-	else if (priv->viu.osd1_width <= 1024)
++	else if (priv->viu.osd[0].width <= 1024)
+ 		conv_lbuf_len = 256;
+-	else if (priv->viu.osd1_width <= 2048)
++	else if (priv->viu.osd[0].width <= 2048)
+ 		conv_lbuf_len = 512;
+ 	else
+ 		conv_lbuf_len = 1024;
+@@ -164,12 +164,12 @@ static int meson_gxm_afbcd_setup(struct meson_drm *priv)
+ 
+ 	writel_relaxed(FIELD_PREP(OSD1_AFBCD_DEC_PIXEL_BGN_H, 0) |
+ 		       FIELD_PREP(OSD1_AFBCD_DEC_PIXEL_END_H,
+-				  priv->viu.osd1_width - 1),
++				  priv->viu.osd[0].width - 1),
+ 		       priv->io_base + _REG(OSD1_AFBCD_PIXEL_HSCOPE));
+ 
+ 	writel_relaxed(FIELD_PREP(OSD1_AFBCD_DEC_PIXEL_BGN_V, 0) |
+ 		       FIELD_PREP(OSD1_AFBCD_DEC_PIXEL_END_V,
+-				  priv->viu.osd1_height - 1),
++				  priv->viu.osd[0].height - 1),
+ 		       priv->io_base + _REG(OSD1_AFBCD_PIXEL_VSCOPE));
+ 
+ 	return 0;
+@@ -327,8 +327,12 @@ static int meson_g12a_afbcd_enable(struct meson_drm *priv)
+ 			       VPU_MAFBC_IRQ_DETILING_ERROR,
+ 			       VPU_MAFBC_IRQ_MASK);
+ 
+-	meson_rdma_writel_sync(priv, VPU_MAFBC_S0_ENABLE,
+-			       VPU_MAFBC_SURFACE_CFG);
++	/* Preserve non-surface controls and all surfaces owned by this commit. */
++	meson_rdma_writel_sync(priv,
++		(readl_relaxed(priv->io_base + _REG(VPU_MAFBC_SURFACE_CFG)) &
++		 ~(priv->sc2 ? GENMASK(2, 0) : VPU_MAFBC_S0_ENABLE)) |
++		(priv->sc2 ? priv->afbcd.active_mask : VPU_MAFBC_S0_ENABLE),
++		VPU_MAFBC_SURFACE_CFG);
+ 
+ 	meson_rdma_writel_sync(priv, VPU_MAFBC_DIRECT_SWAP,
+ 			       VPU_MAFBC_COMMAND);
+@@ -341,66 +345,79 @@ static int meson_g12a_afbcd_enable(struct meson_drm *priv)
+ 
+ static int meson_g12a_afbcd_disable(struct meson_drm *priv)
+ {
+-	writel_bits_relaxed(VPU_MAFBC_S0_ENABLE, 0,
++	writel_bits_relaxed(priv->sc2 ? GENMASK(2, 0) : VPU_MAFBC_S0_ENABLE, 0,
+ 			    priv->io_base + _REG(VPU_MAFBC_SURFACE_CFG));
+ 
+ 	return 0;
+ }
+ 
+-static int meson_g12a_afbcd_setup(struct meson_drm *priv)
++static int meson_g12a_afbcd_setup_surface(struct meson_drm *priv,
++					unsigned int index)
+ {
+-	u32 format = meson_g12a_afbcd_pixel_fmt(priv->afbcd.modifier,
+-						priv->afbcd.format);
+-
+-	/* Disarm the old vsync table before building the next one. */
+-	if (priv->sc2)
+-		meson_rdma_reset(priv);
++	const struct meson_osd_state *osd = &priv->viu.osd[index];
++	/* BSP S0/S1/S2 register blocks begin at 0x3a10/0x3a30/0x3a50. */
++	u32 offset = index * 0x20;
++	u32 format = meson_g12a_afbcd_pixel_fmt(osd->modifier, osd->format);
+ 
+-	if (priv->afbcd.modifier & AFBC_FORMAT_MOD_YTR)
++	if (osd->modifier & AFBC_FORMAT_MOD_YTR)
+ 		format |= VPU_MAFBC_YUV_TRANSFORM;
+-
+-	if (priv->afbcd.modifier & AFBC_FORMAT_MOD_SPLIT)
++	if (osd->modifier & AFBC_FORMAT_MOD_SPLIT)
+ 		format |= VPU_MAFBC_BLOCK_SPLIT;
+-
+-	if (priv->afbcd.modifier & AFBC_FORMAT_MOD_TILED)
++	if (osd->modifier & AFBC_FORMAT_MOD_TILED)
+ 		format |= VPU_MAFBC_TILED_HEADER_EN;
+-
+-	if ((priv->afbcd.modifier & AFBC_FORMAT_MOD_BLOCK_SIZE_MASK) ==
+-		AFBC_FORMAT_MOD_BLOCK_SIZE_32x8)
++	if ((osd->modifier & AFBC_FORMAT_MOD_BLOCK_SIZE_MASK) ==
++	    AFBC_FORMAT_MOD_BLOCK_SIZE_32x8)
+ 		format |= FIELD_PREP(VPU_MAFBC_SUPER_BLOCK_ASPECT, 1);
+ 
+-	meson_rdma_writel_sync(priv, format,
+-			       VPU_MAFBC_FORMAT_SPECIFIER_S0);
+-
+-	meson_rdma_writel_sync(priv, priv->viu.osd1_addr,
+-			       VPU_MAFBC_HEADER_BUF_ADDR_LOW_S0);
++	meson_rdma_writel_sync(priv, format, VPU_MAFBC_FORMAT_SPECIFIER_S0 + offset);
++	meson_rdma_writel_sync(priv, osd->addr,
++			       VPU_MAFBC_HEADER_BUF_ADDR_LOW_S0 + offset);
+ 	meson_rdma_writel_sync(priv, 0,
+-			       VPU_MAFBC_HEADER_BUF_ADDR_HIGH_S0);
+-
+-	meson_rdma_writel_sync(priv, priv->viu.osd1_width,
+-			       VPU_MAFBC_BUFFER_WIDTH_S0);
+-	meson_rdma_writel_sync(priv, ALIGN(priv->viu.osd1_height, 32),
+-			       VPU_MAFBC_BUFFER_HEIGHT_S0);
+-
++			       VPU_MAFBC_HEADER_BUF_ADDR_HIGH_S0 + offset);
++	meson_rdma_writel_sync(priv, osd->width, VPU_MAFBC_BUFFER_WIDTH_S0 + offset);
++	meson_rdma_writel_sync(priv, ALIGN(osd->height, 32),
++			       VPU_MAFBC_BUFFER_HEIGHT_S0 + offset);
++	meson_rdma_writel_sync(priv, 0, VPU_MAFBC_BOUNDING_BOX_X_START_S0 + offset);
++	meson_rdma_writel_sync(priv, osd->width - 1,
++			       VPU_MAFBC_BOUNDING_BOX_X_END_S0 + offset);
++	meson_rdma_writel_sync(priv, 0, VPU_MAFBC_BOUNDING_BOX_Y_START_S0 + offset);
++	meson_rdma_writel_sync(priv, osd->height - 1,
++			       VPU_MAFBC_BOUNDING_BOX_Y_END_S0 + offset);
++	meson_rdma_writel_sync(priv, MESON_G12A_AFBCD_OUT_ADDR * (index + 1),
++			       VPU_MAFBC_OUTPUT_BUF_ADDR_LOW_S0 + offset);
+ 	meson_rdma_writel_sync(priv, 0,
+-			       VPU_MAFBC_BOUNDING_BOX_X_START_S0);
+-	meson_rdma_writel_sync(priv, priv->viu.osd1_width - 1,
+-			       VPU_MAFBC_BOUNDING_BOX_X_END_S0);
+-	meson_rdma_writel_sync(priv, 0,
+-			       VPU_MAFBC_BOUNDING_BOX_Y_START_S0);
+-	meson_rdma_writel_sync(priv, priv->viu.osd1_height - 1,
+-			       VPU_MAFBC_BOUNDING_BOX_Y_END_S0);
+-
+-	meson_rdma_writel_sync(priv, MESON_G12A_AFBCD_OUT_ADDR,
+-			       VPU_MAFBC_OUTPUT_BUF_ADDR_LOW_S0);
+-	meson_rdma_writel_sync(priv, 0,
+-			       VPU_MAFBC_OUTPUT_BUF_ADDR_HIGH_S0);
++			       VPU_MAFBC_OUTPUT_BUF_ADDR_HIGH_S0 + offset);
++	meson_rdma_writel_sync(priv, osd->width *
++			       (meson_g12a_afbcd_bpp(osd->format) / 8),
++			       VPU_MAFBC_OUTPUT_BUF_STRIDE_S0 + offset);
++	return 0;
++}
+ 
+-	meson_rdma_writel_sync(priv, priv->viu.osd1_width *
+-			       (meson_g12a_afbcd_bpp(priv->afbcd.format) / 8),
+-			       VPU_MAFBC_OUTPUT_BUF_STRIDE_S0);
++static int meson_g12a_afbcd_setup(struct meson_drm *priv)
++{
++	return meson_g12a_afbcd_setup_surface(priv, 0);
++}
+ 
+-	return 0;
++void meson_afbcd_sc2_update(struct meson_drm *priv, u32 surface_mask)
++{
++	unsigned int index;
++
++	/* A shared reset is permitted only at the decoder's ownership edges. */
++	if (!priv->afbcd.active_mask && surface_mask)
++		meson_g12a_afbcd_reset(priv);
++	if (!surface_mask) {
++		meson_g12a_afbcd_disable(priv);
++		if (priv->afbcd.active_mask)
++			meson_g12a_afbcd_reset(priv);
++		priv->afbcd.active_mask = 0;
++		return;
++	}
++	priv->afbcd.active_mask = surface_mask;
++	/* Rebuild all enabled surfaces, including unchanged sibling backing. */
++	for (index = 0; index < MESON_MAX_OSDS; index++)
++		if (surface_mask & BIT(index))
++			meson_g12a_afbcd_setup_surface(priv, index);
++	meson_g12a_afbcd_enable(priv);
+ }
+ 
+ struct meson_afbcd_ops meson_afbcd_g12a_ops = {
+diff --git a/drivers/gpu/drm/meson/meson_osd_afbcd.h b/drivers/gpu/drm/meson/meson_osd_afbcd.h
+index e77ddeb6416f..2029ac15890a 100644
+--- a/drivers/gpu/drm/meson/meson_osd_afbcd.h
++++ b/drivers/gpu/drm/meson/meson_osd_afbcd.h
+@@ -26,4 +26,7 @@ struct meson_afbcd_ops {
+ extern struct meson_afbcd_ops meson_afbcd_gxm_ops;
+ extern struct meson_afbcd_ops meson_afbcd_g12a_ops;
+ 
++/* Called once for a complete SC2 OSD transaction, with replay disarmed. */
++void meson_afbcd_sc2_update(struct meson_drm *priv, u32 surface_mask);
++
+ #endif /* __MESON_OSD_AFBCD_H */
+diff --git a/drivers/gpu/drm/meson/meson_plane.c b/drivers/gpu/drm/meson/meson_plane.c
+index e947281af857..8afde5fbff39 100644
+--- a/drivers/gpu/drm/meson/meson_plane.c
++++ b/drivers/gpu/drm/meson/meson_plane.c
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <linux/bitfield.h>
++#include <linux/math64.h>
+ 
+ #include <drm/drm_atomic.h>
+ #include <drm/drm_atomic_helper.h>
+@@ -65,37 +66,107 @@
+ struct meson_plane {
+ 	struct drm_plane base;
+ 	struct meson_drm *priv;
++	unsigned int index;
+ 	bool enabled;
+ };
+ #define to_meson_plane(x) container_of(x, struct meson_plane, base)
+ 
+ #define FRAC_16_16(mult, div)    (((mult) << 16) / (div))
+ 
++/* SC2's OSD1 PPS follows the blender; OSD2/3 PPS precede it. */
++static void meson_plane_blend_size(struct meson_drm *priv,
++				   struct drm_atomic_state *state,
++				   struct drm_crtc_state *crtc_state,
++				   unsigned int *width, unsigned int *height)
++{
++	struct drm_plane_state *primary;
++
++	primary = drm_atomic_get_new_plane_state(state, priv->primary_plane);
++	if (!primary)
++		primary = priv->primary_plane->state;
++	*width = crtc_state->mode.hdisplay;
++	*height = crtc_state->mode.vdisplay;
++	if (primary->crtc && primary->fb) {
++		*width = drm_rect_width(&primary->src) >> 16;
++		*height = drm_rect_height(&primary->src) >> 16;
++	}
++}
++
++static struct drm_rect meson_plane_blend_dest(struct drm_plane_state *plane_state,
++					     struct drm_crtc_state *crtc_state,
++					     unsigned int width,
++					     unsigned int height)
++{
++	struct drm_rect dest = plane_state->dst;
++
++	dest.x1 = DIV_ROUND_CLOSEST_ULL((u64)dest.x1 * width,
++					crtc_state->mode.hdisplay);
++	dest.x2 = DIV_ROUND_CLOSEST_ULL((u64)dest.x2 * width,
++					crtc_state->mode.hdisplay);
++	dest.y1 = DIV_ROUND_CLOSEST_ULL((u64)dest.y1 * height,
++					crtc_state->mode.vdisplay);
++	dest.y2 = DIV_ROUND_CLOSEST_ULL((u64)dest.y2 * height,
++					crtc_state->mode.vdisplay);
++	return dest;
++}
++
+ static int meson_plane_atomic_check(struct drm_plane *plane,
+ 				    struct drm_atomic_state *state)
+ {
+ 	struct drm_plane_state *new_plane_state = drm_atomic_get_new_plane_state(state,
+ 										 plane);
++	struct meson_plane *meson_plane = to_meson_plane(plane);
++	struct meson_drm *priv = meson_plane->priv;
++	struct drm_crtc *crtc = new_plane_state->crtc;
+ 	struct drm_crtc_state *crtc_state;
++	struct drm_plane_state *osd_state;
++	struct drm_rect dest;
++	unsigned int width, height, i;
++	int ret;
+ 
+-	if (!new_plane_state->crtc)
++	if (!crtc) {
++		osd_state = drm_atomic_get_old_plane_state(state, plane);
++		crtc = osd_state->crtc;
++	}
++	if (!crtc)
+ 		return 0;
+ 
+-	crtc_state = drm_atomic_get_crtc_state(state,
+-					       new_plane_state->crtc);
++	crtc_state = drm_atomic_get_crtc_state(state, crtc);
+ 	if (IS_ERR(crtc_state))
+ 		return PTR_ERR(crtc_state);
+ 
+-	/*
+-	 * Only allow :
+-	 * - Upscaling up to 5x, vertical and horizontal
+-	 * - Final coordinates must match crtc size
+-	 */
+-	return drm_atomic_helper_check_plane_state(new_plane_state,
+-						   crtc_state,
+-						   FRAC_16_16(1, 5),
+-						   DRM_PLANE_NO_SCALING,
+-						   false, true);
++	/* A primary scale/enable change changes every OSD's blend coordinates. */
++	if (priv->sc2) {
++		for (i = 0; i < MESON_MAX_OSDS; i++) {
++			osd_state = drm_atomic_get_plane_state(state, priv->osd_planes[i]);
++			if (IS_ERR(osd_state))
++				return PTR_ERR(osd_state);
++		}
++	}
++	if (!new_plane_state->crtc)
++		return 0;
++
++	ret = drm_atomic_helper_check_plane_state(new_plane_state, crtc_state,
++			FRAC_16_16(1, 5), meson_plane->index ?
++			FRAC_16_16(5, 1) : DRM_PLANE_NO_SCALING,
++			meson_plane->index != 0, true);
++	if (ret || !meson_plane->index || !new_plane_state->visible)
++		return ret;
++
++	/* The extra PPS consumes integer crop coordinates and progressive RGB. */
++	if ((new_plane_state->src.x1 | new_plane_state->src.y1 |
++	     new_plane_state->src.x2 | new_plane_state->src.y2) & 0xffff)
++		return -EINVAL;
++	meson_plane_blend_size(priv, state, crtc_state, &width, &height);
++	dest = meson_plane_blend_dest(new_plane_state, crtc_state, width, height);
++	if (drm_rect_width(&dest) <= 0 || drm_rect_height(&dest) <= 0 ||
++	    dest.x2 > 4096 || dest.y2 > 4096 ||
++	    ((u64)drm_rect_width(&new_plane_state->src) >> 16) >
++		5 * drm_rect_width(&dest) ||
++	    ((u64)drm_rect_height(&new_plane_state->src) >> 16) >
++		5 * drm_rect_height(&dest))
++		return -EINVAL;
++	return 0;
+ }
+ 
+ #define MESON_MOD_AFBC_VALID_BITS (AFBC_FORMAT_MOD_BLOCK_SIZE_16x16 |	\
+@@ -110,20 +181,20 @@ static inline int64_t fixed16_to_int(int64_t value)
+ 	return value >> 16;
+ }
+ 
+-static u32 meson_g12a_afbcd_line_stride(struct meson_drm *priv)
++static u32 meson_g12a_afbcd_line_stride(const struct meson_osd_state *osd)
+ {
+ 	u32 line_stride = 0;
+ 
+-	switch (priv->afbcd.format) {
++	switch (osd->format) {
+ 	case DRM_FORMAT_RGB565:
+-		line_stride = ((priv->viu.osd1_width << 4) + 127) >> 7;
++		line_stride = ((osd->width << 4) + 127) >> 7;
+ 		break;
+ 	case DRM_FORMAT_RGB888:
+ 	case DRM_FORMAT_XRGB8888:
+ 	case DRM_FORMAT_ARGB8888:
+ 	case DRM_FORMAT_XBGR8888:
+ 	case DRM_FORMAT_ABGR8888:
+-		line_stride = ((priv->viu.osd1_width << 5) + 127) >> 7;
++		line_stride = ((osd->width << 5) + 127) >> 7;
+ 		break;
+ 	}
+ 
+@@ -138,6 +209,11 @@ static void meson_plane_atomic_update(struct drm_plane *plane,
+ 									   plane);
+ 	struct drm_rect dest = drm_plane_state_dest(new_state);
+ 	struct meson_drm *priv = meson_plane->priv;
++	struct meson_osd_state *osd = &priv->viu.osd[meson_plane->index];
++	const struct meson_osd_regs *regs = &meson_osd_regs[meson_plane->index];
++	struct drm_crtc_state *crtc_state =
++		drm_atomic_get_new_crtc_state(state, new_state->crtc);
++	unsigned int blend_w, blend_h;
+ 	struct drm_framebuffer *fb = new_state->fb;
+ 	struct drm_gem_dma_object *gem;
+ 	unsigned long flags;
+@@ -149,11 +225,19 @@ static void meson_plane_atomic_update(struct drm_plane *plane,
+ 	int bot_ini_phase;
+ 	int hf_bank_len;
+ 	int vf_bank_len;
+-	u8 canvas_id_osd1;
++	u8 canvas_id;
+ 	u32 global_alpha = 0x100;
+-	bool sc2_interlace = priv->sc2 &&
++	bool sc2_interlace = priv->sc2 && !meson_plane->index &&
+ 		(new_state->crtc->mode.flags & DRM_MODE_FLAG_INTERLACE);
+ 
++	if (!new_state->visible) {
++		spin_lock_irqsave(&priv->drm->event_lock, flags);
++		osd->enabled = false;
++		meson_plane->enabled = false;
++		spin_unlock_irqrestore(&priv->drm->event_lock, flags);
++		return;
++	}
++
+ 	if (priv->sc2)
+ 		global_alpha = DIV_ROUND_CLOSEST(new_state->alpha * 0x100,
+ 					       DRM_BLEND_ALPHA_OPAQUE);
+@@ -170,70 +254,70 @@ static void meson_plane_atomic_update(struct drm_plane *plane,
+ 	if ((meson_vpu_is_compatible(priv, VPU_COMPATIBLE_GXM) ||
+ 	     meson_vpu_is_compatible(priv, VPU_COMPATIBLE_G12A)) &&
+ 	    fb->modifier & DRM_FORMAT_MOD_ARM_AFBC(MESON_MOD_AFBC_VALID_BITS))
+-		priv->viu.osd1_afbcd = true;
++		osd->afbcd = true;
+ 	else
+-		priv->viu.osd1_afbcd = false;
++		osd->afbcd = false;
+ 
+ 	/* SC2 exposes the OSD's nine-bit global alpha through atomic state. */
+-	priv->viu.osd1_ctrl_stat = OSD_ENABLE |
++	osd->ctrl_stat = OSD_ENABLE |
+ 				   (global_alpha << OSD_GLOBAL_ALPHA_SHIFT) |
+ 				   OSD_BLK0_ENABLE;
+ 
+-	priv->viu.osd1_ctrl_stat2 = readl(priv->io_base +
+-					  _REG(VIU_OSD1_CTRL_STAT2));
++	osd->ctrl_stat2 = readl(priv->io_base + _REG(regs->ctrl_stat2));
+ 
+-	canvas_id_osd1 = priv->canvas_id_osd1;
++	canvas_id = priv->canvas_id_osd[meson_plane->index];
+ 
+ 	/* Set up BLK0 to point to the right canvas */
+-	priv->viu.osd1_blk0_cfg[0] = canvas_id_osd1 << OSD_CANVAS_SEL;
++	osd->blk0_cfg[0] = canvas_id << OSD_CANVAS_SEL;
+ 
+-	if (priv->viu.osd1_afbcd) {
++	if (osd->afbcd) {
+ 		if (meson_vpu_is_compatible(priv, VPU_COMPATIBLE_G12A)) {
+ 			/* This is the internal decoding memory address */
+-			priv->viu.osd1_blk1_cfg4 = MESON_G12A_AFBCD_OUT_ADDR;
+-			priv->viu.osd1_blk0_cfg[0] |= OSD_ENDIANNESS_BE;
+-			priv->viu.osd1_ctrl_stat2 |= OSD_PENDING_STAT_CLEAN;
+-			priv->viu.osd1_ctrl_stat |= VIU_OSD1_CFG_SYN_EN;
++			osd->blk1_cfg4 = MESON_G12A_AFBCD_OUT_ADDR *
++					(meson_plane->index + 1);
++			osd->blk0_cfg[0] |= OSD_ENDIANNESS_BE;
++			osd->ctrl_stat2 |= OSD_PENDING_STAT_CLEAN;
++			osd->ctrl_stat |= VIU_OSD1_CFG_SYN_EN;
+ 		}
+ 
+ 		if (meson_vpu_is_compatible(priv, VPU_COMPATIBLE_GXM)) {
+-			priv->viu.osd1_blk0_cfg[0] |= OSD_ENDIANNESS_LE;
+-			priv->viu.osd1_ctrl_stat2 |= OSD_DPATH_MALI_AFBCD;
++			osd->blk0_cfg[0] |= OSD_ENDIANNESS_LE;
++			osd->ctrl_stat2 |= OSD_DPATH_MALI_AFBCD;
+ 		}
+ 	} else {
+-		priv->viu.osd1_blk0_cfg[0] |= OSD_ENDIANNESS_LE;
++		osd->blk0_cfg[0] |= OSD_ENDIANNESS_LE;
+ 
+ 		if (meson_vpu_is_compatible(priv, VPU_COMPATIBLE_GXM))
+-			priv->viu.osd1_ctrl_stat2 &= ~OSD_DPATH_MALI_AFBCD;
++			osd->ctrl_stat2 &= ~OSD_DPATH_MALI_AFBCD;
+ 	}
+ 
+ 	/* On GXBB, Use the old non-HDR RGB2YUV converter */
+ 	if (meson_vpu_is_compatible(priv, VPU_COMPATIBLE_GXBB))
+-		priv->viu.osd1_blk0_cfg[0] |= OSD_OUTPUT_COLOR_RGB;
++		osd->blk0_cfg[0] |= OSD_OUTPUT_COLOR_RGB;
+ 
+-	if (priv->viu.osd1_afbcd &&
++	if (osd->afbcd &&
+ 	    meson_vpu_is_compatible(priv, VPU_COMPATIBLE_G12A)) {
+-		priv->viu.osd1_blk0_cfg[0] |= OSD_MALI_SRC_EN |
++		osd->blk0_cfg[0] |= OSD_MALI_SRC_EN |
+ 			priv->afbcd.ops->fmt_to_blk_mode(fb->modifier,
+ 							  fb->format->format);
+ 	} else {
+ 		switch (fb->format->format) {
+ 		case DRM_FORMAT_XRGB8888:
+ 		case DRM_FORMAT_ARGB8888:
+-			priv->viu.osd1_blk0_cfg[0] |= OSD_BLK_MODE_32 |
++			osd->blk0_cfg[0] |= OSD_BLK_MODE_32 |
+ 						OSD_COLOR_MATRIX_32_ARGB;
+ 			break;
+ 		case DRM_FORMAT_XBGR8888:
+ 		case DRM_FORMAT_ABGR8888:
+-			priv->viu.osd1_blk0_cfg[0] |= OSD_BLK_MODE_32 |
++			osd->blk0_cfg[0] |= OSD_BLK_MODE_32 |
+ 						OSD_COLOR_MATRIX_32_ABGR;
+ 			break;
+ 		case DRM_FORMAT_RGB888:
+-			priv->viu.osd1_blk0_cfg[0] |= OSD_BLK_MODE_24 |
++			osd->blk0_cfg[0] |= OSD_BLK_MODE_24 |
+ 						OSD_COLOR_MATRIX_24_RGB;
+ 			break;
+ 		case DRM_FORMAT_RGB565:
+-			priv->viu.osd1_blk0_cfg[0] |= OSD_BLK_MODE_16 |
++			osd->blk0_cfg[0] |= OSD_BLK_MODE_16 |
+ 						OSD_COLOR_MATRIX_16_RGB565;
+ 			break;
+ 		}
+@@ -243,12 +327,12 @@ static void meson_plane_atomic_update(struct drm_plane *plane,
+ 	case DRM_FORMAT_XRGB8888:
+ 	case DRM_FORMAT_XBGR8888:
+ 		/* For XRGB, replace the pixel's alpha by 0xFF */
+-		priv->viu.osd1_ctrl_stat2 |= OSD_REPLACE_EN;
++		osd->ctrl_stat2 |= OSD_REPLACE_EN;
+ 		break;
+ 	case DRM_FORMAT_ARGB8888:
+ 	case DRM_FORMAT_ABGR8888:
+ 		/* For ARGB, use the pixel's alpha */
+-		priv->viu.osd1_ctrl_stat2 &= ~OSD_REPLACE_EN;
++		osd->ctrl_stat2 &= ~OSD_REPLACE_EN;
+ 		break;
+ 	}
+ 
+@@ -258,7 +342,8 @@ static void meson_plane_atomic_update(struct drm_plane *plane,
+ 	hf_bank_len = 4;
+ 	vf_bank_len = 4;
+ 
+-	if (new_state->crtc->mode.flags & DRM_MODE_FLAG_INTERLACE) {
++	if (!meson_plane->index &&
++	    (new_state->crtc->mode.flags & DRM_MODE_FLAG_INTERLACE)) {
+ 		vsc_bot_rcv_num = 6;
+ 		vsc_bot_rpt_p0_num = 2;
+ 	}
+@@ -268,10 +353,16 @@ static void meson_plane_atomic_update(struct drm_plane *plane,
+ 	hsc_ini_rpt_p0_num = (hf_bank_len / 2) - 1;
+ 	vsc_ini_rpt_p0_num = (vf_bank_len / 2) - 1;
+ 
+-	src_w = fixed16_to_int(new_state->src_w);
+-	src_h = fixed16_to_int(new_state->src_h);
++	src_w = drm_rect_width(&new_state->src) >> 16;
++	src_h = drm_rect_height(&new_state->src) >> 16;
+ 	dst_w = new_state->crtc_w;
+ 	dst_h = new_state->crtc_h;
++	if (meson_plane->index) {
++		meson_plane_blend_size(priv, state, crtc_state, &blend_w, &blend_h);
++		dest = meson_plane_blend_dest(new_state, crtc_state, blend_w, blend_h);
++		dst_w = drm_rect_width(&dest);
++		dst_h = drm_rect_height(&dest);
++	}
+ 
+ 	/*
+ 	 * When the output is interlaced, the OSD must switch between
+@@ -280,16 +371,18 @@ static void meson_plane_atomic_update(struct drm_plane *plane,
+ 	 * But the vertical scaler can provide such funtionnality if
+ 	 * is configured for 2:1 scaling with interlace options enabled.
+ 	 */
+-	if (new_state->crtc->mode.flags & DRM_MODE_FLAG_INTERLACE) {
++	if (!meson_plane->index &&
++	    (new_state->crtc->mode.flags & DRM_MODE_FLAG_INTERLACE)) {
+ 		dest.y1 /= 2;
+ 		dest.y2 /= 2;
+ 		dst_h /= 2;
+ 	}
+ 
+-	hf_phase_step = ((src_w << 18) / dst_w) << 6;
+-	vf_phase_step = (src_h << 20) / dst_h;
++	hf_phase_step = div_u64((u64)src_w << 24, dst_w);
++	vf_phase_step = div_u64((u64)src_h << 20, dst_h);
+ 
+-	if (new_state->crtc->mode.flags & DRM_MODE_FLAG_INTERLACE)
++	if (!meson_plane->index &&
++	    (new_state->crtc->mode.flags & DRM_MODE_FLAG_INTERLACE))
+ 		bot_ini_phase = ((vf_phase_step / 2) >> 4);
+ 	else
+ 		bot_ini_phase = 0;
+@@ -310,64 +403,65 @@ static void meson_plane_atomic_update(struct drm_plane *plane,
+ 
+ 	/* In interlaced mode, scaler is always active */
+ 	if (sc2_interlace || src_h != dst_h || src_w != dst_w) {
+-		priv->viu.osd_sc_i_wh_m1 = SCI_WH_M1_W(src_w - 1) |
++		osd->sc_i_wh_m1 = SCI_WH_M1_W(src_w - 1) |
+ 					   SCI_WH_M1_H(src_h - 1);
+-		priv->viu.osd_sc_o_h_start_end = SCO_HV_START(dest.x1) |
++		osd->sc_o_h_start_end = SCO_HV_START(dest.x1) |
+ 						 SCO_HV_END(dest.x2 - 1);
+-		priv->viu.osd_sc_o_v_start_end = SCO_HV_START(dest.y1) |
++		osd->sc_o_v_start_end = SCO_HV_START(dest.y1) |
+ 						 SCO_HV_END(dest.y2 - 1);
+ 		/* Enable OSD Scaler */
+-		priv->viu.osd_sc_ctrl0 = SC_CTRL0_PATH_EN | SC_CTRL0_SEL_OSD1;
++		osd->sc_ctrl0 = SC_CTRL0_PATH_EN | SC_CTRL0_SEL_OSD1;
+ 	} else {
+-		priv->viu.osd_sc_i_wh_m1 = 0;
+-		priv->viu.osd_sc_o_h_start_end = 0;
+-		priv->viu.osd_sc_o_v_start_end = 0;
+-		priv->viu.osd_sc_ctrl0 = 0;
++		osd->sc_i_wh_m1 = 0;
++		osd->sc_o_h_start_end = 0;
++		osd->sc_o_v_start_end = 0;
++		osd->sc_ctrl0 = 0;
+ 	}
+ 
+ 	/* In interlaced mode, vertical scaler is always active */
+ 	if (sc2_interlace || src_h != dst_h) {
+-		priv->viu.osd_sc_v_ctrl0 =
++		osd->sc_v_ctrl0 =
+ 					VSC_BANK_LEN(vf_bank_len) |
+ 					VSC_TOP_INI_RCV_NUM(vsc_ini_rcv_num) |
+ 					VSC_TOP_RPT_L0_NUM(vsc_ini_rpt_p0_num) |
+ 					VSC_VERTICAL_SCALER_EN;
+ 
+-		if (new_state->crtc->mode.flags & DRM_MODE_FLAG_INTERLACE)
+-			priv->viu.osd_sc_v_ctrl0 |=
++		if (!meson_plane->index &&
++		    (new_state->crtc->mode.flags & DRM_MODE_FLAG_INTERLACE))
++			osd->sc_v_ctrl0 |=
+ 					VSC_BOT_INI_RCV_NUM(vsc_bot_rcv_num) |
+ 					VSC_BOT_RPT_L0_NUM(vsc_bot_rpt_p0_num) |
+ 					VSC_PROG_INTERLACE;
+ 
+ 		if (sc2_interlace)
+ 			/* G12B+ vendor setting for progressive-to-field scaling. */
+-			priv->viu.osd_sc_v_ctrl0 |= BIT(25);
++			osd->sc_v_ctrl0 |= BIT(25);
+ 
+-		priv->viu.osd_sc_v_phase_step = SC_PHASE_STEP(vf_phase_step);
+-		priv->viu.osd_sc_v_ini_phase = VSC_INI_PHASE_BOT(bot_ini_phase);
++		osd->sc_v_phase_step = SC_PHASE_STEP(vf_phase_step);
++		osd->sc_v_ini_phase = VSC_INI_PHASE_BOT(bot_ini_phase);
+ 		if (sc2_interlace && src_h == dst_h * 2)
+-			priv->viu.osd_sc_v_ini_phase |=
++			osd->sc_v_ini_phase |=
+ 				VSC_INI_PHASE_TOP(0x8000) |
+ 				VSC_INI_PHASE_BOT(0x8000);
+ 	} else {
+-		priv->viu.osd_sc_v_ctrl0 = 0;
+-		priv->viu.osd_sc_v_phase_step = 0;
+-		priv->viu.osd_sc_v_ini_phase = 0;
++		osd->sc_v_ctrl0 = 0;
++		osd->sc_v_phase_step = 0;
++		osd->sc_v_ini_phase = 0;
+ 	}
+ 
+ 	/* Horizontal scaler is only used if width does not match */
+ 	if (src_w != dst_w) {
+-		priv->viu.osd_sc_h_ctrl0 =
++		osd->sc_h_ctrl0 =
+ 					HSC_BANK_LENGTH(hf_bank_len) |
+ 					HSC_INI_RCV_NUM0(hsc_ini_rcv_num) |
+ 					HSC_RPT_P0_NUM0(hsc_ini_rpt_p0_num) |
+ 					HSC_HORIZ_SCALER_EN;
+-		priv->viu.osd_sc_h_phase_step = SC_PHASE_STEP(hf_phase_step);
+-		priv->viu.osd_sc_h_ini_phase = 0;
++		osd->sc_h_phase_step = SC_PHASE_STEP(hf_phase_step);
++		osd->sc_h_ini_phase = 0;
+ 	} else {
+-		priv->viu.osd_sc_h_ctrl0 = 0;
+-		priv->viu.osd_sc_h_phase_step = 0;
+-		priv->viu.osd_sc_h_ini_phase = 0;
++		osd->sc_h_ctrl0 = 0;
++		osd->sc_h_phase_step = 0;
++		osd->sc_h_ini_phase = 0;
+ 	}
+ 
+ 	/*
+@@ -375,14 +469,14 @@ static void meson_plane_atomic_update(struct drm_plane *plane,
+ 	 * where x2 is exclusive.
+ 	 * e.g. +30x1920 would be (1919 << 16) | 30
+ 	 */
+-	priv->viu.osd1_blk0_cfg[1] =
++	osd->blk0_cfg[1] =
+ 				((fixed16_to_int(new_state->src.x2) - 1) << 16) |
+ 				fixed16_to_int(new_state->src.x1);
+-	priv->viu.osd1_blk0_cfg[2] =
++	osd->blk0_cfg[2] =
+ 				((fixed16_to_int(new_state->src.y2) - 1) << 16) |
+ 				fixed16_to_int(new_state->src.y1);
+-	priv->viu.osd1_blk0_cfg[3] = ((dest.x2 - 1) << 16) | dest.x1;
+-	priv->viu.osd1_blk0_cfg[4] = ((dest.y2 - 1) << 16) | dest.y1;
++	osd->blk0_cfg[3] = ((dest.x2 - 1) << 16) | dest.x1;
++	osd->blk0_cfg[4] = ((dest.y2 - 1) << 16) | dest.y1;
+ 
+ 	if (priv->sc2) {
+ 		/*
+@@ -390,40 +484,39 @@ static void meson_plane_atomic_update(struct drm_plane *plane,
+ 		 * scaler. They consume a progressive frame, not a 540-line
+ 		 * field; only the scaler output and VPP use field coordinates.
+ 		 */
+-		priv->viu.osd1_blk0_cfg[3] = (src_w - 1) << 16;
+-		priv->viu.osd1_blk0_cfg[4] = (src_h - 1) << 16;
++		osd->blk0_cfg[3] = (src_w - 1) << 16;
++		osd->blk0_cfg[4] = (src_h - 1) << 16;
+ 	}
+ 
+ 	if (meson_vpu_is_compatible(priv, VPU_COMPATIBLE_G12A)) {
+-		priv->viu.osd_blend_din0_scope_h = ((dest.x2 - 1) << 16) | dest.x1;
+-		priv->viu.osd_blend_din0_scope_v = ((dest.y2 - 1) << 16) | dest.y1;
+-		priv->viu.osb_blend0_size = dst_h << 16 | dst_w;
+-		priv->viu.osb_blend1_size = dst_h << 16 | dst_w;
+-
+-		if (priv->sc2) {
+-			priv->viu.osd_blend_din0_scope_h = (src_w - 1) << 16;
+-			priv->viu.osd_blend_din0_scope_v = (src_h - 1) << 16;
+-			priv->viu.osb_blend0_size = src_h << 16 | src_w;
+-			priv->viu.osb_blend1_size = src_h << 16 | src_w;
++		osd->blend_scope_h = ((dest.x2 - 1) << 16) | dest.x1;
++		osd->blend_scope_v = ((dest.y2 - 1) << 16) | dest.y1;
++		osd->blend0_size = dst_h << 16 | dst_w;
++		osd->blend1_size = dst_h << 16 | dst_w;
++
++		if (priv->sc2 && !meson_plane->index) {
++			osd->blend_scope_h = (src_w - 1) << 16;
++			osd->blend_scope_v = (src_h - 1) << 16;
++			osd->blend0_size = src_h << 16 | src_w;
++			osd->blend1_size = src_h << 16 | src_w;
+ 		}
+ 	}
+ 
+ 	/* Update Canvas with buffer address */
+ 	gem = drm_fb_dma_get_gem_obj(fb, 0);
+ 
+-	priv->viu.osd1_addr = gem->dma_addr;
+-	priv->viu.osd1_stride = fb->pitches[0];
+-	priv->viu.osd1_height = fb->height;
+-	priv->viu.osd1_width = fb->width;
+-
+-	if (priv->viu.osd1_afbcd) {
+-		priv->afbcd.modifier = fb->modifier;
+-		priv->afbcd.format = fb->format->format;
++	osd->addr = gem->dma_addr + fb->offsets[0];
++	osd->stride = fb->pitches[0];
++	osd->height = fb->height;
++	osd->width = fb->width;
++	osd->modifier = fb->modifier;
++	osd->format = fb->format->format;
+ 
++	if (osd->afbcd) {
+ 		/* Calculate decoder write stride */
+ 		if (meson_vpu_is_compatible(priv, VPU_COMPATIBLE_G12A))
+-			priv->viu.osd1_blk2_cfg4 =
+-				meson_g12a_afbcd_line_stride(priv);
++			osd->blk2_cfg4 =
++				meson_g12a_afbcd_line_stride(osd);
+ 	}
+ 
+ 	if (!meson_plane->enabled) {
+@@ -435,7 +528,7 @@ static void meson_plane_atomic_update(struct drm_plane *plane,
+ 		meson_plane->enabled = true;
+ 	}
+ 
+-	priv->viu.osd1_enabled = true;
++	osd->enabled = true;
+ 
+ 	spin_unlock_irqrestore(&priv->drm->event_lock, flags);
+ }
+@@ -445,11 +538,12 @@ static void meson_plane_atomic_disable(struct drm_plane *plane,
+ {
+ 	struct meson_plane *meson_plane = to_meson_plane(plane);
+ 	struct meson_drm *priv = meson_plane->priv;
++	struct meson_osd_state *osd = &priv->viu.osd[meson_plane->index];
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&priv->drm->event_lock, flags);
+ 	meson_plane->enabled = false;
+-	priv->viu.osd1_enabled = false;
++	osd->enabled = false;
+ 	spin_unlock_irqrestore(&priv->drm->event_lock, flags);
+ }
+ 
+@@ -565,46 +659,46 @@ static const uint64_t format_modifiers_default[] = {
+ 
+ int meson_plane_create(struct meson_drm *priv)
+ {
+-	struct meson_plane *meson_plane;
+-	struct drm_plane *plane;
+-	const uint64_t *format_modifiers = format_modifiers_default;
++	const uint64_t *modifiers = format_modifiers_default;
++	unsigned int index;
+ 	int ret;
+ 
+-	meson_plane = devm_kzalloc(priv->drm->dev, sizeof(*meson_plane),
+-				   GFP_KERNEL);
+-	if (!meson_plane)
+-		return -ENOMEM;
+-
+-	meson_plane->priv = priv;
+-	plane = &meson_plane->base;
+-
+ 	if (meson_vpu_is_compatible(priv, VPU_COMPATIBLE_GXM))
+-		format_modifiers = format_modifiers_afbc_gxm;
++		modifiers = format_modifiers_afbc_gxm;
+ 	else if (meson_vpu_is_compatible(priv, VPU_COMPATIBLE_G12A))
+-		format_modifiers = format_modifiers_afbc_g12a;
+-
+-	ret = drm_universal_plane_init(priv->drm, plane, 0xFF,
+-					&meson_plane_funcs,
+-					supported_drm_formats,
+-					ARRAY_SIZE(supported_drm_formats),
+-					format_modifiers,
+-					DRM_PLANE_TYPE_PRIMARY, "meson_primary_plane");
+-	if (ret) {
+-		devm_kfree(priv->drm->dev, meson_plane);
+-		return ret;
+-	}
+-
+-	drm_plane_helper_add(plane, &meson_plane_helper_funcs);
+-	if (priv->sc2) {
+-		ret = drm_plane_create_alpha_property(plane);
++		modifiers = format_modifiers_afbc_g12a;
++
++	for (index = 0; index < (priv->sc2 ? MESON_MAX_OSDS : 1); index++) {
++		struct meson_plane *meson_plane;
++		struct drm_plane *plane;
++
++		meson_plane = devm_kzalloc(priv->dev, sizeof(*meson_plane), GFP_KERNEL);
++		if (!meson_plane)
++			return -ENOMEM;
++		meson_plane->priv = priv;
++		meson_plane->index = index;
++		plane = &meson_plane->base;
++		ret = drm_universal_plane_init(priv->drm, plane, BIT(0),
++				&meson_plane_funcs, supported_drm_formats,
++				ARRAY_SIZE(supported_drm_formats), modifiers,
++				index ? DRM_PLANE_TYPE_OVERLAY : DRM_PLANE_TYPE_PRIMARY,
++				index ? "meson_osd%u" : "meson_primary_plane", index + 1);
++		if (ret)
++			return ret;
++		drm_plane_helper_add(plane, &meson_plane_helper_funcs);
++		if (priv->sc2) {
++			ret = drm_plane_create_alpha_property(plane);
++			if (ret)
++				return ret;
++		}
++		/* RGB inputs are premultiplied; VD1 < VD2 < OSD1 < OSD2 < OSD3. */
++		ret = drm_plane_create_zpos_immutable_property(plane,
++					priv->sc2 ? index + 2 : 1);
+ 		if (ret)
+ 			return ret;
++		priv->osd_planes[index] = plane;
++		if (!index)
++			priv->primary_plane = plane;
+ 	}
+-
+-	/* For now, OSD Primary plane is always on the front */
+-	drm_plane_create_zpos_immutable_property(plane, priv->sc2 ? 2 : 1);
+-
+-	priv->primary_plane = plane;
+-
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/meson/meson_registers.h b/drivers/gpu/drm/meson/meson_registers.h
+index ea50f2696113..15f709ff847f 100644
+--- a/drivers/gpu/drm/meson/meson_registers.h
++++ b/drivers/gpu/drm/meson/meson_registers.h
+@@ -630,6 +630,14 @@
+ #define VPP_OSD_SCO_V_START_END 0x1dcb
+ #define VPP_OSD_SCALE_COEF_IDX 0x1dcc
+ #define VPP_OSD_SCALE_COEF 0x1dcd
++
++/* SC2 VIU1 OSD2 and OSD3 PPS banks (BSP OSD2_* / OSD34_*). */
++#define OSD2_VSC_PHASE_STEP 0x3d00
++#define OSD2_SCALE_COEF_IDX 0x3d18
++#define OSD2_SCALE_COEF 0x3d19
++#define OSD34_VSC_PHASE_STEP 0x3d20
++#define OSD34_SCALE_COEF_IDX 0x3d1e
++#define OSD34_SCALE_COEF 0x3d1f
+ #define VPP_INT_LINE_NUM 0x1dce
+ 
+ #define VPP_WRAP_OSD1_MATRIX_COEF00_01 0x3d60
+diff --git a/drivers/gpu/drm/meson/meson_viu.c b/drivers/gpu/drm/meson/meson_viu.c
+index 9265366e1ba9..074bddbb3943 100644
+--- a/drivers/gpu/drm/meson/meson_viu.c
++++ b/drivers/gpu/drm/meson/meson_viu.c
+@@ -40,6 +40,51 @@
+  * - OSD1 full scaling to support TV overscan
+  */
+ 
++const struct meson_osd_regs meson_osd_regs[MESON_MAX_OSDS] = {
++	{
++		.ctrl_stat = VIU_OSD1_CTRL_STAT,
++		.ctrl_stat2 = VIU_OSD1_CTRL_STAT2,
++		.blk0_cfg = { VIU_OSD1_BLK0_CFG_W0, VIU_OSD1_BLK0_CFG_W1,
++			      VIU_OSD1_BLK0_CFG_W2, VIU_OSD1_BLK0_CFG_W3,
++			      VIU_OSD1_BLK0_CFG_W4 },
++		.blk1_cfg4 = VIU_OSD1_BLK1_CFG_W4,
++		.blk2_cfg4 = VIU_OSD1_BLK2_CFG_W4,
++		.fifo_ctrl = VIU_OSD1_FIFO_CTRL_STAT,
++		.unpack_ctrl = VIU_OSD1_MALI_UNPACK_CTRL,
++		.sc_base = VPP_OSD_VSC_PHASE_STEP,
++		.coef_idx = VPP_OSD_SCALE_COEF_IDX,
++		.coef = VPP_OSD_SCALE_COEF,
++	},
++	{
++		.ctrl_stat = VIU_OSD2_CTRL_STAT,
++		.ctrl_stat2 = VIU_OSD2_CTRL_STAT2,
++		.blk0_cfg = { VIU_OSD2_BLK0_CFG_W0, VIU_OSD2_BLK0_CFG_W1,
++			      VIU_OSD2_BLK0_CFG_W2, VIU_OSD2_BLK0_CFG_W3,
++			      VIU_OSD2_BLK0_CFG_W4 },
++		.blk1_cfg4 = VIU_OSD2_BLK1_CFG_W4,
++		.blk2_cfg4 = VIU_OSD2_BLK2_CFG_W4,
++		.fifo_ctrl = VIU_OSD2_FIFO_CTRL_STAT,
++		.unpack_ctrl = VIU_OSD2_MALI_UNPACK_CTRL,
++		.sc_base = OSD2_VSC_PHASE_STEP,
++		.coef_idx = OSD2_SCALE_COEF_IDX,
++		.coef = OSD2_SCALE_COEF,
++	},
++	{
++		.ctrl_stat = VIU_OSD3_CTRL_STAT,
++		.ctrl_stat2 = VIU_OSD3_CTRL_STAT2,
++		.blk0_cfg = { VIU_OSD3_BLK0_CFG_W0, VIU_OSD3_BLK0_CFG_W1,
++			      VIU_OSD3_BLK0_CFG_W2, VIU_OSD3_BLK0_CFG_W3,
++			      VIU_OSD3_BLK0_CFG_W4 },
++		.blk1_cfg4 = VIU_OSD3_BLK1_CFG_W4,
++		.blk2_cfg4 = VIU_OSD3_BLK2_CFG_W4,
++		.fifo_ctrl = VIU_OSD3_FIFO_CTRL_STAT,
++		.unpack_ctrl = VIU_OSD3_MALI_UNPACK_CTRL,
++		.sc_base = OSD34_VSC_PHASE_STEP,
++		.coef_idx = OSD34_SCALE_COEF_IDX,
++		.coef = OSD34_SCALE_COEF,
++	},
++};
++
+ /* OSD csc defines */
+ 
+ enum viu_matrix_sel_e {
+@@ -358,45 +403,36 @@ void meson_viu_osd1_reset(struct meson_drm *priv)
+ 	 FIELD_PREP(VIU_OSD1_MALI_AFBCD_R_REORDER,	\
+ 		    VIU_OSD1_MALI_REORDER_B))
+ 
+-void meson_viu_g12a_enable_osd1_afbc(struct meson_drm *priv)
++void meson_viu_osd_afbc_select(struct meson_drm *priv, unsigned int index,
++			      bool enable)
+ {
+-	u32 afbc_order = OSD1_MALI_ORDER_ARGB;
++	const struct meson_osd_regs *regs = &meson_osd_regs[index];
++	u32 order = OSD1_MALI_ORDER_ARGB;
++	u32 mask = VIU_OSD1_MALI_UNPACK_EN |
++		VIU_OSD1_MALI_AFBCD_A_REORDER | VIU_OSD1_MALI_AFBCD_B_REORDER |
++		VIU_OSD1_MALI_AFBCD_G_REORDER | VIU_OSD1_MALI_AFBCD_R_REORDER;
+ 
+-	/* Enable Mali AFBC Unpack */
+-	writel_bits_relaxed(VIU_OSD1_MALI_UNPACK_EN,
+-			    VIU_OSD1_MALI_UNPACK_EN,
+-			    priv->io_base + _REG(VIU_OSD1_MALI_UNPACK_CTRL));
+-
+-	switch (priv->afbcd.format) {
++	switch (priv->viu.osd[index].format) {
+ 	case DRM_FORMAT_XBGR8888:
+ 	case DRM_FORMAT_ABGR8888:
+-		afbc_order = OSD1_MALI_ORDER_ABGR;
++		order = OSD1_MALI_ORDER_ABGR;
+ 		break;
+ 	}
+-
+-	/* Setup RGBA Reordering */
+-	writel_bits_relaxed(VIU_OSD1_MALI_AFBCD_A_REORDER |
+-			    VIU_OSD1_MALI_AFBCD_B_REORDER |
+-			    VIU_OSD1_MALI_AFBCD_G_REORDER |
+-			    VIU_OSD1_MALI_AFBCD_R_REORDER,
+-			    afbc_order,
+-			    priv->io_base + _REG(VIU_OSD1_MALI_UNPACK_CTRL));
+-
+-	/* Select AFBCD path for OSD1 */
+-	writel_bits_relaxed(OSD_PATH_OSD_AXI_SEL_OSD1_AFBCD,
+-			    OSD_PATH_OSD_AXI_SEL_OSD1_AFBCD,
++	writel_bits_relaxed(mask, enable ? VIU_OSD1_MALI_UNPACK_EN | order : 0,
++			    priv->io_base + _REG(regs->unpack_ctrl));
++	/* BSP OSD_PATH_MISC_CTRL[index + 4], shared by all three fetchers. */
++	writel_bits_relaxed(BIT(index + 4), enable ? BIT(index + 4) : 0,
+ 			    priv->io_base + _REG(OSD_PATH_MISC_CTRL));
+ }
+ 
+-void meson_viu_g12a_disable_osd1_afbc(struct meson_drm *priv)
++void meson_viu_g12a_enable_osd1_afbc(struct meson_drm *priv)
+ {
+-	/* Disable AFBCD path for OSD1 */
+-	writel_bits_relaxed(OSD_PATH_OSD_AXI_SEL_OSD1_AFBCD, 0,
+-			    priv->io_base + _REG(OSD_PATH_MISC_CTRL));
++	meson_viu_osd_afbc_select(priv, 0, true);
++}
+ 
+-	/* Disable AFBCD unpack */
+-	writel_bits_relaxed(VIU_OSD1_MALI_UNPACK_EN, 0,
+-			    priv->io_base + _REG(VIU_OSD1_MALI_UNPACK_CTRL));
++void meson_viu_g12a_disable_osd1_afbc(struct meson_drm *priv)
++{
++	meson_viu_osd_afbc_select(priv, 0, false);
+ }
+ 
+ void meson_viu_gxm_enable_osd1_afbc(struct meson_drm *priv)
+@@ -432,6 +468,60 @@ void meson_viu_video_afbc_select(struct meson_drm *priv,
+ 	}
+ }
+ 
++static void meson_viu_sc2_init_osds(struct meson_drm *priv, u32 fifo)
++{
++	/* Same four-tap B-spline filter as the primary PPS. */
++	static const u32 coefs[] = {
++		0x15561500, 0x14561600, 0x13561700, 0x12561800,
++		0x11551a00, 0x11541b00, 0x10541c00, 0x0f541d00,
++		0x0f531e00, 0x0e531f00, 0x0d522100, 0x0c522200,
++		0x0b522300, 0x0b512400, 0x0a502600, 0x0a4f2700,
++		0x094e2900, 0x084e2a00, 0x084d2b00, 0x074c2c01,
++		0x074b2d01, 0x064a2f01, 0x06493001, 0x05483201,
++		0x05473301, 0x05463401, 0x04453601, 0x04433702,
++		0x04423802, 0x03413a02, 0x03403b02, 0x033f3c02,
++		0x033d3d03,
++	};
++	unsigned int index, horizontal, i;
++
++	if (!priv->viu.osd1_bypass_initialized) {
++		priv->viu.osd1_bypass_alpha_div = readl_relaxed(priv->io_base +
++				_REG(meson_osd_regs[0].unpack_ctrl)) & BIT(28);
++		priv->viu.osd1_bypass_blend_ctrl1 = readl_relaxed(priv->io_base +
++				_REG(VIU_OSD_BLEND_CTRL1));
++		priv->viu.osd1_bypass_initialized = true;
++	}
++
++	for (index = 0; index < MESON_MAX_OSDS; index++) {
++		const struct meson_osd_regs *regs = &meson_osd_regs[index];
++
++		writel_bits_relaxed(OSD_ENABLE | OSD_BLK0_ENABLE, 0,
++				    priv->io_base + _REG(regs->ctrl_stat));
++		writel_relaxed(fifo, priv->io_base + _REG(regs->fifo_ctrl));
++		writel_bits_relaxed(0xff << OSD_REPLACE_SHIFT,
++				    0xff << OSD_REPLACE_SHIFT,
++				    priv->io_base + _REG(regs->ctrl_stat2));
++		meson_viu_osd_afbc_select(priv, index, false);
++		priv->viu.osd[index].enabled = false;
++		priv->viu.osd[index].commit = false;
++		priv->viu.osd[index].interlace = false;
++		if (!index)
++			continue;
++		writel_relaxed(0, priv->io_base + _REG(index == 1 ?
++				VIU_OSD2_DIMM_CTRL : VIU_OSD3_DIMM_CTRL));
++		writel_relaxed(0, priv->io_base + _REG(regs->sc_base + 8));
++		writel_relaxed(0, priv->io_base + _REG(regs->sc_base + 2));
++		writel_relaxed(0, priv->io_base + _REG(regs->sc_base + 5));
++		for (horizontal = 0; horizontal < 2; horizontal++) {
++			writel_relaxed(horizontal << 8,
++				       priv->io_base + _REG(regs->coef_idx));
++			for (i = 0; i < ARRAY_SIZE(coefs); i++)
++				writel_relaxed(coefs[i], priv->io_base + _REG(regs->coef));
++		}
++	}
++	priv->afbcd.active_mask = 0;
++}
++
+ void meson_viu_init(struct meson_drm *priv)
+ {
+ 	uint32_t reg;
+@@ -488,6 +578,8 @@ void meson_viu_init(struct meson_drm *priv)
+ 	writel_bits_relaxed(0xff << OSD_REPLACE_SHIFT,
+ 			    0xff << OSD_REPLACE_SHIFT,
+ 			    priv->io_base + _REG(VIU_OSD2_CTRL_STAT2));
++	if (priv->sc2)
++		meson_viu_sc2_init_osds(priv, reg);
+ 
+ 	/* Disable VD1 AFBC */
+ 	/* di_mif0_en=0 mif0_to_vpp_en=0 di_mad_en=0 and afbc vd1 set=0*/
+@@ -546,7 +638,7 @@ void meson_viu_init(struct meson_drm *priv)
+ 	if (meson_vpu_is_compatible(priv, VPU_COMPATIBLE_GXM))
+ 		meson_viu_gxm_disable_osd1_afbc(priv);
+ 
+-	priv->viu.osd1_enabled = false;
+-	priv->viu.osd1_commit = false;
+-	priv->viu.osd1_interlace = false;
++	priv->viu.osd[0].enabled = false;
++	priv->viu.osd[0].commit = false;
++	priv->viu.osd[0].interlace = false;
+ }
+diff --git a/drivers/gpu/drm/meson/meson_viu.h b/drivers/gpu/drm/meson/meson_viu.h
+index 2305ea2a19f5..570939f163b8 100644
+--- a/drivers/gpu/drm/meson/meson_viu.h
++++ b/drivers/gpu/drm/meson/meson_viu.h
+@@ -134,6 +134,24 @@ void meson_viu_video_afbc_select(struct meson_drm *priv,
+ #define OSD_REPLACE_SHIFT	6
+ #define OSD_PENDING_STAT_CLEAN	BIT(1)
+ 
++struct meson_osd_regs {
++	u32 ctrl_stat;
++	u32 ctrl_stat2;
++	u32 blk0_cfg[5];
++	u32 blk1_cfg4;
++	u32 blk2_cfg4;
++	u32 fifo_ctrl;
++	u32 unpack_ctrl;
++	/* PPS offsets 0..11 match the VPP_OSD_VSC_PHASE_STEP bank. */
++	u32 sc_base;
++	u32 coef_idx;
++	u32 coef;
++};
++
++extern const struct meson_osd_regs meson_osd_regs[MESON_MAX_OSDS];
++void meson_viu_osd_afbc_select(struct meson_drm *priv, unsigned int index,
++			      bool enable);
++
+ void meson_viu_osd1_reset(struct meson_drm *priv);
+ void meson_viu_g12a_enable_osd1_afbc(struct meson_drm *priv);
+ void meson_viu_g12a_disable_osd1_afbc(struct meson_drm *priv);
+-- 
+2.47.3
+

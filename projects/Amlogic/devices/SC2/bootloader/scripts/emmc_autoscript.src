@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: GPL-2.0
+# RAM-only internal boot; caller must set sc2_emmc_dev to device:partition.
+# Use the same staging buffers and low-memory kernel window as removable boot.
+setenv sc2_kernel_addr 0x12000000
+setenv sc2_fdt_addr 0x20000000
+setenv sc2_env_addr 0x21000000
+setenv sc2_env_file uEnv.ini
+if test "${sc2_live}" = "1"; then setenv sc2_env_file uEnv.live.ini; fi
+if test -n "${sc2_emmc_dev}" && ext4load mmc ${sc2_emmc_dev} ${sc2_env_addr} ${sc2_env_file}; then
+  if env import -t ${sc2_env_addr} ${filesize} bootargs; then
+    if ext4load mmc ${sc2_emmc_dev} ${sc2_kernel_addr} KERNEL; then
+      if itest ${filesize} -lt 0x03000000; then
+        if ext4load mmc ${sc2_emmc_dev} ${sc2_fdt_addr} amlogic/meson-sc2-hk1-rbox-x4.dtb; then
+          fdt addr ${sc2_fdt_addr}
+          fdt resize 0x10000
+          setenv fdt_high ffffffffffffffff
+          bootm ${sc2_kernel_addr} - ${sc2_fdt_addr}
+        fi
+      else
+        echo SC2 kernel exceeds low-memory load window
+      fi
+    fi
+  fi
+fi
+echo SC2 internal boot failed - use external recovery

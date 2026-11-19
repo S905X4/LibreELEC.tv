@@ -1,0 +1,49 @@
+Subject: [PATCH] media: meson: handle H264 stream-mode data requests
+
+SC2 H264 MULTI runs in stream mode over a continuous VIFIFO, but gives
+firmware a finite input bit budget on each run. The producer may advance
+WP before that budget is exhausted. Firmware then requests more data with
+status 0x12 even though another committed packet is already available.
+
+A powered live-TV capture showed mode 2, a 3232-byte job with zero bits
+remaining, no current picture and no decoder error, while the committed
+end had already advanced to byte 4485. Treating this as an unknown fatal
+mailbox aborted both vb2 queues.
+
+Match the BSP stream-mode protocol: DATA_REQUEST enters the same empty
+handling as SEARCH_BUFEMPTY and DECODE_BUFEMPTY. This is not the disabled
+frame-mode GET_DATA handoff between noncontiguous chunks. Preserve the
+last completed-picture checkpoint and token ledger, release only an
+unfinished picture's own resources, and restart only when new input has
+been committed. Never turn the request into picture completion.
+
+At drain, allow a terminal data request only with the existing complete
+picture/field and empty-token checks. Incomplete pictures or unmatched
+fields still fail rather than manufacturing output or successful EOS.
+
+Requires the native H264 MULTI and drain integration through 0070/0071.
+--- a/drivers/staging/media/meson/vdec/codec_h264.c
++++ b/drivers/staging/media/meson/vdec/codec_h264.c
+@@ -5085,4 +5085,10 @@
+         break;
+     }
++    /* Stream mode can exhaust its bit budget while the producer advances WP.
++     * DATA_REQUEST is starvation, not a completed picture or a frame-based
++     * chunk handoff. Keep the last completed input checkpoint and all tokens;
++     * replay unfinished input only after more bytes have been committed.
++     */
++    case H264_DATA_REQUEST:
+     case H264_SEARCH_BUFEMPTY:
+     case H264_DECODE_BUFEMPTY: {
+@@ -5222,7 +5228,9 @@
+-    /* SEARCH_BUFEMPTY plus the completed-picture ledger is real drain.
++    /* Search starvation plus the completed-picture ledger is real drain.
+      * No timeout, cached ANC surface, or missing field becomes a picture.
+      */
+-    if (m->incomplete || m->empty_status != H264_SEARCH_BUFEMPTY) {
++    if (m->incomplete ||
++        (m->empty_status != H264_SEARCH_BUFEMPTY &&
++         m->empty_status != H264_DATA_REQUEST)) {
+         ret = -EILSEQ;
+         goto unlock;
+     }

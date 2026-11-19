@@ -1,0 +1,103 @@
+From bda93f13ef590787d6dc473ad96d87f0902ad027 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Wed, 21 Oct 2026 01:06:35 +0800
+Subject: [PATCH] media: rc: Apply the active HK1 Android key semantics
+
+The vendor map_0 low words are input codes interpreted by the active
+Vendor_0001_Product_0001.kl, not final Linux desktop/media meanings.
+Translate all mapped commands using that layout and omit ten unmapped
+entries rather than emitting arbitrary modifier, letter or clipboard keys.
+
+Preserve NEC address 0x04 and its command values. The resulting 41 keys
+include BACK, homepage, volume, transport, guide and audio/subtitle keys.
+
+Series validation: execute the unmodified registered rc-map and compare
+all entries against stock DT plus the active Android layout. No handset
+reception or Kodi navigation was exercised.
+
+Change-Id: Id219d2420043037f99542f5c4670d9e9a5b2540a
+---
+ drivers/media/rc/keymaps/rc-hk1-rbox-x4.c | 51 ++++++++++-------------
+ 1 file changed, 21 insertions(+), 30 deletions(-)
+
+diff --git a/drivers/media/rc/keymaps/rc-hk1-rbox-x4.c b/drivers/media/rc/keymaps/rc-hk1-rbox-x4.c
+index 1156bbf4f6c860d14e032a6a3f9e39c5ad7268f8..99c6f7cdd942da1b90839f242c8ba69c7dc1a51a 100644
+--- a/drivers/media/rc/keymaps/rc-hk1-rbox-x4.c
++++ b/drivers/media/rc/keymaps/rc-hk1-rbox-x4.c
+@@ -1,7 +1,8 @@
+ // SPDX-License-Identifier: GPL-2.0+
+ /*
+- * HK1 RBOX X4 stock NEC keytable (sc2_ah212_4g, customcode 0xfb04).
+- * Vendor words store command in bits 23:16 and Linux keycode in bits 15:0.
++ * HK1 RBOX X4 NEC map_0 (sc2_ah212_4g, customcode 0xfb04).
++ * Apply the active Vendor_0001_Product_0001.kl semantics to the vendor
++ * keycodes; omit entries that this Android layout leaves unmapped.
+  * NEC address 0x04 and inverse 0xfb become rc-core scancodes 0x04xx.
+  */
+ 
+@@ -19,47 +20,37 @@ static struct rc_map_table hk1_rbox_x4[] = {
+ 	{ 0x040b, KEY_7 },
+ 	{ 0x0408, KEY_8 },
+ 	{ 0x0409, KEY_9 },
+-	{ 0x045c, KEY_RIGHTCTRL },
+-	{ 0x0451, KEY_F3 },
+-	{ 0x0450, KEY_F4 },
+-	{ 0x0440, KEY_F5 },
++	{ 0x0450, KEY_EPG },
+ 	{ 0x044d, KEY_F6 },
+ 	{ 0x0443, KEY_F7 },
+ 	{ 0x0417, KEY_F8 },
+ 	{ 0x0400, KEY_F9 },
+ 	{ 0x0401, KEY_F10 },
+-	{ 0x0416, KEY_F11 },
++	{ 0x0416, KEY_RED },
+ 	{ 0x0449, KEY_BACKSPACE },
+-	{ 0x0406, KEY_PROPS },
+-	{ 0x0414, KEY_UNDO },
++	{ 0x0406, KEY_ZOOMIN },
++	{ 0x0414, KEY_ZOOMOUT },
+ 	{ 0x0444, KEY_UP },
+ 	{ 0x041d, KEY_DOWN },
+ 	{ 0x041c, KEY_LEFT },
+ 	{ 0x0448, KEY_RIGHT },
+-	{ 0x0453, KEY_LEFTMETA },
+-	{ 0x0445, KEY_PAGEUP },
+-	{ 0x0419, KEY_PAGEDOWN },
+-	{ 0x0452, KEY_PAUSE },
+-	{ 0x0405, KEY_HANGEUL },
+-	{ 0x0459, KEY_HANJA },
+-	{ 0x041b, KEY_SCALE },
+-	{ 0x0404, KEY_KPCOMMA },
++	{ 0x0453, KEY_MENU },
++	{ 0x0445, KEY_VOLUMEUP },
++	{ 0x0419, KEY_VOLUMEDOWN },
++	{ 0x0452, KEY_PLAYPAUSE },
++	{ 0x0405, KEY_PREVIOUSSONG },
++	{ 0x0459, KEY_NEXTSONG },
++	{ 0x041b, KEY_FASTFORWARD },
++	{ 0x0404, KEY_REWIND },
+ 	{ 0x041a, KEY_POWER },
+-	{ 0x040a, KEY_TAB },
++	{ 0x040a, KEY_BACK },
+ 	{ 0x040e, KEY_MUTE },
+-	{ 0x041f, KEY_HOME },
+-	{ 0x041e, KEY_FRONT },
+-	{ 0x0407, KEY_COPY },
+-	{ 0x0412, KEY_OPEN },
+-	{ 0x0454, KEY_PASTE },
+-	{ 0x0402, KEY_FIND },
+-	{ 0x044f, KEY_A },
+-	{ 0x0442, KEY_B },
+-	{ 0x045d, KEY_C },
+-	{ 0x044c, KEY_D },
+-	{ 0x0458, KEY_CUT },
++	{ 0x041f, KEY_HOMEPAGE },
++	{ 0x0407, KEY_INFO },
++	{ 0x0454, KEY_SUBTITLE },
++	{ 0x0402, KEY_AUDIO },
+ 	{ 0x0415, KEY_SEARCH },
+-	{ 0x0455, KEY_CALC },
++	{ 0x0455, KEY_F10 },
+ };
+ 
+ static struct rc_map_list hk1_rbox_x4_map = {

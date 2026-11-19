@@ -1,0 +1,10 @@
+# BCM4339 SDIO firmware from linux-firmware, covered by LICENCE.cypress.
+brcm/brcmfmac4339-sdio.bin
+# Board lookup: brcm/brcmfmac4339-sdio.hk1,rbox-x4.txt. No calibrated NVRAM
+# with established redistribution rights is available; do not use another board's
+# calibration or import the investigation-only Android nvram_ap6335.txt.
+# No external CLM is selected: the stock external path was explicitly ignored.
+# Bluetooth ROM 003.001.009/0x6109 requests BCM4335C0.hcd, supplied with its
+# Broadcom license by bcm4335c0-firmware; no Android or global BCM.hcd alias.
+# USB Ethernet fallback firmware (upstream r8152 module).
+rtl_nic/rtl8153a-3.fw

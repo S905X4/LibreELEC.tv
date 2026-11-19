@@ -1,0 +1,157 @@
+From: SC2 bring-up <sc2@localhost>
+Subject: [PATCH] drm/meson: keep SC2 OSD source geometry and AFBC replay coherent
+
+Keep the OSD block output and upstream OSD blender in source coordinates
+on SC2. Only the shared scaler output and downstream VPP use interlaced
+field coordinates. Match the vendor progressive-to-field phase, receive
+and repeat settings, including the G12B+ vertical-control bit.
+
+Retain hardware-vsync RDMA AFBC starts rather than the rejected CPU-only
+transport. SC2 does not require G12A's unconditional AFBC reset workaround:
+reset synchronously on path transitions, and rebuild only the configuration
+and start descriptors for subsequent replay. Do not replay destructive
+resets each field. Other SoCs retain their reset/programming sequence.
+
+This fixes source-space and reset-replay invariants; it does not establish
+that the recorded alpha flash originates in AFBC, nor alter flip retirement
+without edge-correlated RDMA completion evidence.
+
+--- a/drivers/gpu/drm/meson/meson_crtc.c
++++ b/drivers/gpu/drm/meson/meson_crtc.c
+@@ -410,7 +410,9 @@
+ 			meson_crtc->enable_osd1(priv);
+ 
+ 		if (priv->viu.osd1_afbcd) {
+-			priv->afbcd.ops->reset(priv);
++			/* SC2 does not need the G12A per-frame reset workaround. */
++			if (!priv->sc2 || !meson_crtc->osd1_afbcd)
++				priv->afbcd.ops->reset(priv);
+ 			priv->afbcd.ops->setup(priv);
+ 			priv->afbcd.ops->enable(priv);
+ 		}
+--- a/drivers/gpu/drm/meson/meson_osd_afbcd.c
++++ b/drivers/gpu/drm/meson/meson_osd_afbcd.c
+@@ -279,10 +279,18 @@
+ {
+ 	meson_rdma_reset(priv);
+ 
+-	meson_rdma_writel_sync(priv, VIU_SW_RESET_G12A_AFBC_ARB |
+-			       VIU_SW_RESET_G12A_OSD1_AFBCD,
+-			       VIU_SW_RESET);
+-	meson_rdma_writel_sync(priv, 0, VIU_SW_RESET);
++	/* SC2 does not need G12A's reset on every RDMA replay. */
++	if (priv->sc2) {
++		writel(VIU_SW_RESET_G12A_AFBC_ARB |
++		       VIU_SW_RESET_G12A_OSD1_AFBCD,
++		       priv->io_base + _REG(VIU_SW_RESET));
++		writel(0, priv->io_base + _REG(VIU_SW_RESET));
++	} else {
++		meson_rdma_writel_sync(priv, VIU_SW_RESET_G12A_AFBC_ARB |
++				       VIU_SW_RESET_G12A_OSD1_AFBCD,
++				       VIU_SW_RESET);
++		meson_rdma_writel_sync(priv, 0, VIU_SW_RESET);
++	}
+ 
+ 	return 0;
+ }
+@@ -342,6 +350,10 @@
+ {
+ 	u32 format = meson_g12a_afbcd_pixel_fmt(priv->afbcd.modifier,
+ 						priv->afbcd.format);
++
++	/* Disarm the old vsync table before building the next one. */
++	if (priv->sc2)
++		meson_rdma_reset(priv);
+ 
+ 	if (priv->afbcd.modifier & AFBC_FORMAT_MOD_YTR)
+ 		format |= VPU_MAFBC_YUV_TRANSFORM;
+--- a/drivers/gpu/drm/meson/meson_plane.c
++++ b/drivers/gpu/drm/meson/meson_plane.c
+@@ -150,6 +150,8 @@
+ 	int hf_bank_len;
+ 	int vf_bank_len;
+ 	u8 canvas_id_osd1;
++	bool sc2_interlace = priv->sc2 &&
++		(new_state->crtc->mode.flags & DRM_MODE_FLAG_INTERLACE);
+ 
+ 	/*
+ 	 * Update Coordinates
+@@ -287,10 +289,22 @@
+ 	else
+ 		bot_ini_phase = 0;
+ 
++	if (sc2_interlace) {
++		/* Progressive OSD input to top/bottom fields, as on G12B+. */
++		vsc_bot_rcv_num = vf_bank_len;
++		vsc_bot_rpt_p0_num = vsc_ini_rpt_p0_num;
++		bot_ini_phase = vf_phase_step >> 5;
++		/* Upscaling-only checks limit the field scaler ratio to 2:1. */
++		if (bot_ini_phase >= BIT(16)) {
++			vsc_bot_rpt_p0_num--;
++			bot_ini_phase -= BIT(16);
++		}
++	}
++
+ 	vf_phase_step = (vf_phase_step << 4);
+ 
+ 	/* In interlaced mode, scaler is always active */
+-	if (src_h != dst_h || src_w != dst_w) {
++	if (sc2_interlace || src_h != dst_h || src_w != dst_w) {
+ 		priv->viu.osd_sc_i_wh_m1 = SCI_WH_M1_W(src_w - 1) |
+ 					   SCI_WH_M1_H(src_h - 1);
+ 		priv->viu.osd_sc_o_h_start_end = SCO_HV_START(dest.x1) |
+@@ -307,7 +321,7 @@
+ 	}
+ 
+ 	/* In interlaced mode, vertical scaler is always active */
+-	if (src_h != dst_h) {
++	if (sc2_interlace || src_h != dst_h) {
+ 		priv->viu.osd_sc_v_ctrl0 =
+ 					VSC_BANK_LEN(vf_bank_len) |
+ 					VSC_TOP_INI_RCV_NUM(vsc_ini_rcv_num) |
+@@ -320,8 +334,16 @@
+ 					VSC_BOT_RPT_L0_NUM(vsc_bot_rpt_p0_num) |
+ 					VSC_PROG_INTERLACE;
+ 
++		if (sc2_interlace)
++			/* G12B+ vendor setting for progressive-to-field scaling. */
++			priv->viu.osd_sc_v_ctrl0 |= BIT(25);
++
+ 		priv->viu.osd_sc_v_phase_step = SC_PHASE_STEP(vf_phase_step);
+ 		priv->viu.osd_sc_v_ini_phase = VSC_INI_PHASE_BOT(bot_ini_phase);
++		if (sc2_interlace && src_h == dst_h * 2)
++			priv->viu.osd_sc_v_ini_phase |=
++				VSC_INI_PHASE_TOP(0x8000) |
++				VSC_INI_PHASE_BOT(0x8000);
+ 	} else {
+ 		priv->viu.osd_sc_v_ctrl0 = 0;
+ 		priv->viu.osd_sc_v_phase_step = 0;
+@@ -357,11 +379,28 @@
+ 	priv->viu.osd1_blk0_cfg[3] = ((dest.x2 - 1) << 16) | dest.x1;
+ 	priv->viu.osd1_blk0_cfg[4] = ((dest.y2 - 1) << 16) | dest.y1;
+ 
++	if (priv->sc2) {
++		/*
++		 * OSD memory scanout and the OSD blender precede the shared
++		 * scaler. They consume a progressive frame, not a 540-line
++		 * field; only the scaler output and VPP use field coordinates.
++		 */
++		priv->viu.osd1_blk0_cfg[3] = (src_w - 1) << 16;
++		priv->viu.osd1_blk0_cfg[4] = (src_h - 1) << 16;
++	}
++
+ 	if (meson_vpu_is_compatible(priv, VPU_COMPATIBLE_G12A)) {
+ 		priv->viu.osd_blend_din0_scope_h = ((dest.x2 - 1) << 16) | dest.x1;
+ 		priv->viu.osd_blend_din0_scope_v = ((dest.y2 - 1) << 16) | dest.y1;
+ 		priv->viu.osb_blend0_size = dst_h << 16 | dst_w;
+ 		priv->viu.osb_blend1_size = dst_h << 16 | dst_w;
++
++		if (priv->sc2) {
++			priv->viu.osd_blend_din0_scope_h = (src_w - 1) << 16;
++			priv->viu.osd_blend_din0_scope_v = (src_h - 1) << 16;
++			priv->viu.osb_blend0_size = src_h << 16 | src_w;
++			priv->viu.osb_blend1_size = src_h << 16 | src_w;
++		}
+ 	}
+ 
+ 	/* Update Canvas with buffer address */

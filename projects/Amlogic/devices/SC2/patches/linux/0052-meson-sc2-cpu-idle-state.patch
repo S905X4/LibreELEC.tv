@@ -1,0 +1,85 @@
+From b61e3147c45779a17e9f6d352cb261d902dbc3bc Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Wed, 21 Oct 2026 04:41:33 +0800
+Subject: [PATCH] arm64: dts: amlogic: Describe the SC2 CPU powerdown idle
+ state
+
+The native SC2 CPU nodes lack idle-state references, so PSCI cpuidle
+does not register despite the correct production configuration.
+Describe CPU_SLEEP_0 using the exact stock and CE SC2 PSCI parameter,
+timer-stop flag and entry/exit/residency timings, with the native
+entry-method binding.
+
+Do not copy the synthetic stock system-sleep state or guess a Meson6
+timer compatible. The hrtimer broadcast fallback keeps its required
+owner out of timer-stopping idle; simultaneous all-core power-down
+and system suspend remain unproven.
+
+Native board DTB compilation and complete schema validation pass.
+Actual PSCI state entry and interrupt wake require a controlled boot.
+
+Change-Id: I5a9567982c942c1f9cee422c7addc37705bf600e
+---
+ arch/arm64/boot/dts/amlogic/meson-sc2.dtsi | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi b/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi
+index db5a5f910234..571a01a36bde 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi
++++ b/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi
+@@ -33,6 +33,7 @@ cpu0: cpu@0 {
+ 			compatible = "arm,cortex-a55";
+ 			reg = <0 0>;
+ 			enable-method = "psci";
++			cpu-idle-states = <&cpu_sleep_0>;
+ 			next-level-cache = <&l2>;
+ 		};
+ 		cpu1: cpu@1 {
+@@ -40,6 +41,7 @@ cpu1: cpu@1 {
+ 			compatible = "arm,cortex-a55";
+ 			reg = <0 1>;
+ 			enable-method = "psci";
++			cpu-idle-states = <&cpu_sleep_0>;
+ 			next-level-cache = <&l2>;
+ 		};
+ 		cpu2: cpu@2 {
+@@ -47,6 +49,7 @@ cpu2: cpu@2 {
+ 			compatible = "arm,cortex-a55";
+ 			reg = <0 2>;
+ 			enable-method = "psci";
++			cpu-idle-states = <&cpu_sleep_0>;
+ 			next-level-cache = <&l2>;
+ 		};
+ 		cpu3: cpu@3 {
+@@ -54,6 +57,7 @@ cpu3: cpu@3 {
+ 			compatible = "arm,cortex-a55";
+ 			reg = <0 3>;
+ 			enable-method = "psci";
++			cpu-idle-states = <&cpu_sleep_0>;
+ 			next-level-cache = <&l2>;
+ 		};
+ 		l2: l2-cache {
+@@ -61,6 +65,20 @@ l2: l2-cache {
+ 			cache-level = <2>;
+ 			cache-unified;
+ 		};
++
++		idle-states {
++			entry-method = "psci";
++
++			/* CPU power-down state declared by the stock SC2 device tree. */
++			cpu_sleep_0: cpu-sleep-0 {
++				compatible = "arm,idle-state";
++				arm,psci-suspend-param = <0x10000>;
++				local-timer-stop;
++				entry-latency-us = <4000>;
++				exit-latency-us = <5000>;
++				min-residency-us = <10000>;
++			};
++		};
+ 	};
+ 
+ 	timer {
+-- 
+2.47.3
+

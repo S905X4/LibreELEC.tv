@@ -1,0 +1,77 @@
+From: HK1 SC2 maintainers
+Subject: [PATCH] VideoPlayer: propagate unusable PRIME format as fatal
+
+Do not repeatedly flush a codec after format negotiation has no usable output.
+A terminal format error reaches the existing parent abort path; ordinary decode
+errors, EAGAIN, genuine EOF and successful frame ownership retain their contract.
+
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
+@@ -303,11 +303,12 @@
+ enum AVPixelFormat CDVDVideoCodecDRMPRIME::GetFormat(struct AVCodecContext* avctx,
+                                                      const enum AVPixelFormat* fmt)
+ {
++  auto* ctx = static_cast<CDVDVideoCodecDRMPRIME*>(avctx->opaque);
+   for (int n = 0; fmt[n] != AV_PIX_FMT_NONE; n++)
+   {
+     if (IsSupportedHwFormat(fmt[n]) || IsSupportedSwFormat(fmt[n]))
+     {
+-      CDVDVideoCodecDRMPRIME* ctx = static_cast<CDVDVideoCodecDRMPRIME*>(avctx->opaque);
++      ctx->m_formatError = false;
+       ctx->UpdateProcessInfo(avctx, fmt[n]);
+       return fmt[n];
+     }
+@@ -320,6 +321,8 @@
+   }
+   CLog::Log(LOGERROR, "CDVDVideoCodecDRMPRIME::{} - no supported pixel formats: {}", __FUNCTION__,
+             StringUtils::Join(formats, ", "));
++  // Flushing cannot make an unsupported/failed format negotiation usable.
++  ctx->m_formatError = true;
+ 
+   return AV_PIX_FMT_NONE;
+ }
+@@ -388,6 +391,7 @@
+   m_pCodecContext = avcodec_alloc_context3(pCodec);
+   if (!m_pCodecContext)
+     return false;
++  m_formatError = false;
+ 
+   m_hints = hints;
+ 
+@@ -850,6 +854,9 @@
+ 
+ CDVDVideoCodec::VCReturn CDVDVideoCodecDRMPRIME::GetPicture(VideoPicture* pVideoPicture)
+ {
++  if (m_formatError)
++    return VC_FATAL;
++
+   if (m_decoderError)
+   {
+     Reset();
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h
+@@ -49,6 +49,7 @@
+   AVFrame* m_pFrame = nullptr;
+   bool m_drainSubmitted = false;
+   bool m_decoderError = false;
++  bool m_formatError = false;
+   struct AVFilterGraph* m_deinterlaceGraph = nullptr;
+   struct AVFilterContext* m_deinterlaceSource = nullptr;
+   struct AVFilterContext* m_deinterlaceSink = nullptr;
+--- a/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp
++++ b/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp
+@@ -648,6 +648,14 @@
+     return false;
+   }
+ 
++  if (decoderState == CDVDVideoCodec::VC_FATAL)
++  {
++    CLog::Log(LOGERROR, "CVideoPlayerVideo - unrecoverable video decoder failure");
++    m_messageParent.Put(std::make_shared<CDVDMsg>(CDVDMsg::PLAYER_ABORT));
++    m_bStop = true;
++    return false;
++  }
++
+   // if decoder had an error, tell it to reset to avoid more problems
+   if (decoderState == CDVDVideoCodec::VC_ERROR)
+   {

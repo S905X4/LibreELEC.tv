@@ -1,0 +1,21 @@
+[Unit]
+Description=SC2 verified original video firmware initialization (not decode acceptance)
+After=local-fs.target systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+Before=kodi.service
+# Owner supplies these original assets; absence is a systemd condition skip,
+# never a successful preload/decode and never a boot-complete notification.
+ConditionPathExists=/storage/.config/sc2-optee-preload/ta/526fc4fc-7ee6-4a12-96e3-83da9565bce8.ta
+ConditionPathExists=/storage/.config/sc2-optee-preload/video_ucode.bin
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/sc2-optee-preload --boot-complete /sys/bus/platform/devices/firmware:secure-monitor/boot_complete /dev/teepriv0 /storage/.config/sc2-optee-preload/ta /storage/.config/sc2-optee-preload/video_ucode.bin
+TimeoutStartSec=45s
+TimeoutStopSec=12s
+KillMode=control-group
+UMask=0077
+
+[Install]
+WantedBy=kodi.service

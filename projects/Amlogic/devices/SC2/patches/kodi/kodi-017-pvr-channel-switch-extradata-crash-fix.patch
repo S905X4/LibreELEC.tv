@@ -1,0 +1,55 @@
+From: hiper25 <whydonit@gmail.com>
+Date: Sun, 8 Nov 2026 05:00:00 +0000
+Subject: [PATCH] VideoPlayer: Fix PVR channel switch crash and allow Annex-B in-band parameter sets
+
+1. In VideoPlayerVideo::OpenStream, do not reject HEVC and H.264 streams
+   when container extradata is absent if codec_tag is not an MP4 container
+   requiring out-of-band extradata (e.g. avc1/avc2, hvc1/hev1). In live PVR
+   HTSP and DVB broadcast streams, SPS/PPS/VPS are delivered in-band via Annex-B
+   NAL units. Rejecting OpenStream causes the video stream to be disabled,
+   tearing down the codec mid-channel switch.
+
+2. In DVDDemuxClient::ParsePacket, copy the extracted parameter data into
+   the parser context with FFmpeg input padding. Do not open, submit to,
+   and close a full decoder solely to transport parser extradata. This
+   patch preserves the separately retained live-source behavior; its
+   presence is not proof of end-to-end channel-switch acceptance.
+
+--- a/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp
++++ b/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp
+@@ -111,10 +111,8 @@ bool CVideoPlayerVideo::OpenStream(CDVDStreamInfo hint)
+     // clang-format off
+     if (hint.codec == AV_CODEC_ID_NONE ||
+         hint.codec == AV_CODEC_ID_MPEG1VIDEO ||
+-        hint.codec == AV_CODEC_ID_MPEG2VIDEO ||
+-        (hint.codec == AV_CODEC_ID_H264 && (hint.codec_tag == 0 || hint.codec_tag == MKTAG('a','v','c','1') || hint.codec_tag == MKTAG('a','v','c','2'))) ||
+-        hint.codec == AV_CODEC_ID_HEVC ||
+-        hint.codec == AV_CODEC_ID_MPEG4 ||
++        (hint.codec == AV_CODEC_ID_H264 && (hint.codec_tag == MKTAG('a','v','c','1') || hint.codec_tag == MKTAG('a','v','c','2'))) ||
++        (hint.codec == AV_CODEC_ID_HEVC && (hint.codec_tag == MKTAG('h','v','c','1') || hint.codec_tag == MKTAG('h','e','v','1'))) ||
+         hint.codec == AV_CODEC_ID_WMV3 ||
+         hint.codec == AV_CODEC_ID_VC1 ||
+         hint.codec == AV_CODEC_ID_AV1)
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxClient.cpp
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxClient.cpp
+@@ -187,10 +187,16 @@ bool CDVDDemuxClient::ParsePacket(DemuxPacket* pkt)
+       CLog::Log(LOGDEBUG, "CDVDDemuxClient::ParsePacket - split extradata");
+ 
+-      // Allow ffmpeg to transport codec information to stream->m_context
+-      if (!avcodec_open2(stream->m_context, stream->m_context->codec, nullptr))
++      // Update extradata in stream->m_context for parser
++      av_freep(&stream->m_context->extradata);
++      stream->m_context->extradata_size = 0;
++      if (st->extraData)
+       {
+-        avcodec_send_packet(stream->m_context, avpkt);
+-        avcodec_close(stream->m_context);
++        stream->m_context->extradata = (uint8_t*)av_mallocz(st->extraData.GetSize() + AV_INPUT_BUFFER_PADDING_SIZE);
++        if (stream->m_context->extradata)
++        {
++          memcpy(stream->m_context->extradata, st->extraData.GetData(), st->extraData.GetSize());
++          stream->m_context->extradata_size = st->extraData.GetSize();
++        }
+       }
+     }
+     av_packet_free(&avpkt);

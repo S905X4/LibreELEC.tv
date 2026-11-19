@@ -1,0 +1,103 @@
+Subject: [PATCH] v4l2m2m: drain MPEG geometry boundaries before updating frames
+
+Keep immutable SC2 MPEG capture backings but honor a real LAST/START
+boundary before replacing frame dimensions. A SOURCE_CHANGE event alone
+does not retire already queued frames using the old geometry.
+
+--- a/libavcodec/v4l2_context.c
++++ b/libavcodec/v4l2_context.c
+@@ -383,6 +383,17 @@
+             s->capture.height = ff_v4l2_get_format_height(&cap_fmt);
+             s->capture.sample_aspect_ratio = v4l2_get_sar(&s->capture);
+             ret = ff_set_dimensions(avctx, s->capture.width, s->capture.height);
++            if (ret < 0)
++                return ret;
++            if (s->quirks & FF_V4L2_QUIRK_CAPTURE_BOUNDARY) {
++                struct v4l2_decoder_cmd cmd = { .cmd = V4L2_DEC_CMD_START };
++                if (!s->capture.flag_last || !s->source_change_pending)
++                    return AVERROR_INVALIDDATA;
++                if (ioctl(s->fd, VIDIOC_DECODER_CMD, &cmd))
++                    return AVERROR(errno);
++                s->capture.flag_last = 0;
++                s->source_change_pending = 0;
++            }
+             return ret < 0 ? ret : 1;
+         }
+     }
+@@ -608,8 +619,13 @@
+         return AVERROR_EOF;
+     }
+ 
+-    if (evt.type == V4L2_EVENT_SOURCE_CHANGE)
++    if (evt.type == V4L2_EVENT_SOURCE_CHANGE) {
++        if ((m->quirks & FF_V4L2_QUIRK_CAPTURE_BOUNDARY) && m->capture.streamon) {
++            m->source_change_pending = 1;
++            return 0;
++        }
+         return do_source_change(m);
++    }
+ 
+     return 0;
+ }
+@@ -652,6 +668,12 @@
+             av_log(avctx, AV_LOG_TRACE, "V4L2 %s already done\n", ctx->name);
+             return AVERROR_EOF;
+         }
++        if (is_cap && m->source_change_pending && ctx->flag_last) {
++            ret = do_source_change(m);
++            if (ret < 0)
++                return ret;
++            continue;
++        }
+         if (is_cap && m->draining && (m->quirks & FF_V4L2_QUIRK_EXPLICIT_DRAIN) &&
+             ff_v4l2_ctx_eos(ctx)) {
+             ctx->done = 1;
+@@ -670,7 +692,8 @@
+             return AVERROR(ENOSPC);
+         }
+ 
+-        if (is_cap && (m->quirks & FF_V4L2_QUIRK_FIXED_CAPTURE))
++        if (is_cap && (m->quirks & FF_V4L2_QUIRK_FIXED_CAPTURE) &&
++            !m->source_change_pending)
+             pfd.events |= poll_event;
+ 
+         // Timeout kludged s.t. "forever" eventually gives up & produces logging
+--- a/libavcodec/v4l2_m2m.h
++++ b/libavcodec/v4l2_m2m.h
+@@ -88,6 +88,7 @@
+ 
+     /* null frame/packet received */
+     int draining;
++    int source_change_pending;
+     int running;
+     AVPacket buf_pkt;
+ 
+@@ -127,6 +128,7 @@
+ #define FF_V4L2_QUIRK_ENUM_FRAMESIZES_BROKEN    2
+ #define FF_V4L2_QUIRK_FIXED_CAPTURE             4
+ #define FF_V4L2_QUIRK_EXPLICIT_DRAIN            8
++#define FF_V4L2_QUIRK_CAPTURE_BOUNDARY         16
+     /* Quirks */
+     unsigned int quirks;
+ 
+--- a/libavcodec/v4l2_m2m_dec.c
++++ b/libavcodec/v4l2_m2m_dec.c
+@@ -1441,6 +1441,10 @@
+          avctx->codec_id == AV_CODEC_ID_MPEG2VIDEO))
+         s->quirks |= FF_V4L2_QUIRK_FIXED_CAPTURE;
+     if (strcmp(cap.driver, "meson-sc2-vdec") == 0 &&
++        (avctx->codec_id == AV_CODEC_ID_MPEG1VIDEO ||
++         avctx->codec_id == AV_CODEC_ID_MPEG2VIDEO))
++        s->quirks |= FF_V4L2_QUIRK_CAPTURE_BOUNDARY;
++    if (strcmp(cap.driver, "meson-sc2-vdec") == 0 &&
+         avctx->codec_id == AV_CODEC_ID_MPEG4 &&
+         avctx->framerate.num > 0 && avctx->framerate.den > 0) {
+         struct v4l2_streamparm parm = { .type = s->output.type };
+@@ -1841,6 +1845,7 @@
+     // clear status vars
+     s->running = 0;
+     s->draining = 0;
++    s->source_change_pending = 0;
+     output->done = 0;
+     capture->done = 0;
+ 

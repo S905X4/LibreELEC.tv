@@ -1,0 +1,28 @@
+Subject: [PATCH] v4l2m2m: cancel both native queues at discontinuity
+
+Native decoder abort marks OUTPUT and CAPTURE with VB2 queue_error.
+Stopping OUTPUT alone does not clear the CAPTURE error, so a flush before
+LAST/EOS can leave the new epoch permanently returning EIO. Cancel and
+restart native CAPTURE as well, using the existing AVAILABLE-only requeue
+path so externally referenced decoded frames keep their ownership.
+Non-native decoder behavior is unchanged.
+
+--- a/libavcodec/v4l2_m2m_dec.c
++++ b/libavcodec/v4l2_m2m_dec.c
+@@ -1651,10 +1651,12 @@
+     h264_field_pair_free(priv);
+ #endif
+ 
+-    // Clear a pending EOS
+-    if (ff_v4l2_ctx_eos(capture)) {
+-        // Arguably we could delay this but this is easy and doesn't require
+-        // thought or extra vars
++    // Native abort marks both VB2 queues in error. Cancel both queues even
++    // without LAST/EOS, or CAPTURE keeps returning EIO after OUTPUT restarts.
++    // STREAMON requeues only AVAILABLE buffers; downstream-held surfaces keep
++    // their references and cannot be reused by the new decoder epoch.
++    if (ff_v4l2_ctx_eos(capture) ||
++        ((s->quirks & FF_V4L2_QUIRK_EXPLICIT_DRAIN) && capture->streamon)) {
+         ff_v4l2_context_set_status(capture, VIDIOC_STREAMOFF);
+         ff_v4l2_context_set_status(capture, VIDIOC_STREAMON);
+     }

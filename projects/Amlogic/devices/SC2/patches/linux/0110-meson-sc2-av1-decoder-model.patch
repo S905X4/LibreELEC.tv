@@ -1,0 +1,44 @@
+From 6defcdeb0f6b9e6b257e4bb8cd4497e774ec4ed7 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Fri, 13 Nov 2026 22:58:25 +0800
+Subject: [PATCH] media: meson: accept AV1 source decoder-model timing metadata
+
+Canonical Request reconstruction streams already omit decoder-model timing. Source removal ticks do not select reference buffers or replace userspace presentation timestamps, so rejecting BUFFER_REMOVAL_TIME_PRESENT is unnecessary. Genuine Main8/Main10 model-timing streams match independent original pixels, PTS and EOF; canonical normalization is independently pixel-proven.
+---
+ .../media/platform/amlogic/meson-sc2-vdec/av1_request_syntax.c | 2 ++
+ drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_av1.h  | 3 ++-
+ 2 files changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/platform/amlogic/meson-sc2-vdec/av1_request_syntax.c b/drivers/media/platform/amlogic/meson-sc2-vdec/av1_request_syntax.c
+index 28399f0a4674..f80b69bf7c76 100644
+--- a/drivers/media/platform/amlogic/meson-sc2-vdec/av1_request_syntax.c
++++ b/drivers/media/platform/amlogic/meson-sc2-vdec/av1_request_syntax.c
+@@ -178,6 +178,8 @@ static void sequence_header(struct av1_bits *b, struct av1_syntax *s)
+ 	put(b, 3, 0);
+ 	put(b, 1, SF(s, STILL_PICTURE));
+ 	put(b, 1, 0); /* full header, including for reduced-still inputs */
++	/* Reconstruction is request-scheduled. Omit source decoder-model timing;
++	 * userspace retains its original presentation timestamps independently. */
+ 	put(b, 1, 0); /* timing_info_present_flag */
+ 	put(b, 1, 0); /* initial_display_delay_present_flag */
+ 	put(b, 5, 0); /* one unfiltered operating point */
+diff --git a/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_av1.h b/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_av1.h
+index 0ed509c93b45..ea1ae2c63c36 100644
+--- a/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_av1.h
++++ b/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_av1.h
+@@ -692,10 +692,11 @@ static int sc2_av1_validate(struct meson_sc2_hevc_context *ctx,
+                      V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_Y)) !=
+                     (V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_X |
+                      V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_Y) ||
+-        (f->flags & V4L2_AV1_FRAME_FLAG_BUFFER_REMOVAL_TIME_PRESENT) ||
+         f->tile_info.tile_cols > 64 ||
+         f->tile_info.tile_rows > 64 || job->syntax->num_tiles > 256)
+         return -EOPNOTSUPP;
++    /* The canonical reconstruction stream has no decoder model. Source
++     * removal ticks are metadata, not reference-buffer or presentation PTS. */
+     /* Intra MC entries already bind this picture, as in SC2 config_mc_buffer.
+      * Canonical syntax validates screen-tools/no-superres and no-filter rules. */
+     /* Index zero is not an inter reference. Models 1..7 are checked by the
+-- 
+2.47.3
+

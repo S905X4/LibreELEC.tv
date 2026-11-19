@@ -1,0 +1,34 @@
+From e61b0c5e02c0dc0de0c17111c24ec76f0c737c50 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Mon, 16 Nov 2026 00:57:55 +0800
+Subject: [PATCH] media: meson: sc2: keep VP9 probability cursors within groups
+
+Reset the non-coefficient probability cursor only at an actual count
+group boundary. The unconditional final else sent subsequent nodes
+back to class0 high-precision probability instead of advancing them.
+Match the vendor branch condition without changing the update math.
+
+The original FATE resize stream exposed the error before its first
+resize: two exact pictures followed by 135713 wrong samples. Joint
+hardware verification with retained-reference fixes now returns all
+ten original pictures exactly; the original failure is retained.
+
+Change-Id: I43fd186d27a0c5d97f7f5962250659e2f8f29efe
+---
+ .../media/platform/amlogic/meson-sc2-vdec/meson_sc2_vp9_prob.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_vp9_prob.c b/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_vp9_prob.c
+index fe2fe4225637..ed882c5fc3b9 100644
+--- a/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_vp9_prob.c
++++ b/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_vp9_prob.c
+@@ -443,7 +443,8 @@ void meson_sc2_vp9_adapt_prob(int prev_kf, int cur_kf, int pre_fc,
+ 			else if (coef_count_node_start ==
+ 					VP9_MV_BITS_1_COUNT_START)
+ 				coef_node_start = VP9_MV_BITS_1_START;
+-			else /* node_start == VP9_MV_CLASS0_HP_0_COUNT_START */
++			else if (coef_count_node_start ==
++					VP9_MV_CLASS0_HP_0_COUNT_START)
+ 				coef_node_start = VP9_MV_CLASS0_HP_0_START;
+ 
+ 			den = count[coef_count_node_start] +

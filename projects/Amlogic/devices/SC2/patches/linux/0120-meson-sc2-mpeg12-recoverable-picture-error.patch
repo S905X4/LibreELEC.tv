@@ -1,0 +1,67 @@
+From bc70bcbb95fb6610010ed3ec788602ecfaa15b1d Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Sat, 14 Nov 2026 04:19:40 +0800
+Subject: [PATCH] media: meson: report MPEG12 picture damage without aborting
+
+PICINFO_ERROR on a completed MPEG picture describes recoverable stream
+corruption, not loss of queue or DMA ownership. Preserve its exact token,
+checkpoint and reference lifetime and return VB2_BUF_STATE_ERROR on
+CAPTURE. Propagate damage through P/B prediction references until a clean
+I picture establishes a new chain. Keep all structural and DMA checks.
+
+The original damaged 1080i stream now completes 400 pictures with full
+PTS and decoder EOF, reporting 125 damaged pictures without kernel
+aborts. Independent clean-prefix/tail comparison covers 201 pictures at
+maximum sample difference 4/255. Clean MPEG1/MPEG2/1080i regressions
+return 36/36/24 pictures with their previous pixel accuracy.
+
+Change-Id: Ie3d43262698e3acdf85567c9fd9a4357fe7060b3
+---
+ drivers/staging/media/meson/vdec/codec_mpeg12.c | 17 +++++++++++++++--
+ 1 file changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/staging/media/meson/vdec/codec_mpeg12.c b/drivers/staging/media/meson/vdec/codec_mpeg12.c
+index e5032a317697..809a4e94524f 100644
+--- a/drivers/staging/media/meson/vdec/codec_mpeg12.c
++++ b/drivers/staging/media/meson/vdec/codec_mpeg12.c
+@@ -494,7 +494,8 @@ static int mpeg12_multi_present(struct amvdec_session *sess, int index)
+ 	m->pending--;
+ 	if (pic->packet_done)
+ 		atomic_dec(&sess->esparser_queued_bufs);
+-	v4l2_m2m_buf_done(vb, VB2_BUF_STATE_DONE);
++	v4l2_m2m_buf_done(vb, pic->flags & V4L2_BUF_FLAG_ERROR ?
++			  VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE);
+ 	schedule_work(&sess->esparser_queue_work);
+ 	return 0;
+ }
+@@ -668,7 +669,7 @@ static int mpeg12_multi_picture_done(struct amvdec_session *sess, u32 status)
+ 	 * as in vmpeg12_multi; a cumulative count cannot invalidate a clean IP.
+ 	 */
+ 	if (index < 0 || index >= MPEG12_MULTI_BUFFERS ||
+-	    rec != m->canvas[index] || info & MPEG12_MULTI_PIC_ERROR ||
++	    rec != m->canvas[index] ||
+ 	    type == MPEG12_MULTI_PIC_TYPE)
+ 		return -EIO;
+ 	if ((seq & MPEG12_MULTI_SEQ_EXT) && (seq & MPEG12_MULTI_SEQ_PROG) &&
+@@ -681,6 +682,18 @@ static int mpeg12_multi_picture_done(struct amvdec_session *sess, u32 status)
+ 	ret = mpeg12_multi_timestamp(sess, pic, offset);
+ 	if (ret)
+ 		return ret;
++	/* A real PIC_DONE with parser damage is recoverable, not a queue
++	 * failure. Keep its exact token and reference lifetime; report damage
++	 * on CAPTURE, including pictures predicted from a damaged reference.
++	 * A clean I picture starts a new reference chain without a reset.
++	 */
++	pic->flags &= ~V4L2_BUF_FLAG_ERROR;
++	if ((info & MPEG12_MULTI_PIC_ERROR) ||
++	    (type && m->refs[1] >= 0 &&
++	     (m->picture[m->refs[1]].flags & V4L2_BUF_FLAG_ERROR)) ||
++	    (type == MPEG12_MULTI_TYPE_B && m->refs[0] >= 0 &&
++	     (m->picture[m->refs[0]].flags & V4L2_BUF_FLAG_ERROR)))
++		pic->flags |= V4L2_BUF_FLAG_ERROR;
+ 	ret = mpeg12_multi_retire_preroll(sess, pic->packet_offset, type, drop);
+ 	if (ret)
+ 		return ret;
+-- 
+2.47.3
+

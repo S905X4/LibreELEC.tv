@@ -67,6 +67,11 @@ debug_msg() {
 }
 
 debug_shell() {
+  if [ "@INITRAMFS_DEBUG_SHELL@" != "yes" ]; then
+    echo "### Boot stopped at $BOOT_STEP; initramfs debug shell is disabled ###" >&2
+    while :; do sleep 3600; done
+  fi
+
   echo "### Starting debugging shell for boot step: $BOOT_STEP... type  exit  to quit ###"
 
   showcursor
@@ -1052,7 +1057,11 @@ SILENT_OUT=3
 
 # If the network is up (due to the use of the "ip" kernel parameter) and a DNS
 # server is known, allow the libc resolver to use it
-grep '^\(nameserver\|domain\) ' /proc/net/pnp | grep -v '^nameserver 0\.0\.0\.0$' > /etc/resolv.conf
+if [ -r /proc/net/pnp ]; then
+  grep '^\(nameserver\|domain\) ' /proc/net/pnp | grep -v '^nameserver 0\.0\.0\.0$' > /etc/resolv.conf
+else
+  : > /etc/resolv.conf
+fi
 
 if [ "${boot%%=*}" = "FILE" ]; then
   error "check arguments" "boot argument can't be FILE type..."

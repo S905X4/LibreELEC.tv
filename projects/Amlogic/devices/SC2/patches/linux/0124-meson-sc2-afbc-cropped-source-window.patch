@@ -1,0 +1,62 @@
+From a3c9f48e1745b64a6125f092fcd8fb352bc46b3a Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Sat, 14 Nov 2026 06:39:23 +0800
+Subject: [PATCH] drm/meson: match SC2 AFBC bounds to the VIU source window
+
+SC2 donor programs the same inclusive source coordinates into the
+AFBC bounding box and VIU fetch window. Full-frame AFBC bounds paired
+with cropped VIU requests stall the shared composition in the retained
+real three-surface test, even with nonnegative destination coordinates.
+
+Derive bounds from the existing VIU shadow, preserving full framebuffer
+stride, dimensions, 32MiB virtual slots, fences and retirement. Other
+SoCs remain unchanged. Targeted build passed; paired hardware validation
+follows in the complete image.
+
+Change-Id: Iac62d46a14a829a1dbb375b1fabcc00f67b82458
+---
+ drivers/gpu/drm/meson/meson_osd_afbcd.c | 20 ++++++++++++++++----
+ 1 file changed, 16 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/meson/meson_osd_afbcd.c b/drivers/gpu/drm/meson/meson_osd_afbcd.c
+index 72928dafdfd0..d811e9604c1c 100644
+--- a/drivers/gpu/drm/meson/meson_osd_afbcd.c
++++ b/drivers/gpu/drm/meson/meson_osd_afbcd.c
+@@ -358,6 +358,16 @@ static int meson_g12a_afbcd_setup_surface(struct meson_drm *priv,
+ 	/* BSP S0/S1/S2 register blocks begin at 0x3a10/0x3a30/0x3a50. */
+ 	u32 offset = index * 0x20;
+ 	u32 format = meson_g12a_afbcd_pixel_fmt(osd->modifier, osd->format);
++	u32 x_start = 0, x_end = osd->width - 1;
++	u32 y_start = 0, y_end = osd->height - 1;
++
++	if (priv->sc2) {
++		/* The AFBC-to-VIU transfer must cover the same source window. */
++		x_start = FIELD_GET(GENMASK(12, 0), osd->blk0_cfg[1]);
++		x_end = FIELD_GET(GENMASK(28, 16), osd->blk0_cfg[1]);
++		y_start = FIELD_GET(GENMASK(12, 0), osd->blk0_cfg[2]);
++		y_end = FIELD_GET(GENMASK(28, 16), osd->blk0_cfg[2]);
++	}
+ 
+ 	if (osd->modifier & AFBC_FORMAT_MOD_YTR)
+ 		format |= VPU_MAFBC_YUV_TRANSFORM;
+@@ -377,11 +387,13 @@ static int meson_g12a_afbcd_setup_surface(struct meson_drm *priv,
+ 	meson_rdma_writel_sync(priv, osd->width, VPU_MAFBC_BUFFER_WIDTH_S0 + offset);
+ 	meson_rdma_writel_sync(priv, ALIGN(osd->height, 32),
+ 			       VPU_MAFBC_BUFFER_HEIGHT_S0 + offset);
+-	meson_rdma_writel_sync(priv, 0, VPU_MAFBC_BOUNDING_BOX_X_START_S0 + offset);
+-	meson_rdma_writel_sync(priv, osd->width - 1,
++	meson_rdma_writel_sync(priv, x_start,
++			       VPU_MAFBC_BOUNDING_BOX_X_START_S0 + offset);
++	meson_rdma_writel_sync(priv, x_end,
+ 			       VPU_MAFBC_BOUNDING_BOX_X_END_S0 + offset);
+-	meson_rdma_writel_sync(priv, 0, VPU_MAFBC_BOUNDING_BOX_Y_START_S0 + offset);
+-	meson_rdma_writel_sync(priv, osd->height - 1,
++	meson_rdma_writel_sync(priv, y_start,
++			       VPU_MAFBC_BOUNDING_BOX_Y_START_S0 + offset);
++	meson_rdma_writel_sync(priv, y_end,
+ 			       VPU_MAFBC_BOUNDING_BOX_Y_END_S0 + offset);
+ 	meson_rdma_writel_sync(priv, osd->blk1_cfg4,
+ 			       VPU_MAFBC_OUTPUT_BUF_ADDR_LOW_S0 + offset);
+-- 
+2.47.3
+

@@ -1,0 +1,26 @@
+Subject: [PATCH] avcodec: offer AV1 Main8 monochrome to V4L2 Request
+
+Offer DRM_PRIME for Main-profile GRAY8 input, leaving NVDEC, 4:2:0
+selection and non-Main profiles unchanged. Native SC2 qualification
+observed complete original luma and hardware-generated neutral128 UV
+in the existing NV12 export, including reference reuse and teardown.
+
+Keep Main10 monochrome unexposed: its reconstructed luma is correct,
+but the tested FBC payload explicitly contains128 chroma instead of
+neutral512. Do not relabel that surface, synthesize UV on the CPU or
+change the source bitstream. The native admission guard remains.
+
+The Request path already preserves MONO_CHROME and sequence bit depth.
+Keep existing capture negotiation and truthful DRM descriptors unchanged.
+
+--- a/libavcodec/av1dec.c
++++ b/libavcodec/av1dec.c
+@@ -557,4 +557,8 @@
+ #if CONFIG_AV1_NVDEC_HWACCEL
+         *fmtp++ = AV_PIX_FMT_CUDA;
+ #endif
++#if CONFIG_AV1_V4L2REQUEST_HWACCEL
++        if (seq->seq_profile == FF_PROFILE_AV1_MAIN)
++            *fmtp++ = AV_PIX_FMT_DRM_PRIME;
++#endif
+         break;

@@ -1,0 +1,114 @@
+From: hiper25 <whydonit@gmail.com>
+Subject: [PATCH] avfilter: preserve negotiated NV21 through native SC2 EI
+
+Consume the actual NV12/NV21 DRM layer and matching software-format
+metadata. Negotiate the corresponding two-plane V4L2 source and capture
+layouts, verify that the driver preserved them and export the real DRM
+format. Recreate the session when chroma order changes between frames.
+
+Keep NV12 behavior, pitch/crop bounds, field timing and DMA-BUF lifetime.
+No CPU byte conversion, relabelled pixels or fallback to another layout.
+
+--- a/libavfilter/vf_sc2_deinterlace.c
++++ b/libavfilter/vf_sc2_deinterlace.c
+@@ -44,6 +44,7 @@
+     int error;
+     unsigned count;
+     int width, height, coded_height;
++    uint32_t drm_format;
+     unsigned pitch[2];
+     size_t crop_left, crop_top;
+     SC2Buffer buffers[SC2_BUFFERS];
+@@ -150,7 +151,8 @@
+     if (!d || d->nb_layers != 1 || d->nb_objects < 1 || d->nb_objects > 2)
+         return AVERROR(EINVAL);
+     l = &d->layers[0];
+-    if (l->format != DRM_FORMAT_NV12 || l->nb_planes != 2)
++    if ((l->format != DRM_FORMAT_NV12 && l->format != DRM_FORMAT_NV21) ||
++        l->nb_planes != 2)
+         return AVERROR(ENOSYS);
+     for (p = 0; p < 2; p++) {
+         int obj = l->planes[p].object_index;
+@@ -165,7 +167,9 @@
+     *coded_height = in->height;
+     if (in->hw_frames_ctx) {
+         const AVHWFramesContext *frames = (const void *)in->hw_frames_ctx->data;
+-        if (frames->width < in->width || frames->height < in->height)
++        if (frames->width < in->width || frames->height < in->height ||
++            frames->sw_format != (l->format == DRM_FORMAT_NV12 ?
++                                  AV_PIX_FMT_NV12 : AV_PIX_FMT_NV21))
+             return AVERROR(EINVAL);
+         *coded_height = frames->height;
+     }
+@@ -197,6 +201,8 @@
+     struct v4l2_selection sel = { 0 };
+     struct v4l2_streamparm parm = { 0 };
+     struct v4l2_format fmt = { 0 };
++    const uint32_t pixelformat = l->format == DRM_FORMAT_NV12 ?
++        V4L2_PIX_FMT_NV12M : V4L2_PIX_FMT_NV21M;
+     unsigned i, p;
+     int ret;
+     int width = in->width - in->crop_left - in->crop_right;
+@@ -219,12 +225,13 @@
+     s->width = width;
+     s->height = height;
+     s->coded_height = coded_height;
++    s->drm_format = l->format;
+     s->crop_left = in->crop_left;
+     s->crop_top = in->crop_top;
+     fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+     fmt.fmt.pix_mp.width = in->width;
+     fmt.fmt.pix_mp.height = coded_height;
+-    fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12M;
++    fmt.fmt.pix_mp.pixelformat = pixelformat;
+     fmt.fmt.pix_mp.field = in->top_field_first ?
+         V4L2_FIELD_INTERLACED_TB : V4L2_FIELD_INTERLACED_BT;
+     fmt.fmt.pix_mp.num_planes = 2;
+@@ -234,6 +241,11 @@
+     }
+     if ((ret = sc2_ioctl(s->fd, VIDIOC_S_FMT, &fmt)) < 0)
+         goto fail;
++    if (fmt.fmt.pix_mp.pixelformat != pixelformat ||
++        fmt.fmt.pix_mp.num_planes != 2) {
++        ret = AVERROR(EINVAL);
++        goto fail;
++    }
+     for (p = 0; p < 2; p++)
+         if (fmt.fmt.pix_mp.plane_fmt[p].bytesperline != s->pitch[p]) {
+             ret = AVERROR(EINVAL);
+@@ -248,13 +260,14 @@
+     fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+     fmt.fmt.pix_mp.width = width;
+     fmt.fmt.pix_mp.height = height;
+-    fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12M;
++    fmt.fmt.pix_mp.pixelformat = pixelformat;
+     fmt.fmt.pix_mp.field = V4L2_FIELD_NONE;
+     fmt.fmt.pix_mp.num_planes = 2;
+     if ((ret = sc2_ioctl(s->fd, VIDIOC_S_FMT, &fmt)) < 0)
+         goto fail;
+     if (fmt.fmt.pix_mp.width != width || fmt.fmt.pix_mp.height != height ||
+-        fmt.fmt.pix_mp.pixelformat != V4L2_PIX_FMT_NV12M) {
++        fmt.fmt.pix_mp.pixelformat != pixelformat ||
++        fmt.fmt.pix_mp.num_planes != 2) {
+         ret = AVERROR(EINVAL);
+         goto fail;
+     }
+@@ -297,7 +310,7 @@
+             goto fail;
+         b->drm.nb_objects = 2;
+         b->drm.nb_layers = 1;
+-        b->drm.layers[0].format = DRM_FORMAT_NV12;
++        b->drm.layers[0].format = s->drm_format;
+         b->drm.layers[0].nb_planes = 2;
+         for (p = 0; p < 2; p++) {
+             struct v4l2_exportbuffer exp = {
+@@ -392,7 +405,8 @@
+         goto fail;
+     }
+     s = ctx->session;
+-    if (!s || s->coded_height != coded_height ||
++    if (!s || s->drm_format != d->layers[0].format ||
++        s->coded_height != coded_height ||
+         s->width != in->width - in->crop_left - in->crop_right ||
+         s->height != in->height - in->crop_top - in->crop_bottom ||
+         s->crop_left != in->crop_left || s->crop_top != in->crop_top ||

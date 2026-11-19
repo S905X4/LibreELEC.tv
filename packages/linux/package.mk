@@ -15,6 +15,13 @@ PKG_STAMP="${KERNEL_TARGET} ${KERNEL_MAKE_EXTRACMD}"
 PKG_PATCH_DIRS="${LINUX}"
 
 case "${LINUX}" in
+  amlogic-sc2)
+    PKG_VERSION="6.18.57"
+    PKG_SHA256="5bd9acdc82ec5efc3790ae840e5aaa40dfde7efff261cf6dde902dc570acf98c"
+    PKG_URL="https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${PKG_VERSION}.tar.xz"
+    PKG_SOURCE_NAME="linux-${PKG_VERSION}.tar.xz"
+    PKG_PATCH_DIRS="default"
+    ;;
   amlogic)
     PKG_VERSION="86731a2a651e58953fc949573895f2fa6d456841" # 6.16-rc3
     PKG_SHA256="008b00968a8bfc0627580b82a2d30c7304336a4f92a58e80cdbc2d4723e01840"
@@ -290,7 +297,7 @@ makeinstall_target() {
   rm -f ${INSTALL}/$(get_kernel_overlay_dir)/lib/modules/*/build
   rm -f ${INSTALL}/$(get_kernel_overlay_dir)/lib/modules/*/source
 
-  if [ "${BOOTLOADER}" = "u-boot" ]; then
+  if [ "${BOOTLOADER}" = "u-boot" ] || [ "${BOOTLOADER}" = "u-boot-script" ]; then
     mkdir -p ${INSTALL}/usr/share/bootloader
     for dtb in arch/${TARGET_KERNEL_ARCH}/boot/dts/*.dtb \
                arch/${TARGET_KERNEL_ARCH}/boot/dts/*/*.dtb \

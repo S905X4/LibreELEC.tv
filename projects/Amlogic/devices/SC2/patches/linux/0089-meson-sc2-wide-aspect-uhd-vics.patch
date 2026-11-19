@@ -1,0 +1,20 @@
+From: hiper25 <whydonit@gmail.com>
+Subject: [PATCH] drm/meson: Export retained wide-aspect UHD VIC mappings
+
+Reconcile the existing Linux aaf0b7b36db2 source with the packaged
+0079/0080 predecessor. CTA VIC 106 and 107 use the same existing VENC
+recipes as UHD50 and UHD60; no new pixel-clock limit or invented VIC.
+Physical receiver acceptance is separate from this source declaration.
+
+---
+--- a/drivers/gpu/drm/meson/meson_venc.c
++++ b/drivers/gpu/drm/meson/meson_venc.c
+@@ -842,6 +842,8 @@
+ 	{ 95, &meson_hdmi_encp_mode_2160p30 },
+ 	{ 96, &meson_hdmi_encp_mode_2160p25 },
+ 	{ 97, &meson_hdmi_encp_mode_2160p30 },
++	{ 106, &meson_hdmi_encp_mode_2160p25 },
++	{ 107, &meson_hdmi_encp_mode_2160p30 },
+ 	{ 0, NULL}, /* sentinel */
+ };
+ 

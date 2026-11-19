@@ -1,0 +1,40 @@
+From b620c129906819bba4aa9691dbe26ab603cea5b7 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Fri, 13 Nov 2026 06:36:42 +0800
+Subject: [PATCH] arm64: dts: amlogic: Enable HK1 X4 internal HDMI I2S lanes
+
+The internal TDMOUT_C to TOHDMITX connection currently supplies only
+one two-slot lane even though the native TDM formatter and HDMI input
+already consume four lanes. Match the SC2 AH212 topology: four pairs
+of slots, two 32-bit slots per lane, and the existing 256fs MCLK.
+
+This permits the existing PCM channel routing without changing pins,
+speaker allocation, ELD constraints or compressed-audio packet modes.
+Stereo still selects only lane zero; unused lane masks are cleared
+by the native formatter on each parameter setup. Actual multichannel
+reception remains a separate receiver-dependent acceptance item.
+
+Change-Id: I441b844bba3f2816b238aaec47762ee20238b30a
+---
+ arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts b/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
+index 7999bfa8e56e..16dbfc0b4523 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
++++ b/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
+@@ -117,6 +117,11 @@ dai-link-3 {
+ 			sound-dai = <&tdmif_c>;
+ 			dai-format = "i2s";
+ 			dai-tdm-slot-tx-mask-0 = <1 1>;
++			dai-tdm-slot-tx-mask-1 = <1 1>;
++			dai-tdm-slot-tx-mask-2 = <1 1>;
++			dai-tdm-slot-tx-mask-3 = <1 1>;
++			dai-tdm-slot-num = <2>;
++			dai-tdm-slot-width = <32>;
+ 			mclk-fs = <256>;
+ 			codec {
+ 				sound-dai = <&tohdmitx TOHDMITX_I2S_IN_C>;
+-- 
+2.47.3
+

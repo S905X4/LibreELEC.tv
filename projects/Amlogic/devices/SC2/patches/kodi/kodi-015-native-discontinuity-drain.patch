@@ -1,0 +1,192 @@
+Subject: [PATCH] DRM PRIME: cancel discontinuities and bound decoder drain
+
+Reset is an abort, not graceful EOF: an incomplete complementary H.264
+field must be discarded by flush without asking firmware to drain it.
+Send a drain marker only after backpressure permits it, and only once.
+Report failed input, output and drains, then abort their decoder epoch.
+AddData's bool is packet consumption: consume terminally rejected input
+but latch VC_ERROR for GetPicture before accepting anything else. Unlike
+EAGAIN, bad input must not be retried forever. Abort releases the retained
+PAFF field and stale native queues; new input still faces native reference
+validation, so dependent pictures cannot reuse the failed epoch's DPB.
+Hardware errors and malformed true EOF remain errors, not fake pictures.
+Exported DI/renderer frames retain their existing independent ownership.
+
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h
+@@ -32,7 +32,7 @@
+   void SetCodecControl(int flags) override;
+ 
+ protected:
+-  void Drain();
++  int Drain();
+   void ResetDeinterlace();
+   int EnsureDeinterlace();
+   int ReceiveFrame();
+@@ -47,6 +47,8 @@
+   double m_DAR = 1.0;
+   AVCodecContext* m_pCodecContext = nullptr;
+   AVFrame* m_pFrame = nullptr;
++  bool m_drainSubmitted = false;
++  bool m_decoderError = false;
+   struct AVFilterGraph* m_deinterlaceGraph = nullptr;
+   struct AVFilterContext* m_deinterlaceSource = nullptr;
+   struct AVFilterContext* m_deinterlaceSink = nullptr;
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
+@@ -526,6 +526,9 @@
+   if (!packet.pData)
+     return true;
+ 
++  if (m_decoderError)
++    return false;
++
+   AVPacket* avpkt = av_packet_alloc();
+   if (!avpkt)
+   {
+@@ -561,8 +564,9 @@
+     av_strerror(ret, err, AV_ERROR_MAX_STRING_SIZE);
+     CLog::Log(LOGERROR, "CDVDVideoCodecDRMPRIME::{} - send packet failed: {} ({})", __FUNCTION__,
+               err, ret);
+-    if (ret != AVERROR_EOF && ret != AVERROR_INVALIDDATA)
+-      return false;
++    // AddData reports packet consumption, not decode success. Do not retry a
++    // malformed packet forever; GetPicture reports VC_ERROR before more input.
++    m_decoderError = true;
+   }
+ 
+   return true;
+@@ -570,57 +574,37 @@
+ 
+ void CDVDVideoCodecDRMPRIME::Reset()
+ {
+-  // STREAMOFF the DI graph before flushing decoder ownership on a seek.
++  // A seek/channel discontinuity cancels the old epoch; it is not end of stream.
++  // In particular, a retained first PAFF field cannot be gracefully drained.
+   ResetDeinterlace();
+-  if (!m_pCodecContext)
+-    return;
+-
+-  Drain();
+-
+-  do
+-  {
+-    int ret = avcodec_receive_frame(m_pCodecContext, m_pFrame);
+-    if (ret == AVERROR_EOF)
+-      break;
+-    else if (ret)
+-    {
+-      char err[AV_ERROR_MAX_STRING_SIZE] = {};
+-      av_strerror(ret, err, AV_ERROR_MAX_STRING_SIZE);
+-      CLog::Log(LOGERROR, "CDVDVideoCodecDRMPRIME::{} - receive frame failed: {} ({})",
+-                __FUNCTION__, err, ret);
+-      break;
+-    }
+-    else
+-      av_frame_unref(m_pFrame);
+-  } while (true);
+-
+-  CLog::Log(LOGDEBUG, "CDVDVideoCodecDRMPRIME::{} - flush buffers", __FUNCTION__);
+-  avcodec_flush_buffers(m_pCodecContext);
+-}
+-
+-void CDVDVideoCodecDRMPRIME::Drain()
+-{
+-  AVPacket* avpkt = av_packet_alloc();
+-  if (!avpkt)
+-  {
+-    CLog::Log(LOGERROR, "CDVDVideoCodecDRMPRIME::{} - av_packet_alloc failed: {}", __FUNCTION__,
+-              strerror(errno));
+-    return;
+-  }
+-
+-  avpkt->data = nullptr;
+-  avpkt->size = 0;
+-
+-  int ret = avcodec_send_packet(m_pCodecContext, avpkt);
+-  if (ret && ret != AVERROR_EOF)
++  av_frame_unref(m_pFrame);
++  m_drainSubmitted = false;
++  m_decoderError = false;
++  SetCodecControl(m_codecControlFlags & ~DVD_CODEC_CTRL_DRAIN);
++  if (m_pCodecContext)
++    avcodec_flush_buffers(m_pCodecContext);
++}
++
++int CDVDVideoCodecDRMPRIME::Drain()
++{
++  if (m_drainSubmitted)
++    return 0;
++
++  const int ret = avcodec_send_packet(m_pCodecContext, nullptr);
++  if (ret == 0 || ret == AVERROR_EOF)
++  {
++    m_drainSubmitted = true;
++    return 0;
++  }
++  if (ret != AVERROR(EAGAIN))
+   {
+     char err[AV_ERROR_MAX_STRING_SIZE] = {};
+     av_strerror(ret, err, AV_ERROR_MAX_STRING_SIZE);
+     CLog::Log(LOGERROR, "CDVDVideoCodecDRMPRIME::{} - send packet failed: {} ({})", __FUNCTION__,
+               err, ret);
+   }
+-
+-  av_packet_free(&avpkt);
++  // EAGAIN means the null packet was not accepted: receive output before retrying.
++  return ret;
+ }
+ 
+ void CDVDVideoCodecDRMPRIME::SetPictureParams(VideoPicture* pVideoPicture)
+@@ -867,7 +851,21 @@
+ CDVDVideoCodec::VCReturn CDVDVideoCodecDRMPRIME::GetPicture(VideoPicture* pVideoPicture)
+ {
++  if (m_decoderError)
++  {
++    Reset();
++    return VC_ERROR;
++  }
++
+   if (m_codecControlFlags & DVD_CODEC_CTRL_DRAIN)
+-    Drain();
++  {
++    const int ret = Drain();
++    if (ret < 0 && ret != AVERROR(EAGAIN))
++    {
++      // Report the failed drain, then cancel that epoch so it cannot poison input.
++      Reset();
++      return VC_ERROR;
++    }
++  }
+ 
+   int ret = ReceiveFrame();
+   if (ret == AVERROR(EAGAIN))
+@@ -876,10 +874,7 @@
+   {
+     if (m_codecControlFlags & DVD_CODEC_CTRL_DRAIN)
+     {
+-      CLog::Log(LOGDEBUG, "CDVDVideoCodecDRMPRIME::{} - flush buffers", __FUNCTION__);
+-      ResetDeinterlace();
+-      avcodec_flush_buffers(m_pCodecContext);
+-      SetCodecControl(m_codecControlFlags & ~DVD_CODEC_CTRL_DRAIN);
++      Reset();
+     }
+     return VC_EOF;
+   }
+@@ -889,6 +884,7 @@
+     av_strerror(ret, err, AV_ERROR_MAX_STRING_SIZE);
+     CLog::Log(LOGERROR, "CDVDVideoCodecDRMPRIME::{} - receive frame failed: {} ({})", __FUNCTION__,
+               err, ret);
++    Reset();
+     return VC_ERROR;
+   }
+ 
+@@ -924,7 +920,7 @@
+   {
+     CLog::Log(LOGERROR, "CDVDVideoCodecDRMPRIME::{} - videoBuffer:nullptr format:{}", __FUNCTION__,
+               av_get_pix_fmt_name(static_cast<AVPixelFormat>(m_pFrame->format)));
+-    av_frame_unref(m_pFrame);
++    Reset();
+     return VC_ERROR;
+   }
+ 

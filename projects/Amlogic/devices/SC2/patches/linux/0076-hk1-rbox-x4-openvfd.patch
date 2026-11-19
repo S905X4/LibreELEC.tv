@@ -1,0 +1,80 @@
+Subject: [PATCH] arm64: dts: amlogic: use upstream OpenVFD on HK1 RBOX X4
+
+Replace the GPIO-I2C/native display owner with the upstream OpenVFD
+board profile. The out-of-tree module and Kodi addon are built by the
+SC2 image; never instantiate both GPIO owners.
+
+diff --git a/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts b/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
+index 60b8b14e485b..7999bfa8e56e 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
++++ b/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
+@@ -69,61 +69,14 @@ led-status {
+ 		};
+ 	};
+ 
+-	i2c-panel {
+-		compatible = "i2c-gpio";
+-		sda-gpios = <&gpio GPIOA_14 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+-		scl-gpios = <&gpio GPIOA_15 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+-		i2c-gpio,delay-us = <5>;
+-		#address-cells = <1>;
+-		#size-cells = <0>;
+-
+-		display-controller@24 {
+-			compatible = "fdhisi,fd6551";
+-			reg = <0x24>;
+-			fdhisi,digits = <4 3 2 1>;
+-			default-brightness-level = <8>;
+-			#address-cells = <1>;
+-			#size-cells = <0>;
+-
+-			display {
+-				function = "display";
+-			};
+-
+-			led@0 {
+-				reg = <0>;
+-				function = "alarm";
+-			};
+-
+-			led@1 {
+-				reg = <1>;
+-				function = "usb";
+-			};
+-
+-			led@2 {
+-				reg = <2>;
+-				function = "pause";
+-			};
+-
+-			led@3 {
+-				reg = <3>;
+-				function = "play";
+-			};
+-
+-			led@4 {
+-				reg = <4>;
+-				function = "colon";
+-			};
+-
+-			led@5 {
+-				reg = <5>;
+-				function = "lan";
+-			};
+-
+-			led@6 {
+-				reg = <6>;
+-				function = "wlan";
+-			};
+-		};
++	openvfd {
++		compatible = "open,vfd";
++		openvfd_gpio_clk = <&gpio GPIOA_15 GPIO_ACTIVE_HIGH>;
++		openvfd_gpio_dat = <&gpio GPIOA_14 GPIO_ACTIVE_HIGH>;
++		openvfd_chars = [00 04 03 02 01];
++		openvfd_dot_bits = [00 01 03 02 04 05 06];
++		/* OpenVFD packs type/reserved/flags/controller into this word. */
++		openvfd_display_type = <0x06000000>;
+ 	};
+ 
+ 	spdif_dit: spdif-transmitter {

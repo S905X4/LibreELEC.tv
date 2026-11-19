@@ -1,0 +1,94 @@
+From 1eb84d51956b083ec8461ccffb1ad65b9661cee6 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Fri, 13 Nov 2026 23:40:30 +0800
+Subject: [PATCH] drm: meson: initialize each SC2 OSD RGB conversion matrix
+
+The three VIU1 OSD sources have independent wrapper matrices before
+composition. Initializing only OSD1 leaves OSD2 and OSD3 RGB samples
+interpreted as YUV, turning red into green and green into blue.
+
+Parameterize the existing matrix writer by register-bank base and
+initialize both extra SC2 sources with the existing RGB709-to-limited
+YUV709 coefficients. Preserve other SoCs and the OSD1 HDR bypass.
+A reversible exact-matrix receiver observation confirms opaque source
+colors for both linear and real GPU-produced AFBC surfaces. This does
+not claim exact premultiplied-color or primary-disabled acceptance.
+
+Change-Id: Id5223b9dd9db440b57cc288b7b598c63c335f00a
+---
+ drivers/gpu/drm/meson/meson_viu.c | 42 ++++++++++++++++++-------------
+ 1 file changed, 24 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/gpu/drm/meson/meson_viu.c b/drivers/gpu/drm/meson/meson_viu.c
+index 074bddbb3943..ee52602de5eb 100644
+--- a/drivers/gpu/drm/meson/meson_viu.c
++++ b/drivers/gpu/drm/meson/meson_viu.c
+@@ -123,32 +123,32 @@ static int eotf_bypass_coeff[EOTF_COEFF_SIZE] = {
+ 	EOTF_COEFF_RIGHTSHIFT /* right shift */
+ };
+ 
+-static void meson_viu_set_g12a_osd1_matrix(struct meson_drm *priv,
+-					   int *m, bool csc_on)
++static void meson_viu_set_g12a_osd_matrix(struct meson_drm *priv, u32 base,
++				       int *m, bool csc_on)
+ {
+-	/* VPP WRAP OSD1 matrix */
++	u32 offset = base - VPP_WRAP_OSD1_MATRIX_COEF00_01;
++
++	/* Each OSD converts RGB before the shared YUV blender. */
+ 	writel(((m[0] & 0xfff) << 16) | (m[1] & 0xfff),
+-		priv->io_base + _REG(VPP_WRAP_OSD1_MATRIX_PRE_OFFSET0_1));
++		priv->io_base + _REG(VPP_WRAP_OSD1_MATRIX_PRE_OFFSET0_1 + offset));
+ 	writel(m[2] & 0xfff,
+-		priv->io_base + _REG(VPP_WRAP_OSD1_MATRIX_PRE_OFFSET2));
++		priv->io_base + _REG(VPP_WRAP_OSD1_MATRIX_PRE_OFFSET2 + offset));
+ 	writel(((m[3] & 0x1fff) << 16) | (m[4] & 0x1fff),
+-		priv->io_base + _REG(VPP_WRAP_OSD1_MATRIX_COEF00_01));
++		priv->io_base + _REG(VPP_WRAP_OSD1_MATRIX_COEF00_01 + offset));
+ 	writel(((m[5] & 0x1fff) << 16) | (m[6] & 0x1fff),
+-		priv->io_base + _REG(VPP_WRAP_OSD1_MATRIX_COEF02_10));
++		priv->io_base + _REG(VPP_WRAP_OSD1_MATRIX_COEF02_10 + offset));
+ 	writel(((m[7] & 0x1fff) << 16) | (m[8] & 0x1fff),
+-		priv->io_base + _REG(VPP_WRAP_OSD1_MATRIX_COEF11_12));
++		priv->io_base + _REG(VPP_WRAP_OSD1_MATRIX_COEF11_12 + offset));
+ 	writel(((m[9] & 0x1fff) << 16) | (m[10] & 0x1fff),
+-		priv->io_base + _REG(VPP_WRAP_OSD1_MATRIX_COEF20_21));
+-	writel((m[11] & 0x1fff),
+-		priv->io_base +	_REG(VPP_WRAP_OSD1_MATRIX_COEF22));
+-
++		priv->io_base + _REG(VPP_WRAP_OSD1_MATRIX_COEF20_21 + offset));
++	writel(m[11] & 0x1fff,
++		priv->io_base + _REG(VPP_WRAP_OSD1_MATRIX_COEF22 + offset));
+ 	writel(((m[18] & 0xfff) << 16) | (m[19] & 0xfff),
+-		priv->io_base + _REG(VPP_WRAP_OSD1_MATRIX_OFFSET0_1));
++		priv->io_base + _REG(VPP_WRAP_OSD1_MATRIX_OFFSET0_1 + offset));
+ 	writel(m[20] & 0xfff,
+-		priv->io_base + _REG(VPP_WRAP_OSD1_MATRIX_OFFSET2));
+-
++		priv->io_base + _REG(VPP_WRAP_OSD1_MATRIX_OFFSET2 + offset));
+ 	writel_bits_relaxed(BIT(0), csc_on ? BIT(0) : 0,
+-		priv->io_base + _REG(VPP_WRAP_OSD1_MATRIX_EN_CTRL));
++		priv->io_base + _REG(VPP_WRAP_OSD1_MATRIX_EN_CTRL + offset));
+ }
+ 
+ static void meson_viu_set_osd_matrix(struct meson_drm *priv,
+@@ -537,8 +537,14 @@ void meson_viu_init(struct meson_drm *priv)
+ 	    meson_vpu_is_compatible(priv, VPU_COMPATIBLE_GXL))
+ 		meson_viu_load_matrix(priv);
+ 	else if (meson_vpu_is_compatible(priv, VPU_COMPATIBLE_G12A)) {
+-		meson_viu_set_g12a_osd1_matrix(priv, RGB709_to_YUV709l_coeff,
+-					       true);
++		meson_viu_set_g12a_osd_matrix(priv, VPP_WRAP_OSD1_MATRIX_COEF00_01,
++					     RGB709_to_YUV709l_coeff, true);
++		if (priv->sc2) {
++			meson_viu_set_g12a_osd_matrix(priv, VPP_WRAP_OSD2_MATRIX_COEF00_01,
++						     RGB709_to_YUV709l_coeff, true);
++			meson_viu_set_g12a_osd_matrix(priv, VPP_WRAP_OSD3_MATRIX_COEF00_01,
++						     RGB709_to_YUV709l_coeff, true);
++		}
+ 		/* fix green/pink color distortion from vendor u-boot */
+ 		writel_bits_relaxed(OSD1_HDR2_CTRL_REG_ONLY_MAT |
+ 				OSD1_HDR2_CTRL_VDIN0_HDR2_TOP_EN, 0,
+-- 
+2.47.3
+

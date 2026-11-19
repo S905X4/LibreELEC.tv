@@ -1,0 +1,424 @@
+From 60ac2670c78684066366fcbd72f514692895d2ed Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Fri, 13 Nov 2026 07:22:16 +0800
+Subject: [PATCH] media: meson-sc2: Negotiate native legacy NV21M and EI byte
+ order
+
+Keep NV12M as the default and add native SC2 NV21M to the supported
+legacy decoder paths. Restore negotiated chroma order at every core
+programming boundary, including H264 CAPTURE resume after headers.
+Normalize CAPTURE when changing the compressed codec so a prior NV21M
+selection cannot leak into an NV12M-only codec.
+
+Negotiate both semiplanar layouts independently on the DI queues and
+program the actual SC2 reader/writer mappings for each combination.
+Do not relabel pixels, swap bytes on CPU, change other SoC format lists,
+reduce buffer capacities or weaken completion/drain ownership.
+
+Compilation and hardware pixel/color acceptance are performed on the
+matched integrated series; existing codec compatibility failures remain
+separate from this output-format implementation.
+
+Change-Id: I77f5ce219ec4137392a8e474084ca3ec2795ddc3
+---
+ .../platform/amlogic/meson-sc2-di/Kconfig     |  5 ++--
+ .../platform/amlogic/meson-sc2-di/sc2-di.c    | 21 ++++++++++------
+ drivers/staging/media/meson/vdec/codec_h264.c |  5 ++--
+ .../staging/media/meson/vdec/codec_legacy.c   | 14 ++++-------
+ .../staging/media/meson/vdec/codec_mpeg12.c   |  9 ++++---
+ .../staging/media/meson/vdec/codec_mpeg4.c    |  9 ++++---
+ drivers/staging/media/meson/vdec/vdec.c       |  8 +++---
+ drivers/staging/media/meson/vdec/vdec_1.c     | 12 ++-------
+ .../staging/media/meson/vdec/vdec_helpers.c   | 25 +++++++++++++++++--
+ .../staging/media/meson/vdec/vdec_helpers.h   |  3 +++
+ .../staging/media/meson/vdec/vdec_platform.c  | 14 +++++------
+ 11 files changed, 75 insertions(+), 50 deletions(-)
+
+diff --git a/drivers/media/platform/amlogic/meson-sc2-di/Kconfig b/drivers/media/platform/amlogic/meson-sc2-di/Kconfig
+index 6659d7dd0681..bf130ce814f5 100644
+--- a/drivers/media/platform/amlogic/meson-sc2-di/Kconfig
++++ b/drivers/media/platform/amlogic/meson-sc2-di/Kconfig
+@@ -7,5 +7,6 @@ config VIDEO_MESON_SC2_DI
+ 	select VIDEOBUF2_DMA_CONTIG
+ 	help
+ 	  Native V4L2 M2M SC2 post-engine edge interpolation. Imports linear
+-	  NV12M DMABUFs and exports progressive MMAP/DMABUF surfaces at field
+-	  rate. This is spatial EI, not the vendor temporal MA/MC algorithm.
++	  NV12M/NV21M DMABUFs and exports progressive NV12M/NV21M MMAP/DMABUF
++	  surfaces at field rate. Chroma order conversion uses hardware MIFs.
++	  This is spatial EI, not the vendor temporal MA/MC algorithm.
+diff --git a/drivers/media/platform/amlogic/meson-sc2-di/sc2-di.c b/drivers/media/platform/amlogic/meson-sc2-di/sc2-di.c
+index 3bf09f8a5e86..cf43b5603bf6 100644
+--- a/drivers/media/platform/amlogic/meson-sc2-di/sc2-di.c
++++ b/drivers/media/platform/amlogic/meson-sc2-di/sc2-di.c
+@@ -185,7 +185,9 @@ static int di_program(struct sc2_di_ctx *ctx,
+ 
+ 	di_write(di, DI_POST_GL_CTRL, 0x40200001);
+ 	di_write(di, IF0_BASE + IF_GEN3, (3 << 4) | (2 << 1));
+-	di_write(di, IF0_BASE + IF_GEN2, 1); /* NV12, not NV21 */
++	/* SC2 set_di_mif_v3: chroma map 1=VU, 2=UV. */
++	di_write(di, IF0_BASE + IF_GEN2,
++		 ctx->fmt[0].pixelformat == V4L2_PIX_FMT_NV21M ? 1 : 2);
+ 	di_write(di, IF0_BASE + IF_CANVAS, di->canvas_id[0] |
+ 		 (di->canvas_id[1] << 8) | (di->canvas_id[1] << 16));
+ 	di_write(di, IF0_BASE + IF_X, (r->width - 1) << 16);
+@@ -206,8 +208,12 @@ static int di_program(struct sc2_di_ctx *ctx,
+ 	di_write(di, DIWR_X, r->width - 1);
+ 	di_write(di, DIWR_Y, r->height - 1);
+ 	di_write(di, DIWR_CANVAS, di->canvas_id[2] | (di->canvas_id[3] << 8));
+-	/* NV12 writeback: two planes, 8 bit, 420 chroma decimation. */
+-	di_write(di, DIWR_CTRL, BIT(0) | BIT(3) | (3 << 4) | (2 << 22) | (2 << 26));
++	/* SC2 set_wrmif_simple_v3: bit17=0 writes VU, bit17=1 writes UV.
++	 * Input and output order are independent hardware MIF selections.
++	 */
++	di_write(di, DIWR_CTRL, BIT(0) | BIT(3) | (3 << 4) | (2 << 22) |
++		 (2 << 26) |
++		 (ctx->fmt[1].pixelformat == V4L2_PIX_FMT_NV12M ? BIT(17) : 0));
+ 	di_write(di, DI_POST_GL_THD, 8 << 16);
+ 	di_write(di, DI_POST_SIZE, ((r->height - 1) << 16) | (r->width - 1));
+ 	/* post + EI + mux + DDR; blend and MC deliberately disabled. */
+@@ -509,9 +515,9 @@ static int di_querycap(struct file *file, void *fh, struct v4l2_capability *cap)
+ 
+ static int di_enum_fmt(struct file *file, void *fh, struct v4l2_fmtdesc *f)
+ {
+-	if (f->index)
++	if (f->index > 1)
+ 		return -EINVAL;
+-	f->pixelformat = V4L2_PIX_FMT_NV12M;
++	f->pixelformat = f->index ? V4L2_PIX_FMT_NV21M : V4L2_PIX_FMT_NV12M;
+ 	return 0;
+ }
+ 
+@@ -521,7 +527,8 @@ static int di_try_fmt(struct file *file, void *fh, struct v4l2_format *f)
+ 	unsigned int i;
+ 	u32 alignment = V4L2_TYPE_IS_OUTPUT(f->type) ? 32 : 64;
+ 
+-	p->pixelformat = V4L2_PIX_FMT_NV12M;
++	if (p->pixelformat != V4L2_PIX_FMT_NV21M)
++		p->pixelformat = V4L2_PIX_FMT_NV12M;
+ 	p->width = clamp_t(u32, ALIGN(p->width, 2), 32, 1920);
+ 	p->height = clamp_t(u32, ALIGN(p->height, 4), 32, 1088);
+ 	p->num_planes = 2;
+@@ -896,7 +903,7 @@ static int di_probe(struct platform_device *pdev)
+ 		pm_runtime_disable(dev);
+ 		goto unreg_v4l2;
+ 	}
+-	dev_info(dev, "native SC2 hardware EI, NV12M, two progressive outputs per frame\n");
++	dev_info(dev, "native SC2 hardware EI, NV12M/NV21M, two progressive outputs per frame\n");
+ 	return 0;
+ unreg_v4l2:
+ 	v4l2_device_unregister(&di->v4l2);
+diff --git a/drivers/staging/media/meson/vdec/codec_h264.c b/drivers/staging/media/meson/vdec/codec_h264.c
+index 6b48425dbb95..26b80322f1b3 100644
+--- a/drivers/staging/media/meson/vdec/codec_h264.c
++++ b/drivers/staging/media/meson/vdec/codec_h264.c
+@@ -4505,8 +4505,8 @@ static int h264_multi_run(struct amvdec_session *sess)
+     amvdec_write_dos(core, AV_SCRATCH_9, BIT(2) |
+         ((m->sequence_level & 0xff) << 7) |
+         (m->dpb.bitstream_restriction_flag << 15));
+-    amvdec_write_dos_bits(core, MDEC_PIC_DC_CTRL, BIT(17));
+-    amvdec_clear_dos_bits(core, MDEC_PIC_DC_CTRL, BIT(16) | BIT(31));
++    amvdec_set_output_format(sess);
++    amvdec_clear_dos_bits(core, MDEC_PIC_DC_CTRL, BIT(31));
+     amvdec_write_dos(core, MDEC_PIC_DC_THRESH, 0x404038aa);
+     /* The VLD/IQIDCT reset loses controls established by the parsed PPS. */
+     if (m->iqidct_valid)
+@@ -4977,6 +4977,7 @@ static void h264_multi_resume(struct amvdec_session *sess)
+     dpb->colocated_buf_size = stride_mbs * height_mbs * 96;
+     dpb->colocated_mv_addr_start = h264->ref_paddr;
+     dpb->colocated_mv_addr_end = h264->ref_paddr + bytes;
++    amvdec_set_output_format(sess);
+     m->waiting_capture = false;
+     amvdec_write_dos(core, AV_SCRATCH_J, H264_ACTION_CONFIG_DONE);
+     /* CONFIG_PARAM waits for allocation in scratch 0; scratch 7 is run restore. */
+diff --git a/drivers/staging/media/meson/vdec/codec_legacy.c b/drivers/staging/media/meson/vdec/codec_legacy.c
+index 899a077b2001..79d84264343e 100644
+--- a/drivers/staging/media/meson/vdec/codec_legacy.c
++++ b/drivers/staging/media/meson/vdec/codec_legacy.c
+@@ -279,7 +279,8 @@ static int legacy_set_canvases(struct amvdec_session *sess)
+ 	int ret;
+ 
+ 	if ((planar ? sess->pixfmt_cap != V4L2_PIX_FMT_YUV420M :
+-		      sess->pixfmt_cap != V4L2_PIX_FMT_NV12M) ||
++		      (sess->pixfmt_cap != V4L2_PIX_FMT_NV12M &&
++		       sess->pixfmt_cap != V4L2_PIX_FMT_NV21M)) ||
+ 	    sess->fmt_out->capture_width != LEGACY_WIDTH ||
+ 	    sess->fmt_out->capture_height != LEGACY_HEIGHT)
+ 		return -EINVAL;
+@@ -406,12 +407,7 @@ static int legacy_configure(struct amvdec_session *sess)
+ 	amvdec_write_dos(core, PSCALE_CTRL, 0);
+ 	amvdec_write_dos(core, LEGACY_BUFFERIN, 0);
+ 	amvdec_write_dos(core, LEGACY_BUFFEROUT, 0);
+-	/* Bit17 selects interleaved chroma; bit16=0 selects UV, not VU. */
+-	if (sess->pixfmt_cap == V4L2_PIX_FMT_YUV420M)
+-		amvdec_clear_dos_bits(core, MDEC_PIC_DC_CTRL, BIT(17));
+-	else
+-		amvdec_write_dos_bits(core, MDEC_PIC_DC_CTRL, BIT(17));
+-	amvdec_clear_dos_bits(core, MDEC_PIC_DC_CTRL, BIT(16));
++	amvdec_set_output_format(sess);
+ 
+ 
+ 
+@@ -1162,8 +1158,8 @@ static void avsm_start_run(struct amvdec_session *sess, u32 slot)
+ 	if (ctx->avsm_context_valid)
+ 		amvdec_write_dos(core, LEGACY_SCRATCH_N, 0);
+ 	amvdec_write_dos(core, PSCALE_CTRL, 0);
+-	amvdec_write_dos_bits(core, MDEC_PIC_DC_CTRL, BIT(17));
+-	amvdec_clear_dos_bits(core, MDEC_PIC_DC_CTRL, BIT(16) | BIT(31));
++	amvdec_set_output_format(sess);
++	amvdec_clear_dos_bits(core, MDEC_PIC_DC_CTRL, BIT(31));
+ 	/* Must precede vdec_enable_input(), also on resumed runs. */
+ 	amvdec_write_dos(core, AVSM_CONTROL, 0x4c80);
+ 	amvdec_write_dos_bits(core, VLD_MEM_VIFIFO_CONTROL, BIT(2) | BIT(1));
+diff --git a/drivers/staging/media/meson/vdec/codec_mpeg12.c b/drivers/staging/media/meson/vdec/codec_mpeg12.c
+index 1a80bff9d09c..d006c8db56d0 100644
+--- a/drivers/staging/media/meson/vdec/codec_mpeg12.c
++++ b/drivers/staging/media/meson/vdec/codec_mpeg12.c
+@@ -616,8 +616,7 @@ static int mpeg12_multi_run(struct amvdec_session *sess)
+ 	amvdec_write_dos(core, AV_SCRATCH_J,
+ 			 m->context_valid ? 0 : m->userdata_wp);
+ 	amvdec_write_dos(core, MREG_BUFFERIN, m->context_valid ? BIT(6) : 0);
+-	amvdec_write_dos_bits(core, MDEC_PIC_DC_CTRL, BIT(17));
+-	amvdec_clear_dos_bits(core, MDEC_PIC_DC_CTRL, BIT(16));
++	amvdec_set_output_format(sess);
+ 	amvdec_write_dos(core, ASSIST_MBOX1_CLR_REG, 1);
+ 	amvdec_write_dos(core, ASSIST_MBOX1_MASK, 1);
+ 	m->active = index;
+@@ -886,7 +885,8 @@ static int mpeg12_multi_start(struct amvdec_session *sess)
+ 	struct device *dev = sess->core->dev;
+ 
+ 	if (sess->core->platform->revision != VDEC_REVISION_SC2 ||
+-	    sess->pixfmt_cap != V4L2_PIX_FMT_NV12M)
++	    (sess->pixfmt_cap != V4L2_PIX_FMT_NV12M &&
++	     sess->pixfmt_cap != V4L2_PIX_FMT_NV21M))
+ 		return -EINVAL;
+ 	m = kzalloc(sizeof(*m), GFP_KERNEL);
+ 	if (!m)
+@@ -948,7 +948,8 @@ static void mpeg12_multi_resume(struct amvdec_session *sess)
+ 	mutex_lock(&m->lock);
+ 	if (!m->ready) {
+ 		if (sess->num_dst_bufs != MPEG12_MULTI_BUFFERS ||
+-		    sess->pixfmt_cap != V4L2_PIX_FMT_NV12M) {
++		    (sess->pixfmt_cap != V4L2_PIX_FMT_NV12M &&
++		     sess->pixfmt_cap != V4L2_PIX_FMT_NV21M)) {
+ 			ret = -EINVAL;
+ 			goto unlock;
+ 		}
+diff --git a/drivers/staging/media/meson/vdec/codec_mpeg4.c b/drivers/staging/media/meson/vdec/codec_mpeg4.c
+index 812fbf1ce2cd..8301d097dc0b 100644
+--- a/drivers/staging/media/meson/vdec/codec_mpeg4.c
++++ b/drivers/staging/media/meson/vdec/codec_mpeg4.c
+@@ -423,8 +423,7 @@ static int mpeg4_run(struct amvdec_session *sess)
+ 	amvdec_write_dos(core, MPEG4_INFO, 0);
+ 	amvdec_write_dos(core, MPEG4_DEBUG, 0);
+ 	amvdec_write_dos(core, MPEG4_ERRORS, 0);
+-	amvdec_write_dos_bits(core, MDEC_PIC_DC_CTRL, BIT(17));
+-	amvdec_clear_dos_bits(core, MDEC_PIC_DC_CTRL, BIT(16));
++	amvdec_set_output_format(sess);
+ 	amvdec_write_dos(core, MDEC_PIC_DC_THRESH, 0x404038aa);
+ 	/* Match vmpeg4_hw_ctx_restore() ordering. Do not initialize IQIDCT
+ 	 * from an invalid context: its initial state belongs to core startup.
+@@ -619,7 +618,8 @@ static int mpeg4_start(struct amvdec_session *sess)
+ 	int ret = -ENOMEM;
+ 
+ 	if (sess->core->platform->revision != VDEC_REVISION_SC2 ||
+-	    sess->pixfmt_cap != V4L2_PIX_FMT_NV12M)
++	    (sess->pixfmt_cap != V4L2_PIX_FMT_NV12M &&
++	     sess->pixfmt_cap != V4L2_PIX_FMT_NV21M))
+ 		return -EINVAL;
+ 	m = kzalloc(sizeof(*m), GFP_KERNEL);
+ 	if (!m)
+@@ -670,7 +670,8 @@ static void mpeg4_resume(struct amvdec_session *sess)
+ 	mutex_lock(&m->lock);
+ 	if (!m->ready) {
+ 		if (sess->num_dst_bufs != MPEG4_BUFFERS ||
+-		    sess->pixfmt_cap != V4L2_PIX_FMT_NV12M) {
++		    (sess->pixfmt_cap != V4L2_PIX_FMT_NV12M &&
++		     sess->pixfmt_cap != V4L2_PIX_FMT_NV21M)) {
+ 			ret = -EINVAL;
+ 			goto unlock;
+ 		}
+diff --git a/drivers/staging/media/meson/vdec/vdec.c b/drivers/staging/media/meson/vdec/vdec.c
+index 0dae2eb5dd39..61695610b01b 100644
+--- a/drivers/staging/media/meson/vdec/vdec.c
++++ b/drivers/staging/media/meson/vdec/vdec.c
+@@ -238,6 +238,7 @@ static int vdec_queue_setup(struct vb2_queue *q, unsigned int *num_buffers,
+ 		case V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE:
+ 			switch (sess->pixfmt_cap) {
+ 			case V4L2_PIX_FMT_NV12M:
++			case V4L2_PIX_FMT_NV21M:
+ 				if (*num_planes != 2 ||
+ 				    sizes[0] < output_size ||
+ 				    sizes[1] < output_size / 2)
+@@ -269,6 +270,7 @@ static int vdec_queue_setup(struct vb2_queue *q, unsigned int *num_buffers,
+ 	case V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE:
+ 		switch (sess->pixfmt_cap) {
+ 		case V4L2_PIX_FMT_NV12M:
++		case V4L2_PIX_FMT_NV21M:
+ 			sizes[0] = output_size;
+ 			sizes[1] = output_size / 2;
+ 			*num_planes = 2;
+@@ -636,7 +638,8 @@ vdec_try_fmt_common(struct amvdec_session *sess, u32 size,
+ 			pixmp->pixelformat = fmt_out->pixfmts_cap[0];
+ 
+ 		memset(pfmt[1].reserved, 0, sizeof(pfmt[1].reserved));
+-		if (pixmp->pixelformat == V4L2_PIX_FMT_NV12M) {
++		if (pixmp->pixelformat == V4L2_PIX_FMT_NV12M ||
++		    pixmp->pixelformat == V4L2_PIX_FMT_NV21M) {
+ 			pfmt[0].sizeimage = output_size;
+ 			pfmt[0].bytesperline = stride;
+ 
+@@ -774,8 +777,7 @@ static int vdec_s_fmt(struct file *file, void *fh, struct v4l2_format *f)
+ 
+ 	if (f->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE)
+ 		sess->fmt_out = fmt_out;
+-	else if (f->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
+-		sess->pixfmt_cap = format.fmt.pix_mp.pixelformat;
++	sess->pixfmt_cap = format.fmt.pix_mp.pixelformat;
+ 
+ 	return 0;
+ }
+diff --git a/drivers/staging/media/meson/vdec/vdec_1.c b/drivers/staging/media/meson/vdec/vdec_1.c
+index 10ad4a314fbf..5e416767ab0b 100644
+--- a/drivers/staging/media/meson/vdec/vdec_1.c
++++ b/drivers/staging/media/meson/vdec/vdec_1.c
+@@ -287,11 +287,7 @@ static int vdec_1_sc2_start(struct amvdec_session *sess)
+ 		ret = -EIO;
+ 		goto stop;
+ 	}
+-	if (sess->pixfmt_cap == V4L2_PIX_FMT_NV12M)
+-		amvdec_write_dos_bits(core, MDEC_PIC_DC_CTRL, BIT(17));
+-	else
+-		amvdec_clear_dos_bits(core, MDEC_PIC_DC_CTRL, BIT(17));
+-	amvdec_clear_dos_bits(core, MDEC_PIC_DC_CTRL, BIT(16));
++	amvdec_set_output_format(sess);
+ 	enable_irq(core->irq);
+ 	if (!sess->fmt_out->codec_ops->manages_processor &&
+ 	    (!sess->fmt_out->needs_capture ||
+@@ -419,11 +415,7 @@ static int vdec_1_start(struct amvdec_session *sess)
+ 	amvdec_write_dos(core, ASSIST_MBOX1_CLR_REG, 1);
+ 	amvdec_write_dos(core, ASSIST_MBOX1_MASK, 1);
+ 
+-	/* Enable 2-plane output */
+-	if (sess->pixfmt_cap == V4L2_PIX_FMT_NV12M)
+-		amvdec_write_dos_bits(core, MDEC_PIC_DC_CTRL, BIT(17));
+-	else
+-		amvdec_clear_dos_bits(core, MDEC_PIC_DC_CTRL, BIT(17));
++	amvdec_set_output_format(sess);
+ 
+ 	/* Enable firmware processor */
+ 	amvdec_write_dos(core, MPSR, 1);
+diff --git a/drivers/staging/media/meson/vdec/vdec_helpers.c b/drivers/staging/media/meson/vdec/vdec_helpers.c
+index 75906c8d40a9..72137b214a50 100644
+--- a/drivers/staging/media/meson/vdec/vdec_helpers.c
++++ b/drivers/staging/media/meson/vdec/vdec_helpers.c
+@@ -39,6 +39,25 @@ void amvdec_clear_dos_bits(struct amvdec_core *core, u32 reg, u32 val)
+ }
+ EXPORT_SYMBOL_GPL(amvdec_clear_dos_bits);
+ 
++void amvdec_set_output_format(struct amvdec_session *sess)
++{
++	struct amvdec_core *core = sess->core;
++	u32 value = amvdec_read_dos(core, MDEC_PIC_DC_CTRL);
++
++	value &= ~BIT(17);
++	if (sess->pixfmt_cap == V4L2_PIX_FMT_NV12M ||
++	    sess->pixfmt_cap == V4L2_PIX_FMT_NV21M)
++		value |= BIT(17);
++	/* SC2 decoder_v4l: bit16 selects VU; T7 has opposite polarity. */
++	if (core->platform->revision == VDEC_REVISION_SC2) {
++		value &= ~BIT(16);
++		if (sess->pixfmt_cap == V4L2_PIX_FMT_NV21M)
++			value |= BIT(16);
++	}
++	amvdec_write_dos(core, MDEC_PIC_DC_CTRL, value);
++}
++EXPORT_SYMBOL_GPL(amvdec_set_output_format);
++
+ u32 amvdec_read_parser(struct amvdec_core *core, u32 reg)
+ {
+ 	return readl_relaxed(core->esparser_base + reg);
+@@ -139,7 +158,7 @@ static int set_canvas_yuv420m(struct amvdec_session *sess,
+ 	return 0;
+ }
+ 
+-static int set_canvas_nv12m(struct amvdec_session *sess,
++static int set_canvas_semiplanar(struct amvdec_session *sess,
+ 			    struct vb2_buffer *vb, u32 width,
+ 			    u32 height, u32 reg)
+ {
+@@ -207,7 +226,8 @@ int amvdec_set_canvases(struct amvdec_session *sess,
+ 
+ 		switch (pixfmt) {
+ 		case V4L2_PIX_FMT_NV12M:
+-			ret = set_canvas_nv12m(sess, &buf->vb.vb2_buf, width,
++		case V4L2_PIX_FMT_NV21M:
++			ret = set_canvas_semiplanar(sess, &buf->vb.vb2_buf, width,
+ 					       height, reg_cur);
+ 			if (ret)
+ 				return ret;
+@@ -314,6 +334,7 @@ static void dst_buf_done(struct amvdec_session *sess,
+ 
+ 	switch (sess->pixfmt_cap) {
+ 	case V4L2_PIX_FMT_NV12M:
++	case V4L2_PIX_FMT_NV21M:
+ 		vb2_set_plane_payload(&vbuf->vb2_buf, 0, output_size);
+ 		vb2_set_plane_payload(&vbuf->vb2_buf, 1, output_size / 2);
+ 		break;
+diff --git a/drivers/staging/media/meson/vdec/vdec_helpers.h b/drivers/staging/media/meson/vdec/vdec_helpers.h
+index be1b16dfba3c..b8788203d0e8 100644
+--- a/drivers/staging/media/meson/vdec/vdec_helpers.h
++++ b/drivers/staging/media/meson/vdec/vdec_helpers.h
+@@ -24,6 +24,9 @@ u32 amvdec_read_dos(struct amvdec_core *core, u32 reg);
+ void amvdec_write_dos(struct amvdec_core *core, u32 reg, u32 val);
+ void amvdec_write_dos_bits(struct amvdec_core *core, u32 reg, u32 val);
+ void amvdec_clear_dos_bits(struct amvdec_core *core, u32 reg, u32 val);
++
++/* Restore PIC_DC layout after startup or a decoder-local reset. */
++void amvdec_set_output_format(struct amvdec_session *sess);
+ u32 amvdec_read_parser(struct amvdec_core *core, u32 reg);
+ void amvdec_write_parser(struct amvdec_core *core, u32 reg, u32 val);
+ 
+diff --git a/drivers/staging/media/meson/vdec/vdec_platform.c b/drivers/staging/media/meson/vdec/vdec_platform.c
+index aed85084e9a3..72cf6ddb964c 100644
+--- a/drivers/staging/media/meson/vdec/vdec_platform.c
++++ b/drivers/staging/media/meson/vdec/vdec_platform.c
+@@ -294,12 +294,12 @@ static const struct amvdec_format vdec_formats_sm1[] = {
+ /* Single-instance VDEC protocols. A secure ID is not a filename and must
+  * never fall through to the old normal-world IMEM upload path.
+  */
+-#define SC2_FIXED_FORMAT(fourcc, ops, index, buffers, capture) { \
++#define SC2_FIXED_FORMAT(fourcc, ops, index, buffers, ...) { \
+ 	.pixfmt = (fourcc), .min_buffers = (buffers), .max_buffers = (buffers), \
+ 	.max_width = 1920, .max_height = 1088, \
+ 	.capture_width = 1920, .capture_height = 1088, .needs_capture = true, \
+ 	.vdec_ops = &vdec_1_ops, .codec_ops = &(ops), \
+-	.firmware_index = (index), .pixfmts_cap = { (capture), 0 }, \
++	.firmware_index = (index), .pixfmts_cap = { __VA_ARGS__, 0 }, \
+ 	.flags = V4L2_FMT_FLAG_COMPRESSED | V4L2_FMT_FLAG_DYN_RESOLUTION, \
+ }
+ 
+@@ -313,15 +313,15 @@ static const struct amvdec_format vdec_formats_sc2[] = {
+ 		.vdec_ops = &vdec_1_ops,
+ 		.codec_ops = &codec_h264_ops,
+ 		.firmware_index = 0x0f,
+-		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, 0 },
++		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_NV21M, 0 },
+ 		.flags = V4L2_FMT_FLAG_COMPRESSED | V4L2_FMT_FLAG_DYN_RESOLUTION,
+ 	},
+-	SC2_FIXED_FORMAT(V4L2_PIX_FMT_MPEG1, codec_mpeg12_multi_ops, 0x4d31324d, 8, V4L2_PIX_FMT_NV12M),
+-	SC2_FIXED_FORMAT(V4L2_PIX_FMT_MPEG2, codec_mpeg12_multi_ops, 0x4d31324d, 8, V4L2_PIX_FMT_NV12M),
+-	SC2_FIXED_FORMAT(V4L2_PIX_FMT_MPEG4, codec_mpeg4_ops, 0x4d34354d, 8, V4L2_PIX_FMT_NV12M),
++	SC2_FIXED_FORMAT(V4L2_PIX_FMT_MPEG1, codec_mpeg12_multi_ops, 0x4d31324d, 8, V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_NV21M),
++	SC2_FIXED_FORMAT(V4L2_PIX_FMT_MPEG2, codec_mpeg12_multi_ops, 0x4d31324d, 8, V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_NV21M),
++	SC2_FIXED_FORMAT(V4L2_PIX_FMT_MPEG4, codec_mpeg4_ops, 0x4d34354d, 8, V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_NV21M),
+ 	SC2_FIXED_FORMAT(V4L2_PIX_FMT_VC1_ANNEX_G, codec_vc1_ops, 9, 4, V4L2_PIX_FMT_NV12M),
+ 	SC2_FIXED_FORMAT(V4L2_PIX_FMT_VC1_ANNEX_L, codec_vc1_ops, 9, 4, V4L2_PIX_FMT_NV12M),
+-	SC2_FIXED_FORMAT(V4L2_PIX_FMT_AVS, codec_avs_ops, MESON_AVS_FIRMWARE_INDEX, 8, V4L2_PIX_FMT_NV12M),
++	SC2_FIXED_FORMAT(V4L2_PIX_FMT_AVS, codec_avs_ops, MESON_AVS_FIRMWARE_INDEX, 8, V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_NV21M),
+ 	SC2_FIXED_FORMAT(V4L2_PIX_FMT_MJPEG, codec_mjpeg_ops, 5, 4, V4L2_PIX_FMT_YUV420M),
+ };
+ 
+-- 
+2.47.3
+

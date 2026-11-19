@@ -1,0 +1,35 @@
+From 25dafc9a120aede8f5196ba76f3f36b0e0b6aa2a Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Mon, 19 Oct 2026 20:44:50 +0800
+Subject: [PATCH] dt-bindings: auxdisplay: fix FD6551 indicator reg schema
+
+Describe the one-cell indicator index directly with its numeric bounds.
+The meta-schema rejects maxItems combined with a nested items object
+for this scalar cell. Combined board DT validation already passed;
+this fixes the separate binding meta-schema failure.
+
+Change-Id: Ia1e062e715fea356a0c1307be1f40f1dad248632
+---
+ .../devicetree/bindings/auxdisplay/fdhisi,fd6551.yaml       | 6 ++----
+ 1 file changed, 2 insertions(+), 4 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/auxdisplay/fdhisi,fd6551.yaml b/Documentation/devicetree/bindings/auxdisplay/fdhisi,fd6551.yaml
+index 741d263e6109..3bb3c60d2622 100644
+--- a/Documentation/devicetree/bindings/auxdisplay/fdhisi,fd6551.yaml
++++ b/Documentation/devicetree/bindings/auxdisplay/fdhisi,fd6551.yaml
+@@ -65,10 +65,8 @@ patternProperties:
+       any of the four text grids or duplicate another indicator index.
+     properties:
+       reg:
+-        maxItems: 1
+-        items:
+-          minimum: 0
+-          maximum: 34
++        minimum: 0
++        maximum: 34
+     required:
+       - reg
+ 
+-- 
+2.47.3
+

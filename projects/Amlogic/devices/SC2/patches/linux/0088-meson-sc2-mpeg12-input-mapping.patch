@@ -1,0 +1,32 @@
+From 4b96b5b987848a167eea35033284a95d22a006f9 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Fri, 13 Nov 2026 02:02:09 +0800
+Subject: [PATCH] media: meson: Reject unmappable MPEG startup input
+
+The preroll scanner reads vb2_plane_vaddr() before the stream writer
+can reject a failed imported dma-buf CPU mapping. Return EFAULT before
+scanning a NULL mapping, preserving the existing preparation error path
+and all completion, reference and preroll token checks.
+
+Change-Id: I17d26f75b24b05f865641f6d217cf99740ecb862
+---
+ drivers/staging/media/meson/vdec/codec_mpeg12.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/drivers/staging/media/meson/vdec/codec_mpeg12.c b/drivers/staging/media/meson/vdec/codec_mpeg12.c
+index 0ced55f37c86..1a80bff9d09c 100644
+--- a/drivers/staging/media/meson/vdec/codec_mpeg12.c
++++ b/drivers/staging/media/meson/vdec/codec_mpeg12.c
+@@ -840,6 +840,9 @@ static int mpeg12_multi_prepare_input(struct amvdec_session *sess,
+ 	bool slice = false, header = false;
+ 	int ret = 0;
+ 
++	if (!data)
++		return -EFAULT;
++
+ 	mutex_lock(&m->lock);
+ 	if (m->input_refs >= 2)
+ 		goto unlock;
+-- 
+2.47.3
+

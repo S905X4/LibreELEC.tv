@@ -1,0 +1,249 @@
+Subject: [PATCH] avcodec: require actual request retirement before pool reuse
+
+media_request_done() previously returned every request to the free pool even
+when REINIT failed, and treated poll timeout as if the request had completed.
+The kernel permits REINIT only in idle or complete state; EBUSY does not
+retire a queued request.
+
+Require POLLPRI before callback reinitialization, and require successful
+REINIT before free-list insertion. Keep a terminal pool error and broadcast
+to all waiting consumers rather than handing out still-owned requests or
+leaving semaphore waiters blocked. Serialize new request QUEUE against the
+terminal transition, and propagate the actual allocation/wait error instead
+of always reporting ENOMEM. Keep failed FDs until normal pool destruction.
+
+Verified offline using the real production implementation and poll worker
+under QEMU: actual REINIT/ENOTTY, poll timeout, pipe HUP and invalid-FD errors
+never recycle the request; all eight waiting consumers per case wake with
+the corresponding error. No mocked successful ioctl, media hardware or DMA
+completion claim. This does not identify the observed board SSH-loss cause.
+
+--- a/libavcodec/v4l2_req_media.c
++++ b/libavcodec/v4l2_req_media.c
+@@ -84,7 +84,8 @@
+ 
+ struct media_pool {
+     int fd;
+-    sem_t sem;
++    pthread_cond_t ready;
++    int error;
+     pthread_mutex_t lock;
+     unsigned int pool_n;
+     struct media_request * pool_reqs;
+@@ -188,18 +189,25 @@
+ struct media_request * media_request_get(struct media_pool * const mp)
+ {
+     struct media_request *req = NULL;
+-
+-    /* Timeout handled by poll code */
+-    if (do_wait(&mp->sem))
+-        return NULL;
++    int error;
+ 
+     pthread_mutex_lock(&mp->lock);
+-    req = mp->free_reqs;
+-    if (req) {
++    while (!mp->free_reqs && !mp->error) {
++        error = pthread_cond_wait(&mp->ready, &mp->lock);
++        if (error) {
++            mp->error = error;
++            pthread_cond_broadcast(&mp->ready);
++        }
++    }
++    error = mp->error;
++    if (!error) {
++        req = mp->free_reqs;
+         mp->free_reqs = req->next;
+         req->next = NULL;
+     }
+     pthread_mutex_unlock(&mp->lock);
++    if (error)
++        errno = error;
+     return req;
+ }
+ 
+@@ -210,35 +218,69 @@
+ 
+ int media_request_start(struct media_request * const req)
+ {
+-    while (ioctl(req->fd, MEDIA_REQUEST_IOC_QUEUE, NULL) == -1)
+-    {
+-        const int err = errno;
+-        if (err == EINTR)
++    struct media_pool *const mp = req->mp;
++    int error;
++
++    pthread_mutex_lock(&mp->lock);
++    error = mp->error;
++    if (error)
++        goto unlock;
++    while (ioctl(req->fd, MEDIA_REQUEST_IOC_QUEUE, NULL) == -1) {
++        error = errno;
++        if (error == EINTR)
+             continue;
+-        request_log("%s: Failed to Q media: (%d) %s\n", __func__, err, strerror(err));
+-        return -err;
+-    }
+-
++        request_log("%s: Failed to Q media: (%d) %s\n", __func__, error, strerror(error));
++        goto unlock;
++    }
++    error = 0;
+     pollqueue_add_task(req->pt, 2000);
++unlock:
++    pthread_mutex_unlock(&mp->lock);
++    return -error;
++}
++
++static int media_pool_fail(struct media_pool *const mp, int error)
++{
++    pthread_mutex_lock(&mp->lock);
++    if (!mp->error)
++        mp->error = error;
++    pthread_cond_broadcast(&mp->ready);
++    pthread_mutex_unlock(&mp->lock);
++    return -error;
++}
++
++/* Kernel ownership ends only when REINIT succeeds, never on a poll timeout. */
++static int media_request_reinit(struct media_request *const req)
++{
++    struct media_pool *const mp = req->mp;
++
++    if (ioctl(req->fd, MEDIA_REQUEST_IOC_REINIT, NULL) < 0) {
++        const int error = errno;
++        request_log("Unable to reinit media request: %s\n", strerror(error));
++        return media_pool_fail(mp, error);
++    }
++    pthread_mutex_lock(&mp->lock);
++    if (!mp->error) {
++        req->next = mp->free_reqs;
++        mp->free_reqs = req;
++        pthread_cond_signal(&mp->ready);
++    }
++    pthread_mutex_unlock(&mp->lock);
+     return 0;
+ }
+ 
+ static void media_request_done(void *v, short revents)
+ {
+     struct media_request *const req = v;
+-    struct media_pool *const mp = req->mp;
+-
+-    /* ** Not sure what to do about timeout */
+-
+-    if (ioctl(req->fd, MEDIA_REQUEST_IOC_REINIT, NULL) < 0)
+-        request_log("Unable to reinit media request: %s\n",
+-                strerror(errno));
+-
+-    pthread_mutex_lock(&mp->lock);
+-    req->next = mp->free_reqs;
+-    mp->free_reqs = req;
+-    pthread_mutex_unlock(&mp->lock);
+-    sem_post(&mp->sem);
++
++    if (!(revents & POLLPRI) || (revents & (POLLERR | POLLHUP | POLLNVAL))) {
++        const int error = !revents ? ETIMEDOUT :
++                          (revents & POLLNVAL) ? EBADF : EIO;
++        request_log("Media request completion failed: %s\n", strerror(error));
++        media_pool_fail(req->mp, error);
++        return;
++    }
++    media_request_reinit(req);
+ }
+ 
+ int media_request_abort(struct media_request ** const preq)
+@@ -249,8 +291,7 @@
+         return 0;
+     *preq = NULL;
+ 
+-    media_request_done(req, 0);
+-    return 0;
++    return media_request_reinit(req);
+ }
+ 
+ static void free_req_pool(struct media_request * const pool, const unsigned int n)
+@@ -277,11 +318,14 @@
+         goto fail0;
+ 
+     mp->pq = pq;
+-    pthread_mutex_init(&mp->lock, NULL);
++    if (pthread_mutex_init(&mp->lock, NULL))
++        goto fail1;
++    if (pthread_cond_init(&mp->ready, NULL))
++        goto fail_lock;
+     mp->fd = open(media_path, O_RDWR | O_NONBLOCK);
+     if (mp->fd == -1) {
+         request_log("Failed to open '%s': %s\n", media_path, strerror(errno));
+-        goto fail1;
++        goto fail_cond;
+     }
+ 
+     if ((mp->pool_reqs = calloc(n, sizeof(*mp->pool_reqs))) == NULL)
+@@ -308,14 +352,15 @@
+         mp->free_reqs = req;
+     }
+ 
+-    sem_init(&mp->sem, 0, n);
+-
+     return mp;
+ 
+ fail4:
+     free_req_pool(mp->pool_reqs, mp->pool_n);
+ fail3:
+     close(mp->fd);
++fail_cond:
++    pthread_cond_destroy(&mp->ready);
++fail_lock:
+     pthread_mutex_destroy(&mp->lock);
+ fail1:
+     free(mp);
+@@ -333,7 +378,7 @@
+ 
+     free_req_pool(mp->pool_reqs, mp->pool_n);
+     close(mp->fd);
+-    sem_destroy(&mp->sem);
++    pthread_cond_destroy(&mp->ready);
+     pthread_mutex_destroy(&mp->lock);
+     free(mp);
+ }
+--- a/libavcodec/v4l2_req_media.h
++++ b/libavcodec/v4l2_req_media.h
+@@ -51,17 +51,17 @@
+                    const unsigned int n);
+ void media_pool_delete(struct media_pool ** pmp);
+ 
+-// Obtain a media request
+-// Will block if none availible - has a 2sec timeout
++// Wait for a free request or a terminal completion/reinitialization failure.
++// NULL reports the failure through errno; failed requests are never recycled.
+ struct media_request * media_request_get(struct media_pool * const mp);
+ int media_request_fd(const struct media_request * const req);
+ 
+-// Start this request
+-// Request structure is returned to pool once done
++// Start this request unless its pool has failed.
++// Reuse requires both actual POLLPRI completion and successful REINIT.
+ int media_request_start(struct media_request * const req);
+ 
+-// Return an *unstarted* media_request to the pool
+-// May later be upgraded to allow for aborting a started req
++// Reinitialize an unstarted request; consumes the pointer in all cases.
++// Return a negative errno on failure, retaining its FD until pool destruction.
+ int media_request_abort(struct media_request ** const preq);
+ 
+ 
+--- a/libavcodec/v4l2_req_hevc_vx.c
++++ b/libavcodec/v4l2_req_hevc_vx.c
+@@ -1124,8 +1124,9 @@
+     uint32_t *offsets = n_offsets ? rd->offsets + rd->slices[i].n_offsets : NULL;
+ 
+     if ((req = media_request_get(ctx->mpool)) == NULL) {
+-        av_log(avctx, AV_LOG_ERROR, "%s: Failed to alloc media request\n", __func__);
+-        return AVERROR(ENOMEM);
++        const int error = errno;
++        av_log(avctx, AV_LOG_ERROR, "%s: Media request unavailable: %s\n", __func__, strerror(error));
++        return AVERROR(error);
+     }
+     if ((src = mediabufs_src_qent_get(ctx->mbufs)) == NULL) {
+         av_log(avctx, AV_LOG_ERROR, "%s: Failed to get src buffer\n", __func__);

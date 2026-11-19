@@ -1,0 +1,94 @@
+From: HK1 SC2 maintainers
+Subject: [PATCH] avutil/v4l2request: preserve AV1 full-depth SC2 CAPTURE
+
+Reuse the native AMF0 scatter descriptor instead of truncating Main10 to DW8.
+Never negotiate a different depth once the source depth is known.
+
+--- a/libavutil/hwcontext_v4l2request.c
++++ b/libavutil/hwcontext_v4l2request.c
+@@ -37,6 +37,13 @@
+ #include "hwcontext_v4l2request_internal.h"
+ #include "mem.h"
+ 
++/* Local proposed SC2 ABI, shared with the HEVC and stateful producers.
++ * Compressed full-depth backing, not a linear ten-bit pixel format.
++ */
++#ifndef V4L2_PIX_FMT_AMLOGIC_FBC10
++#define V4L2_PIX_FMT_AMLOGIC_FBC10 v4l2_fourcc('A', 'M', 'F', '0')
++#endif
++
+ typedef struct V4L2RequestDeviceContext {
+     char *media_device;
+ } V4L2RequestDeviceContext;
+@@ -63,6 +70,9 @@
+ } v4l2request_capture_pixelformats[] = {
+     { V4L2_PIX_FMT_NV12, AV_PIX_FMT_NV12, DRM_FORMAT_NV12, DRM_FORMAT_MOD_LINEAR, 8 },
+     { V4L2_PIX_FMT_NV21, AV_PIX_FMT_NV21, DRM_FORMAT_NV21, DRM_FORMAT_MOD_LINEAR, 8 },
++    { V4L2_PIX_FMT_AMLOGIC_FBC10, AV_PIX_FMT_YUV420P10LE,
++      DRM_FORMAT_YUV420_10BIT,
++      DRM_FORMAT_MOD_AMLOGIC_FBC(AMLOGIC_FBC_LAYOUT_SCATTER, 0), 10 },
+ #if defined(V4L2_PIX_FMT_NV12_32L32)
+     { V4L2_PIX_FMT_NV12_32L32, AV_PIX_FMT_YUV420P, DRM_FORMAT_NV12, DRM_FORMAT_MOD_ALLWINNER_TILED, 8 },
+ #endif
+@@ -121,6 +131,28 @@
+                            format->fmt.pix.pixelformat;
+     uint64_t format_modifier;
+ 
++    if (pixelformat == V4L2_PIX_FMT_AMLOGIC_FBC10) {
++        unsigned int width = format->fmt.pix_mp.width;
++        unsigned int height = format->fmt.pix_mp.height;
++
++        if (!V4L2_TYPE_IS_MULTIPLANAR(format->type) ||
++            format->fmt.pix_mp.num_planes != 1 || desc->nb_objects != 1 ||
++            format->fmt.pix_mp.plane_fmt[0].bytesperline ||
++            !width || !height || (width & 63) || (height & 63))
++            return AVERROR(EINVAL);
++        desc->objects[0].size = format->fmt.pix_mp.plane_fmt[0].sizeimage;
++        desc->objects[0].format_modifier = DRM_FORMAT_MOD_AMLOGIC_FBC(
++            AMLOGIC_FBC_LAYOUT_SCATTER, 0); /* Never MEM_SAVING for ten bits. */
++        desc->nb_layers = 1;
++        *layer = (AVDRMLayerDescriptor) {
++            .format = DRM_FORMAT_YUV420_10BIT,
++            .nb_planes = 1,
++            /* The header embeds body PFNs in this same exported object. */
++            .planes = {{ .object_index = 0, .offset = 0, .pitch = width }},
++        };
++        return 0;
++    }
++
+     layer->format = 0;
+     for (int i = 0; i < FF_ARRAY_ELEMS(v4l2request_capture_pixelformats); i++) {
+         if (pixelformat == v4l2request_capture_pixelformats[i].pixelformat) {
+@@ -281,7 +313,7 @@
+     AVV4L2RequestFramesContext *fctx = hwfc->hwctx;
+     AVV4L2RequestFramesContextInternal *fctxi = fctx->internal;
+     enum v4l2_buf_type type = fctxi->capture.format.type;
+-    uint32_t pixelformat, fallback = 0;
++    uint32_t pixelformat;
+     struct v4l2_format format = {
+         .type = type,
+     };
+@@ -313,19 +345,16 @@
+                 if (fctx->bit_depth == v4l2request_capture_pixelformats[i].bit_depth ||
+                     !fctx->bit_depth)
+                     return v4l2request_set_format(hwfc, type, fmtdesc.pixelformat, 0);
+-                else if (!fallback)
+-                    fallback = fmtdesc.pixelformat;
+             }
+         }
+ 
+         fmtdesc.index++;
+     }
+ 
+-    // Fallback to use the first known format
+-    if (fallback)
+-        return v4l2request_set_format(hwfc, type, fallback, 0);
+-
+-    return AVERROR(errno);
++    /* A known source depth must never silently select a DW8 CAPTURE.
++     * With unspecified depth every known format already matches above.
++     */
++    return AVERROR(ENOTSUP);
+ }
+ 
+ static int v4l2request_try_framesize(AVHWFramesContext *hwfc,

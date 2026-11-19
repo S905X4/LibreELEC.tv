@@ -1,0 +1,47 @@
+From b19d00f4f6d023efe9917b7e15f1de1c9fb4bc6c Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Sat, 14 Nov 2026 12:35:23 +0800
+Subject: [PATCH] media: meson-sc2-di: preserve chroma at 420 field endpoints
+
+Do not push neutral dummy pixels into the vertical formatter for
+separate-plane 420 input. That request prevents the last selected
+chroma row from being repeated and contaminates the bottom edge.
+Keep the existing packed422 policy, formatter phase, input scopes,
+allocation bounds, completion and retirement contract unchanged.
+
+A bounded copy diagnostic isolated GEN[18]: in-bounds lookahead
+removed the defect, field-phase changes did not, and disabling dummy
+push corrected the original scopes without extra input rows. The
+unchanged 24-field EI regression then passed all declared luma and
+chroma samples, 131072 exterior guard bytes, and retained exports
+across context destruction. This was a RAM candidate, not a new
+production-image run.
+
+Change-Id: Idc42692b7a85d9fafc1cd9b82a2595ab94d66449
+---
+ drivers/media/platform/amlogic/meson-sc2-di/sc2-di.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/media/platform/amlogic/meson-sc2-di/sc2-di.c b/drivers/media/platform/amlogic/meson-sc2-di/sc2-di.c
+index c37f66dd9d12..4f743a55aa96 100644
+--- a/drivers/media/platform/amlogic/meson-sc2-di/sc2-di.c
++++ b/drivers/media/platform/amlogic/meson-sc2-di/sc2-di.c
+@@ -221,9 +221,13 @@ static int di_program(struct sc2_di_ctx *ctx,
+ 		 BIT(21) | BIT(20) | BIT(17) |
+ 		 (packed_in ? (16 << 1) : (8 << 1) | BIT(0)));
+ 	di_write(di, IF0_BASE + IF_FMT_W, (r->width << 16) | (r->width / 2));
++	/* The 420 formatter repeats the last chroma row at the field edge.
++	 * Pushing dummy pixels makes that interpolation consume neutral chroma
++	 * instead. Keep the packed422 policy, which has no vertical formatter.
++	 */
+ 	di_write(di, IF0_BASE + IF_GEN,
+-		 BIT(29) | BIT(25) | (8 << 19) | BIT(18) | BIT(4) | BIT(0) |
+-		 (packed_in ? BIT(14) : BIT(6) | BIT(1)));
++		 BIT(29) | BIT(25) | (8 << 19) | BIT(4) | BIT(0) |
++		 (packed_in ? BIT(18) | BIT(14) : BIT(6) | BIT(1)));
+ 	di_write(di, DIWR_X, r->width - 1);
+ 	di_write(di, DIWR_Y, r->height - 1);
+ 	di_write(di, DIWR_CANVAS, di->canvas_id[2] |
+-- 
+2.47.3
+

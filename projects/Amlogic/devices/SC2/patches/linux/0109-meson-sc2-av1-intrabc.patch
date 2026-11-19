@@ -1,0 +1,32 @@
+From d30d90e00b994f357963e22fd56219da7aa1ac79 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Fri, 13 Nov 2026 22:07:00 +0800
+Subject: [PATCH] media: meson: enable controls-validated AV1 intra block copy
+
+The existing SC2 intra MC table maps all entries to the current picture, matching the donor's config_mc_buffer path. Canonical syntax already enforces intra/screen-tools/no-superres and no-filter rules. Remove only the blanket intrabc admission rejection; do not add external references, copies or speculative registers. The unchanged previously rejected 4K Main10 intrabc/GMC stream and an independent Main8 SB64 stream match all original pixels, PTS and EOF with actual intrabc block-use evidence.
+---
+ .../media/platform/amlogic/meson-sc2-vdec/meson_sc2_av1.h    | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_av1.h b/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_av1.h
+index 0fc51ce9eb0a..0ed509c93b45 100644
+--- a/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_av1.h
++++ b/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_av1.h
+@@ -692,11 +692,12 @@ static int sc2_av1_validate(struct meson_sc2_hevc_context *ctx,
+                      V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_Y)) !=
+                     (V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_X |
+                      V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_Y) ||
+-        (f->flags & (V4L2_AV1_FRAME_FLAG_ALLOW_INTRABC |
+-                     V4L2_AV1_FRAME_FLAG_BUFFER_REMOVAL_TIME_PRESENT)) ||
++        (f->flags & V4L2_AV1_FRAME_FLAG_BUFFER_REMOVAL_TIME_PRESENT) ||
+         f->tile_info.tile_cols > 64 ||
+         f->tile_info.tile_rows > 64 || job->syntax->num_tiles > 256)
+         return -EOPNOTSUPP;
++    /* Intra MC entries already bind this picture, as in SC2 config_mc_buffer.
++     * Canonical syntax validates screen-tools/no-superres and no-filter rules. */
+     /* Index zero is not an inter reference. Models 1..7 are checked by the
+      * serializer and decoded into the context-owned opaque GMC workspace. */
+     if (f->global_motion.type[0] != V4L2_AV1_WARP_MODEL_IDENTITY)
+-- 
+2.47.3
+

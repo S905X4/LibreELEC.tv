@@ -1,0 +1,66 @@
+From 63bf301359257d877eef37eccfb891109aba9bdb Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Sat, 14 Nov 2026 02:35:19 +0800
+Subject: [PATCH] media: meson: hold the first SC2 MPEG12 launch for a
+ following unit
+
+The SC2 MPEG12 MULTI firmware completes a picture only when it reaches
+the next start code. Launching cold with only the first access unit
+committed ends in DATA_EMPTY mid-picture. Every later cold replay from
+ring offset 0 then fails to parse the leading sequence header again:
+SEQ_INFO stays 0 and MPEG1_2_REG never gets its MPEG-2 bit. Decoding
+recovers only at the next sequence header, so a whole GOP is lost.
+
+Observed register state of the first launch and the replays was matched
+(command/picture geometry, PIC_DC_CTRL bit 31, a reloaded TEE firmware
+image) without changing that outcome. Do not start the first cold run
+until a further unit is committed or EOS is queued. Payloads,
+timestamps, buffer counts and DMA isolation are unchanged.
+
+On the original 24-packet 1080i MPEG-2 input this returns 24 of 24
+pictures for NV12/NV21 in and out, with LAST, EPIPE and EOS. Against an
+independent software decode the maximum sample difference is 4. The
+retained FFmpeg V4L2 MPEG-1 and MPEG-2 320x240 inputs return 36 of 36
+with maximum differences 4 and 5.
+
+Change-Id: I61a9bc5319a258d28566546acc1251aa5a069b1b
+---
+ drivers/staging/media/meson/vdec/codec_mpeg12.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/drivers/staging/media/meson/vdec/codec_mpeg12.c b/drivers/staging/media/meson/vdec/codec_mpeg12.c
+index 6f0216b18a84..e5032a317697 100644
+--- a/drivers/staging/media/meson/vdec/codec_mpeg12.c
++++ b/drivers/staging/media/meson/vdec/codec_mpeg12.c
+@@ -283,6 +283,7 @@ struct mpeg12_multi {
+ 	struct mutex lock;
+ 	struct list_head preroll;
+ 	u32 input_refs;
++	u32 first_end;
+ 	void *workspace;
+ 	dma_addr_t workspace_dma;
+ 	void *cc;
+@@ -539,6 +540,14 @@ static int mpeg12_multi_run(struct amvdec_session *sess)
+ 	    (!m->swap_valid && !m->committed) ||
+ 	    (m->empty && m->job_end == m->committed))
+ 		return 0;
++	/* The MULTI firmware completes a picture only at the next start code.
++	 * A cold launch with just AU0 ends in DATA_EMPTY mid-picture, and every
++	 * cold replay from offset 0 then skips the leading sequence header until
++	 * the next one. Hold the first launch for a following unit or EOS.
++	 */
++	if (!m->swap_valid && !m->job_end && !m->eos_queued &&
++	    m->committed == m->first_end)
++		return 0;
+ 	for (i = 0; i < MPEG12_MULTI_BUFFERS; i++) {
+ 		if (i != m->refs[0] && i != m->refs[1] &&
+ 		    !m->picture[i].pending && !m->picture[i].displayed) {
+@@ -989,6 +998,8 @@ static void mpeg12_multi_input_committed(struct amvdec_session *sess,
+ 
+ 	mutex_lock(&m->lock);
+ 	m->committed = offset + bytes;
++	if (!m->first_end)
++		m->first_end = m->committed;
+ 	ret = mpeg12_multi_run(sess);
+ 	if (ret)
+ 		m->error = ret;

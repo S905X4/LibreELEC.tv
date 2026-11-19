@@ -1,0 +1,64 @@
+From 4f4b47a8150f13d405fceb81bf2a89ea69547c5b Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Fri, 13 Nov 2026 23:53:07 +0800
+Subject: [PATCH] drm: meson: match SC2 OSD output alpha to limited-range VPP
+
+The multi-OSD DOUT divider produces straight-alpha YUV, but the previous
+postblend flag claimed it was already premultiplied. Semi-transparent
+AFBC pixels therefore received the wrong final alpha treatment even
+when their opaque colours and independent source matrices were correct.
+
+Use the coherent DRM donor DOUT divider and straight-alpha postblend
+boundary. Keep the established single-primary bypass divider state.
+Set the packed eight-bit postblend background to limited-range Y=16,
+Cb=Cr=128, matching the existing WRAP conversion and ten-bit VPP black.
+Full-range Y=0 darkens partially covered regions despite neutral chroma.
+
+A real GPU separately composites the same three patterns onto opaque
+black; the native multi-OSD receiver regions then match that reference
+within observed 0..3/255 channel differences. The old primary and overlap
+regions differ by 113.67 and 67.67 mean channel levels respectively.
+This is bounded receiver evidence, not uncompressed wire-pixel identity.
+
+Change-Id: I835907ccc257b16609ae978a8aafb69cb0d61722
+---
+ drivers/gpu/drm/meson/meson_crtc.c | 6 +++---
+ drivers/gpu/drm/meson/meson_vpp.c  | 3 ++-
+ 2 files changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/meson/meson_crtc.c b/drivers/gpu/drm/meson/meson_crtc.c
+index a161f3b44cbc..469b0e89e550 100644
+--- a/drivers/gpu/drm/meson/meson_crtc.c
++++ b/drivers/gpu/drm/meson/meson_crtc.c
+@@ -257,11 +257,11 @@ static void meson_crtc_sc2_osd_blend(struct meson_drm *priv)
+ 	writel_relaxed(size, priv->io_base + _REG(VIU_OSD_BLEND_BLEND1_SIZE));
+ 	writel_relaxed(control, priv->io_base + _REG(VIU_OSD_BLEND_CTRL));
+ 	writel_relaxed(bypass ? priv->viu.osd1_bypass_blend_ctrl1 :
+-			BIT(0) | (3 << 4) | (3 << 16),
++			BIT(0) | (3 << 4) | BIT(12) | (3 << 16),
+ 			priv->io_base + _REG(VIU_OSD_BLEND_CTRL1));
++	/* DOUT is divided to straight alpha; VPP must multiply it once. */
+ 	writel_relaxed(OSD_BLEND_PATH_SEL_ENABLE |
+-			(count ? OSD_BLEND_POSTBLD_SRC_OSD1 : 0) |
+-			(count && !bypass ? VD_BLEND_POSTBLD_PREMULT_EN : 0),
++			(count ? OSD_BLEND_POSTBLD_SRC_OSD1 : 0),
+ 			priv->io_base + _REG(OSD1_BLEND_SRC_CTRL));
+ 	meson_crtc_sc2_output_scaler(priv, count != 0);
+ }
+diff --git a/drivers/gpu/drm/meson/meson_vpp.c b/drivers/gpu/drm/meson/meson_vpp.c
+index a181584a1336..a05d6cf7ae2d 100644
+--- a/drivers/gpu/drm/meson/meson_vpp.c
++++ b/drivers/gpu/drm/meson/meson_vpp.c
+@@ -156,7 +156,8 @@ void meson_vpp_init(struct meson_drm *priv)
+ 	/* SC2 blends ten-bit YCbCr, including when only VD2 remains enabled. */
+ 	if (priv->sc2) {
+ 		writel_relaxed(0x04080200, priv->io_base + _REG(VPP_DUMMY_DATA));
+-		writel_relaxed(0x008080, priv->io_base +
++		/* Packed eight-bit limited-range black, matching the OSD matrices. */
++		writel_relaxed(0x108080, priv->io_base +
+ 			       _REG(VPP_POST_BLEND_BLEND_DUMMY_DATA));
+ 		writel_relaxed(0x7fffffff, priv->io_base +
+ 			       _REG(VPP_POST_BLEND_DUMMY_ALPHA));
+-- 
+2.47.3
+

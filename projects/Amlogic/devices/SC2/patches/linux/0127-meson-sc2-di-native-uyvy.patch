@@ -1,0 +1,226 @@
+From 415046c91eeffc2ba0cb3703b750d67e87fc06e7 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Sat, 14 Nov 2026 10:55:11 +0800
+Subject: [PATCH] media: meson-sc2-di: support native UYVY field processing
+
+Add single-plane UYVY input and output using SC2 packed read and write
+MIF modes with linear hardware byte ordering. Keep plane counts, pitch,
+allocation size, field selection and output chroma order independent.
+Preserve NV12/NV21 operation and existing DMA drain and quarantine.
+
+The isolated candidate passes all 16 packed-input fields, including
+1080-line output, cropped width 78, padded pitch and both field orders.
+Allocated exterior guards and retained exports survive context teardown.
+NV12/NV21 inputs still fail their known final chroma boundary; this does
+not claim to repair that separate defect or provide a display consumer.
+Full-image acceptance is pending.
+
+Change-Id: If2a1662d3c688939318ef4f2ecbc906ecf1f4b09
+---
+ .../platform/amlogic/meson-sc2-di/sc2-di.c    | 101 +++++++++++-------
+ 1 file changed, 64 insertions(+), 37 deletions(-)
+
+diff --git a/drivers/media/platform/amlogic/meson-sc2-di/sc2-di.c b/drivers/media/platform/amlogic/meson-sc2-di/sc2-di.c
+index 4badc73f47c9..c37f66dd9d12 100644
+--- a/drivers/media/platform/amlogic/meson-sc2-di/sc2-di.c
++++ b/drivers/media/platform/amlogic/meson-sc2-di/sc2-di.c
+@@ -158,6 +158,10 @@ static int di_program(struct sc2_di_ctx *ctx,
+ {
+ 	struct sc2_di *di = ctx->di;
+ 	const struct v4l2_rect *r = &ctx->crop;
++	const struct v4l2_pix_format_mplane *in = &ctx->fmt[0];
++	const struct v4l2_pix_format_mplane *out = &ctx->fmt[1];
++	bool packed_in = in->pixelformat == V4L2_PIX_FMT_UYVY;
++	bool packed_out = out->pixelformat == V4L2_PIX_FMT_UYVY;
+ 	unsigned int bottom = (src->field == V4L2_FIELD_INTERLACED_BT) ^ ctx->field;
+ 	unsigned int p, burst_len = 2;
+ 	int ret;
+@@ -165,9 +169,9 @@ static int di_program(struct sc2_di_ctx *ctx,
+ 	/* Decoder-backed frames retain their full canvas and field selection.
+ 	 * Crop scopes and repeat patterns select source rows without CPU copies.
+ 	 */
+-	for (p = 0; p < 2; p++) {
+-		u32 pitch = ctx->fmt[0].plane_fmt[p].bytesperline;
+-		u32 height = ctx->fmt[0].height >> p;
++	for (p = 0; p < in->num_planes; p++) {
++		u32 pitch = in->plane_fmt[p].bytesperline;
++		u32 height = in->height >> p;
+ 		dma_addr_t addr = vb2_dma_contig_plane_dma_addr(&src->vb2_buf, p) +
+ 			src->vb2_buf.planes[p].data_offset;
+ 
+@@ -176,10 +180,13 @@ static int di_program(struct sc2_di_ctx *ctx,
+ 		ret = di_canvas(di, p, addr, pitch, height);
+ 		if (ret)
+ 			return ret;
+-		addr = vb2_dma_contig_plane_dma_addr(&dst->vb2_buf, p) +
++	}
++	for (p = 0; p < out->num_planes; p++) {
++		dma_addr_t addr = vb2_dma_contig_plane_dma_addr(&dst->vb2_buf, p) +
+ 			dst->vb2_buf.planes[p].data_offset;
++
+ 		ret = di_canvas(di, p + 2, addr,
+-			ctx->fmt[1].plane_fmt[p].bytesperline, r->height >> p);
++			out->plane_fmt[p].bytesperline, out->height >> p);
+ 		if (ret)
+ 			return ret;
+ 	}
+@@ -188,43 +195,46 @@ static int di_program(struct sc2_di_ctx *ctx,
+ 	/* The newer EI filter requires at least 80 output pixels. */
+ 	di_write(di, DI_EI_CTRL3, (r->width >= 80 ? BIT(31) : 0) | 0x13);
+ 	di_write(di, IF0_BASE + IF_GEN3, (3 << 4) | (burst_len << 1));
+-	/* SC2 set_di_mif_v3: chroma map 1=VU, 2=UV. */
+-	di_write(di, IF0_BASE + IF_GEN2,
+-		 ctx->fmt[0].pixelformat == V4L2_PIX_FMT_NV21M ? 1 : 2);
++	/* SC2 set_di_mif_v3: packed422 has no separate chroma canvas/map. */
++	di_write(di, IF0_BASE + IF_GEN2, packed_in ? 0 :
++		 (in->pixelformat == V4L2_PIX_FMT_NV21M ? 1 : 2));
+ 	di_write(di, IF0_BASE + IF_CANVAS, di->canvas_id[0] |
+-		 (di->canvas_id[1] << 8) | (di->canvas_id[1] << 16));
++		 (packed_in ? 0 : (di->canvas_id[1] << 8) |
++		  (di->canvas_id[1] << 16)));
+ 	di_write(di, IF0_BASE + IF_X,
+ 		 ((r->left + r->width - 1) << 16) | r->left);
+ 	di_write(di, IF0_BASE + IF_Y,
+ 		 ((r->top + r->height - 1) << 16) | (r->top + bottom));
+-	di_write(di, IF0_BASE + IF_CX,
++	/* Packed chroma is fetched with luma; its separate scopes are unused. */
++	di_write(di, IF0_BASE + IF_CX, packed_in ? 0 :
+ 		 ((r->left / 2 + r->width / 2 - 1) << 16) | (r->left / 2));
+-	di_write(di, IF0_BASE + IF_CY,
++	di_write(di, IF0_BASE + IF_CY, packed_in ? 0 :
+ 		 ((r->top / 2 + r->height / 2 - 1) << 16) |
+ 		 (r->top / 2 + bottom));
+-	di_write(di, IF0_BASE + IF_RPT, 0x1111);
++	di_write(di, IF0_BASE + IF_RPT, packed_in ? 0x11 : 0x1111);
+ 	di_write(di, IF0_BASE + IF_YPAT, 0x80);
+-	di_write(di, IF0_BASE + IF_CPAT, 0x80);
++	di_write(di, IF0_BASE + IF_CPAT, packed_in ? 0 : 0x80);
+ 	di_write(di, IF0_BASE + IF_DUMMY, 0x00808000);
+-	di_write(di, IF0_BASE + IF_FIFO, 0x120);
+-	/* Ordinary IF0 field mode: phase0, step8; no decoder phase override. */
++	di_write(di, IF0_BASE + IF_FIFO, packed_in ? 0xc0 : 0x120);
++	/* Packed422 bypasses vertical chroma formatting (video_mode=1). */
+ 	di_write(di, IF0_BASE + IF_FMT,
+-		 BIT(21) | BIT(20) | BIT(17) | (8 << 1) | BIT(0));
++		 BIT(21) | BIT(20) | BIT(17) |
++		 (packed_in ? (16 << 1) : (8 << 1) | BIT(0)));
+ 	di_write(di, IF0_BASE + IF_FMT_W, (r->width << 16) | (r->width / 2));
+ 	di_write(di, IF0_BASE + IF_GEN,
+-		 BIT(29) | BIT(25) | (8 << 19) | BIT(18) | BIT(6) |
+-		 BIT(4) | BIT(1) | BIT(0));
++		 BIT(29) | BIT(25) | (8 << 19) | BIT(18) | BIT(4) | BIT(0) |
++		 (packed_in ? BIT(14) : BIT(6) | BIT(1)));
+ 	di_write(di, DIWR_X, r->width - 1);
+ 	di_write(di, DIWR_Y, r->height - 1);
+-	di_write(di, DIWR_CANVAS, di->canvas_id[2] | (di->canvas_id[3] << 8));
+-	/* SC2 set_wrmif_simple_v3: bit17=0 writes VU, bit17=1 writes UV.
+-	 * Input and output order are independent hardware MIF selections.
++	di_write(di, DIWR_CANVAS, di->canvas_id[2] |
++		 (packed_out ? 0 : di->canvas_id[3] << 8));
++	/* SC2 set_wrmif_simple_v3 mode0 writes one-plane 8-bit packed422.
++	 * Canvas endian0 and MIF little-endian produce linear U,Y0,V,Y1.
++	 * NV12/NV21 use mode2 with independent output chroma order.
+ 	 */
+-	/* The writer, not the destination canvas, orders linear output bytes. */
+-	di_write(di, DIWR_CTRL, BIT(0) | BIT(2) | BIT(3) | (3 << 4) |
+-		 (2 << 22) |
+-		 (2 << 26) |
+-		 (ctx->fmt[1].pixelformat == V4L2_PIX_FMT_NV12M ? BIT(17) : 0));
++	di_write(di, DIWR_CTRL, BIT(0) | BIT(2) | (2 << 26) |
++		 (packed_out ? (5 << 4) : BIT(3) | (3 << 4) | (2 << 22) |
++		  (out->pixelformat == V4L2_PIX_FMT_NV12M ? BIT(17) : 0)));
+ 	di_write(di, DI_POST_GL_THD, 8 << 16);
+ 	di_write(di, DI_POST_SIZE, ((r->height - 1) << 16) | (r->width - 1));
+ 	/* post + EI + mux + DDR; blend and MC deliberately disabled. */
+@@ -385,14 +395,14 @@ static int di_queue_setup(struct vb2_queue *vq, unsigned int *nbufs,
+ 		return -EIO;
+ 
+ 	if (*nplanes) {
+-		if (*nplanes != 2)
++		if (*nplanes != f->num_planes)
+ 			return -EINVAL;
+-		for (p = 0; p < 2; p++)
++		for (p = 0; p < f->num_planes; p++)
+ 			if (sizes[p] < f->plane_fmt[p].sizeimage)
+ 				return -EINVAL;
+ 	} else {
+-		*nplanes = 2;
+-		for (p = 0; p < 2; p++)
++		*nplanes = f->num_planes;
++		for (p = 0; p < f->num_planes; p++)
+ 			sizes[p] = f->plane_fmt[p].sizeimage;
+ 	}
+ 	return 0;
+@@ -407,12 +417,14 @@ static int di_buf_prepare(struct vb2_buffer *vb)
+ 
+ 	if (READ_ONCE(ctx->di->fatal) || READ_ONCE(ctx->di->removing))
+ 		return -EIO;
++	if (vb->num_planes != f->num_planes)
++		return -EINVAL;
+ 
+ 	if (V4L2_TYPE_IS_OUTPUT(vb->type) &&
+ 	    vbuf->field != V4L2_FIELD_INTERLACED_TB &&
+ 	    vbuf->field != V4L2_FIELD_INTERLACED_BT)
+ 		return -EINVAL;
+-	for (p = 0; p < 2; p++) {
++	for (p = 0; p < f->num_planes; p++) {
+ 		u32 off = vb->planes[p].data_offset;
+ 		dma_addr_t addr = vb2_dma_contig_plane_dma_addr(vb, p) + off;
+ 
+@@ -526,9 +538,19 @@ static int di_querycap(struct file *file, void *fh, struct v4l2_capability *cap)
+ 
+ static int di_enum_fmt(struct file *file, void *fh, struct v4l2_fmtdesc *f)
+ {
+-	if (f->index > 1)
++	switch (f->index) {
++	case 0:
++		f->pixelformat = V4L2_PIX_FMT_NV12M;
++		break;
++	case 1:
++		f->pixelformat = V4L2_PIX_FMT_NV21M;
++		break;
++	case 2:
++		f->pixelformat = V4L2_PIX_FMT_UYVY;
++		break;
++	default:
+ 		return -EINVAL;
+-	f->pixelformat = f->index ? V4L2_PIX_FMT_NV21M : V4L2_PIX_FMT_NV12M;
++	}
+ 	return 0;
+ }
+ 
+@@ -537,22 +559,27 @@ static int di_try_fmt(struct file *file, void *fh, struct v4l2_format *f)
+ 	struct v4l2_pix_format_mplane *p = &f->fmt.pix_mp;
+ 	unsigned int i;
+ 	u32 alignment = V4L2_TYPE_IS_OUTPUT(f->type) ? 32 : 64;
++	u32 min_pitch;
+ 
+-	if (p->pixelformat != V4L2_PIX_FMT_NV21M)
++	if (p->pixelformat != V4L2_PIX_FMT_NV21M &&
++	    p->pixelformat != V4L2_PIX_FMT_UYVY)
+ 		p->pixelformat = V4L2_PIX_FMT_NV12M;
+ 	p->width = clamp_t(u32, ALIGN(p->width, 2), 32, 1920);
+ 	p->height = clamp_t(u32, ALIGN(p->height, 4), 32, 1088);
+-	p->num_planes = 2;
++	p->num_planes = p->pixelformat == V4L2_PIX_FMT_UYVY ? 1 : 2;
++	min_pitch = p->width * (p->num_planes == 1 ? 2 : 1);
+ 	if (!V4L2_TYPE_IS_OUTPUT(f->type))
+ 		p->field = V4L2_FIELD_NONE;
+ 	else if (p->field != V4L2_FIELD_INTERLACED_BT)
+ 		p->field = V4L2_FIELD_INTERLACED_TB;
+-	for (i = 0; i < 2; i++) {
++	for (i = 0; i < p->num_planes; i++) {
+ 		/* SC2 DIWR uses 64-byte bursts; a 32-byte-only stride aliases rows. */
+ 		p->plane_fmt[i].bytesperline = ALIGN(clamp_t(u32,
+-			p->plane_fmt[i].bytesperline, p->width, 4096), alignment);
++			p->plane_fmt[i].bytesperline, min_pitch, 4096), alignment);
+ 		p->plane_fmt[i].sizeimage = p->plane_fmt[i].bytesperline * (p->height >> i);
+ 	}
++	memset(&p->plane_fmt[p->num_planes], 0,
++	       sizeof(p->plane_fmt) - p->num_planes * sizeof(p->plane_fmt[0]));
+ 	if (p->colorspace == V4L2_COLORSPACE_DEFAULT)
+ 		p->colorspace = V4L2_COLORSPACE_REC709;
+ 	return 0;
+-- 
+2.47.3
+

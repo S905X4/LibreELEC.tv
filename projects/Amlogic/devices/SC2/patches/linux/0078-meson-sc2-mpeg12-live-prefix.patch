@@ -1,0 +1,259 @@
+Subject: [PATCH] media: meson: account for MPEG12 live random-access prefixes
+
+The MULTI parser's ERROR_COUNT covers skipped prefix pictures as well as
+the current picture. Powered captures of the original live I/B0/B1/P prefix
+showed 38 errors at DATA_EMPTY before P arrived, 39 while P was incomplete,
+and the same 39 at its clean PIC_DONE. PIC_INFO.ERROR was clear and REC was
+owned throughout. The identical P and later output pixels matched the
+no-leading-B hardware run byte-for-byte. Match vmpeg12_multi's per-picture
+PIC_INFO error authority instead of applying the cumulative count to P.
+
+Track only explicitly classified startup P/B packet ranges in source coded
+order. A real completed picture can retire exact classified prefix tokens
+wholly before its own packet; it cannot discard arbitrary earlier tokens.
+A valid completed P/B without random-access references retires its own
+non-display token and checkpoints the consumed stream without installing
+an unusable reference or returning a CAPTURE surface. Packet bytes and PTS
+are unchanged; ambiguous packet syntax retains strict normal accounting.
+
+Keep PIC_INFO.ERROR, owned REC, picture type, progressive syntax, dimensions
+and exact token matching mandatory. DATA_EMPTY still never checkpoints an
+incomplete picture or retires tokens. EOS still requires real firmware
+termination at the queued B7 marker and an empty exact token ledger.
+
+Requires the native MPEG12 MULTI integration through 0070/0071.
+diff --git a/drivers/staging/media/meson/vdec/codec_mpeg12.c b/drivers/staging/media/meson/vdec/codec_mpeg12.c
+index 27b0c2a7fa86..0ced55f37c86 100644
+--- a/drivers/staging/media/meson/vdec/codec_mpeg12.c
++++ b/drivers/staging/media/meson/vdec/codec_mpeg12.c
+@@ -266,14 +266,23 @@ struct mpeg12_multi_picture {
+ 	struct v4l2_timecode timecode;
+ 	u32 flags;
+ 	u32 field;
+-	u32 offset;
++	u32 packet_offset;
+ 	bool pending;
+ 	bool displayed;
+ 	bool packet_done;
+ };
+ 
++struct mpeg12_multi_preroll {
++	struct list_head list;
++	u32 offset;
++	u32 end;
++	u32 type;
++};
++
+ struct mpeg12_multi {
+ 	struct mutex lock;
++	struct list_head preroll;
++	u32 input_refs;
+ 	void *workspace;
+ 	dma_addr_t workspace_dma;
+ 	void *cc;
+@@ -396,6 +405,7 @@ static int mpeg12_multi_timestamp(struct amvdec_session *sess,
+ 		pic->timestamp = ts->ts;
+ 		pic->timecode = ts->tc;
+ 		pic->flags = ts->flags;
++		pic->packet_offset = ts->offset;
+ 		pic->packet_done = !--ts->remaining;
+ 		if (pic->packet_done) {
+ 			list_del(&ts->list);
+@@ -408,6 +418,52 @@ static int mpeg12_multi_timestamp(struct amvdec_session *sess,
+ 	return ret;
+ }
+ 
++/* The MULTI parser can consume leading pictures without PIC_DONE. Only
++ * explicitly classified startup packets, wholly behind a real completed
++ * picture's exact packet, may lose their non-display tokens this way.
++ */
++static int mpeg12_multi_retire_preroll(struct amvdec_session *sess,
++				     u32 offset, u32 type, bool drop)
++{
++	struct mpeg12_multi *m = sess->priv;
++	struct mpeg12_multi_preroll *p, *next;
++	struct amvdec_timestamp *ts;
++	unsigned long flags;
++	bool found;
++	int ret = drop ? -EPROTO : 0;
++
++	list_for_each_entry_safe(p, next, &m->preroll, list) {
++		if (p->offset == offset) {
++			if (!drop || p->type != type)
++				return -EPROTO;
++			list_del(&p->list);
++			kfree(p);
++			return 0;
++		}
++		if ((s32)(p->end - offset) > 0)
++			break;
++		found = false;
++		spin_lock_irqsave(&sess->ts_spinlock, flags);
++		list_for_each_entry(ts, &sess->timestamps, list) {
++			if (ts->offset != p->offset || ts->end_offset != p->end)
++				continue;
++			if (ts->remaining != 1)
++				break;
++			list_del(&ts->list);
++			kfree(ts);
++			atomic_dec(&sess->esparser_queued_bufs);
++			found = true;
++			break;
++		}
++		spin_unlock_irqrestore(&sess->ts_spinlock, flags);
++		if (!found)
++			return -ENOENT;
++		list_del(&p->list);
++		kfree(p);
++	}
++	return ret;
++}
++
+ static int mpeg12_multi_present(struct amvdec_session *sess, int index)
+ {
+ 	struct mpeg12_multi *m = sess->priv;
+@@ -586,20 +642,22 @@ static int mpeg12_multi_picture_done(struct amvdec_session *sess, u32 status)
+ 	u32 offset = amvdec_read_dos(core, MREG_FRAME_OFFSET);
+ 	u32 rec = amvdec_read_dos(core, MPEG12_MULTI_REC_CANVAS);
+ 	u32 type = info & MPEG12_MULTI_PIC_TYPE;
++	bool drop = (!m->decoded && type) ||
++		    (type == MPEG12_MULTI_TYPE_B && m->refs[0] < 0);
+ 	unsigned int i;
+ 	int index = m->active, display = index, ret;
+ 
++	/* ERROR_COUNT accumulates parser errors from firmware-skipped prefix
++	 * pictures as well. PIC_INFO.ERROR describes THIS completed picture,
++	 * as in vmpeg12_multi; a cumulative count cannot invalidate a clean IP.
++	 */
+ 	if (index < 0 || index >= MPEG12_MULTI_BUFFERS ||
+ 	    rec != m->canvas[index] || info & MPEG12_MULTI_PIC_ERROR ||
+-	    type == MPEG12_MULTI_PIC_TYPE ||
+-	    amvdec_read_dos(core, MREG_ERROR_COUNT))
++	    type == MPEG12_MULTI_PIC_TYPE)
+ 		return -EIO;
+ 	if ((seq & MPEG12_MULTI_SEQ_EXT) && (seq & MPEG12_MULTI_SEQ_PROG) &&
+ 	    !(info & PICINFO_PROG))
+ 		return -EPROTO;
+-	if ((!m->decoded && type) ||
+-	    (type == MPEG12_MULTI_TYPE_B && m->refs[0] < 0))
+-		return -EPROTO;
+ 	ret = mpeg12_multi_dimensions(sess);
+ 	if (ret)
+ 		return ret;
+@@ -607,7 +665,16 @@ static int mpeg12_multi_picture_done(struct amvdec_session *sess, u32 status)
+ 	ret = mpeg12_multi_timestamp(sess, pic, offset);
+ 	if (ret)
+ 		return ret;
+-	pic->offset = offset;
++	ret = mpeg12_multi_retire_preroll(sess, pic->packet_offset, type, drop);
++	if (ret)
++		return ret;
++	if (drop) {
++		/* Real completion, but no usable random-access references yet. */
++		if (pic->packet_done)
++			atomic_dec(&sess->esparser_queued_bufs);
++		display = -1;
++		goto checkpoint;
++	}
+ 	pic->field = V4L2_FIELD_NONE;
+ 	/* MPEG-1 has no sequence/picture coding extension: its absent
+ 	 * progressive_frame bit does not describe an interlaced picture.
+@@ -642,6 +709,7 @@ static int mpeg12_multi_picture_done(struct amvdec_session *sess, u32 status)
+ 			display = m->refs[0];
+ 		}
+ 	}
++checkpoint:
+ 	/* SEQ_END invalidates the MPEG context, but still reports its actual
+ 	 * completed picture. It is not a license to emit a stale final surface.
+ 	 */
+@@ -756,6 +824,59 @@ static irqreturn_t mpeg12_multi_threaded_isr(struct amvdec_session *sess)
+ 	return IRQ_HANDLED;
+ }
+ 
++/* Track source coded order, not asynchronous decoder progress. Once two IP
++ * references have been submitted there are no startup packets left to mark.
++ * This only classifies complete packet headers; it never changes payloads or
++ * authorizes display, and malformed/ambiguous packets keep normal strict tokens.
++ */
++static int mpeg12_multi_prepare_input(struct amvdec_session *sess,
++				     struct vb2_v4l2_buffer *vbuf,
++				     u32 *payload_size)
++{
++	struct mpeg12_multi *m = sess->priv;
++	struct mpeg12_multi_preroll *p;
++	const u8 *data = vb2_plane_vaddr(&vbuf->vb2_buf, 0);
++	u32 code = U32_MAX, type = 0, pictures = 0, i;
++	bool slice = false, header = false;
++	int ret = 0;
++
++	mutex_lock(&m->lock);
++	if (m->input_refs >= 2)
++		goto unlock;
++	for (i = 0; i < *payload_size; i++) {
++		code = (code << 8) | data[i];
++		if ((code & 0xffffff00) != 0x100)
++			continue;
++		if (!(code & 0xff)) {
++			pictures++;
++			if (*payload_size - i > 2) {
++				type = (data[i + 2] >> 3) & 7;
++				header = true;
++			}
++		} else if ((code & 0xff) <= 0xaf && pictures) {
++			slice = true;
++		}
++	}
++	if (pictures != 1 || !header || !slice || type < 1 || type > 3)
++		goto unlock;
++	if (type == 1 || (type == 2 && m->input_refs)) {
++		m->input_refs++;
++		goto unlock;
++	}
++	p = kmalloc(sizeof(*p), GFP_KERNEL);
++	if (!p) {
++		ret = -ENOMEM;
++		goto unlock;
++	}
++	p->offset = sess->stream_offset;
++	p->end = p->offset + *payload_size;
++	p->type = (type - 1) << 16;
++	list_add_tail(&p->list, &m->preroll);
++unlock:
++	mutex_unlock(&m->lock);
++	return ret;
++}
++
+ static int mpeg12_multi_start(struct amvdec_session *sess)
+ {
+ 	struct mpeg12_multi *m;
+@@ -768,6 +889,7 @@ static int mpeg12_multi_start(struct amvdec_session *sess)
+ 	if (!m)
+ 		return -ENOMEM;
+ 	mutex_init(&m->lock);
++	INIT_LIST_HEAD(&m->preroll);
+ 	m->refs[0] = -1;
+ 	m->refs[1] = -1;
+ 	m->active = -1;
+@@ -799,9 +921,14 @@ static int mpeg12_multi_start(struct amvdec_session *sess)
+ static int mpeg12_multi_stop(struct amvdec_session *sess)
+ {
+ 	struct mpeg12_multi *m = sess->priv;
++	struct mpeg12_multi_preroll *p, *next;
+ 	struct device *dev = sess->core->dev;
+ 
+ 	/* vdec_1_sc2_stop has disabled IRQs and proved processor/DMC DMA idle. */
++	list_for_each_entry_safe(p, next, &m->preroll, list) {
++		list_del(&p->list);
++		kfree(p);
++	}
+ 	dma_free_coherent(dev, PAGE_SIZE, m->swap, m->swap_dma);
+ 	dma_free_coherent(dev, MPEG12_MULTI_CC_SIZE, m->cc, m->cc_dma);
+ 	dma_free_coherent(dev, MPEG12_MULTI_WORKSPACE, m->workspace,
+@@ -954,6 +1081,7 @@ struct amvdec_codec_ops codec_mpeg12_multi_ops = {
+ 	.can_recycle = mpeg12_multi_can_recycle,
+ 	.recycle = mpeg12_multi_recycle,
+ 	.resume = mpeg12_multi_resume,
++	.prepare_input = mpeg12_multi_prepare_input,
+ 	.input_committed = mpeg12_multi_input_committed,
+ 	.input_read_pointer = mpeg12_multi_input_read_pointer,
+ 	.drain_step = mpeg12_multi_drain_step,

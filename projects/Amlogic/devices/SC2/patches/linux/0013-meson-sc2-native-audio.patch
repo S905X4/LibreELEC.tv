@@ -1,0 +1,876 @@
+From e731197d59cd0ea9134a76892871bf99fcfd1035 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Mon, 19 Oct 2026 20:37:36 +0800
+Subject: [PATCH] ASoC: meson: implement native SC2 digital playback
+
+SC2 uses the TM2-revb FIFO layout with channel counts in CTRL2,
+separate clock and data gates, and a burst-drain handshake at stop.
+Add native match data and bindings instead of claiming an SM1 SoC.
+Wire the actual powered audio bus, FRDDR A/B, optical SPDIF on H4
+and TDM-C through TOHDMITX into the real DW-HDMI audio codec.
+Initialize the audio MPLL rate families rather than inheriting firmware.
+
+The native analog glue is supported, but the stock DT does not identify
+the T9015 AVDD rail or physical AV-jack connections. Do not invent a
+regulator or headphone amplifier. Analog board activation remains
+blocked by those hardware prerequisites. Stereo digital hardware
+acceptance is separate from source integration and combined build.
+
+Change-Id: I1c665ddc35ed2adbd4401c0c781037a2225edf35
+---
+ .../bindings/sound/amlogic,axg-fifo.yaml      |   2 +
+ .../bindings/sound/amlogic,axg-spdifout.yaml  |   2 +
+ .../sound/amlogic,axg-tdm-formatters.yaml     |   2 +
+ .../bindings/sound/amlogic,g12a-toacodec.yaml |   1 +
+ .../bindings/sound/amlogic,g12a-tohdmitx.yaml |   1 +
+ .../dts/amlogic/meson-sc2-hk1-rbox-x4.dts     |  69 ++++++++++-
+ arch/arm64/boot/dts/amlogic/meson-sc2.dtsi    | 113 ++++++++++++++++++
+ sound/soc/meson/axg-card.c                    |   7 +-
+ sound/soc/meson/axg-fifo.c                    |  11 ++
+ sound/soc/meson/axg-fifo.h                    |   1 +
+ sound/soc/meson/axg-frddr.c                   |  74 ++++++++++++
+ sound/soc/meson/axg-spdifout.c                |  34 +++++-
+ sound/soc/meson/axg-tdmout.c                  |  20 ++++
+ sound/soc/meson/g12a-toacodec.c               |  54 +++++++++
+ sound/soc/meson/g12a-tohdmitx.c               |  58 ++++++++-
+ 15 files changed, 439 insertions(+), 10 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/sound/amlogic,axg-fifo.yaml b/Documentation/devicetree/bindings/sound/amlogic,axg-fifo.yaml
+index b1b48d683101..c0f95ae09147 100644
+--- a/Documentation/devicetree/bindings/sound/amlogic,axg-fifo.yaml
++++ b/Documentation/devicetree/bindings/sound/amlogic,axg-fifo.yaml
+@@ -15,6 +15,7 @@ properties:
+       - enum:
+           - amlogic,axg-toddr
+           - amlogic,axg-frddr
++          - amlogic,sc2-frddr
+       - items:
+           - enum:
+               - amlogic,g12a-toddr
+@@ -71,6 +72,7 @@ allOf:
+               - amlogic,sm1-toddr
+               - amlogic,g12a-frddr
+               - amlogic,sm1-frddr
++              - amlogic,sc2-frddr
+ 
+     then:
+       properties:
+diff --git a/Documentation/devicetree/bindings/sound/amlogic,axg-spdifout.yaml b/Documentation/devicetree/bindings/sound/amlogic,axg-spdifout.yaml
+index 15be8dae9398..56a858aebada 100644
+--- a/Documentation/devicetree/bindings/sound/amlogic,axg-spdifout.yaml
++++ b/Documentation/devicetree/bindings/sound/amlogic,axg-spdifout.yaml
+@@ -13,6 +13,7 @@ properties:
+   compatible:
+     oneOf:
+       - const: amlogic,axg-spdifout
++      - const: amlogic,sc2-spdifout
+       - items:
+           - enum:
+               - amlogic,g12a-spdifout
+@@ -55,6 +56,7 @@ allOf:
+             enum:
+               - amlogic,g12a-spdifout
+               - amlogic,sm1-spdifout
++              - amlogic,sc2-spdifout
+     then:
+       required:
+         - resets
+diff --git a/Documentation/devicetree/bindings/sound/amlogic,axg-tdm-formatters.yaml b/Documentation/devicetree/bindings/sound/amlogic,axg-tdm-formatters.yaml
+index 719ca8fc98c7..47b6b49b3a33 100644
+--- a/Documentation/devicetree/bindings/sound/amlogic,axg-tdm-formatters.yaml
++++ b/Documentation/devicetree/bindings/sound/amlogic,axg-tdm-formatters.yaml
+@@ -14,6 +14,7 @@ properties:
+     enum:
+       - amlogic,g12a-tdmout
+       - amlogic,sm1-tdmout
++      - amlogic,sc2-tdmout
+       - amlogic,axg-tdmout
+       - amlogic,g12a-tdmin
+       - amlogic,sm1-tdmin
+@@ -59,6 +60,7 @@ allOf:
+               - amlogic,sm1-tdmin
+               - amlogic,g12a-tdmout
+               - amlogic,sm1-tdmout
++              - amlogic,sc2-tdmout
+     then:
+       required:
+         - resets
+diff --git a/Documentation/devicetree/bindings/sound/amlogic,g12a-toacodec.yaml b/Documentation/devicetree/bindings/sound/amlogic,g12a-toacodec.yaml
+index 23f82bb89750..97f48e91944c 100644
+--- a/Documentation/devicetree/bindings/sound/amlogic,g12a-toacodec.yaml
++++ b/Documentation/devicetree/bindings/sound/amlogic,g12a-toacodec.yaml
+@@ -21,6 +21,7 @@ properties:
+ 
+   compatible:
+     oneOf:
++      - const: amlogic,sc2-toacodec
+       - items:
+           - const: amlogic,g12a-toacodec
+       - items:
+diff --git a/Documentation/devicetree/bindings/sound/amlogic,g12a-tohdmitx.yaml b/Documentation/devicetree/bindings/sound/amlogic,g12a-tohdmitx.yaml
+index b4b78475c5b8..cf17e915b6a6 100644
+--- a/Documentation/devicetree/bindings/sound/amlogic,g12a-tohdmitx.yaml
++++ b/Documentation/devicetree/bindings/sound/amlogic,g12a-tohdmitx.yaml
+@@ -18,6 +18,7 @@ properties:
+ 
+   compatible:
+     oneOf:
++      - const: amlogic,sc2-tohdmitx
+       - items:
+           - const: amlogic,g12a-tohdmitx
+       - items:
+diff --git a/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts b/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
+index decd90e9999b..491c79050d87 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
++++ b/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
+@@ -2,11 +2,12 @@
+ /*
+  * HK1 RBOX X4, S905X4, 4GB variant.
+  * Wiring and usable-memory boundary: original sc2_ah212_4g vendor DT.
+- * This intentionally leaves CPU DVFS, Wi-Fi, display and media unmodelled.
++ * CPU DVFS, Wi-Fi and hardware video decoding remain unmodelled.
+  */
+ /dts-v1/;
+ #include "meson-sc2.dtsi"
+ #include <dt-bindings/leds/common.h>
++#include <dt-bindings/sound/meson-g12a-tohdmitx.h>
+ 
+ / {
+ 	model = "HK1 RBOX X4 (S905X4, 4GB)";
+@@ -106,6 +107,58 @@ led@6 {
+ 		};
+ 	};
+ 
++	spdif_dit: spdif-transmitter {
++		compatible = "linux,spdif-dit";
++		#sound-dai-cells = <0>;
++	};
++
++	sound {
++		compatible = "amlogic,axg-sound-card";
++		model = "HK1 RBOX X4";
++		audio-aux-devs = <&tdmout_c>;
++		audio-routing = "SPDIFOUT_A IN 0", "FRDDR_A OUT 3",
++				"TDMOUT_C IN 1", "FRDDR_B OUT 2",
++				"TDM_C Playback", "TDMOUT_C OUT";
++		clocks = <&clkc CLKID_MPLL2>, <&clkc CLKID_MPLL0>,
++			 <&clkc CLKID_MPLL1>;
++		assigned-clocks = <&clkc CLKID_MPLL2>, <&clkc CLKID_MPLL0>,
++				  <&clkc CLKID_MPLL1>;
++		assigned-clock-parents = <0>, <0>, <0>;
++		assigned-clock-rates = <294912000>, <270950400>, <393216000>;
++
++		dai-link-0 {
++			sound-dai = <&frddr_a>;
++		};
++
++		dai-link-1 {
++			sound-dai = <&frddr_b>;
++		};
++
++		dai-link-2 {
++			sound-dai = <&spdifout_a>;
++			codec {
++				sound-dai = <&spdif_dit>;
++			};
++		};
++
++		dai-link-3 {
++			sound-dai = <&tdmif_c>;
++			dai-format = "i2s";
++			dai-tdm-slot-tx-mask-0 = <1 1>;
++			mclk-fs = <256>;
++			codec {
++				sound-dai = <&tohdmitx TOHDMITX_I2S_IN_C>;
++			};
++		};
++
++		dai-link-4 {
++			sound-dai = <&tohdmitx TOHDMITX_I2S_OUT>;
++			codec {
++				sound-dai = <&hdmi_tx>;
++			};
++		};
++	};
++
+ 	reserved-memory {
+ 		#address-cells = <2>;
+ 		#size-cells = <2>;
+@@ -156,6 +209,20 @@ &hdmi_tx {
+ 	pinctrl-0 = <&hdmitx_hpd_pins>, <&hdmitx_ddc_pins>;
+ };
+ 
++&audiobus {
++	status = "okay";
++};
++
++&spdifout_a {
++	status = "okay";
++	pinctrl-names = "default";
++	pinctrl-0 = <&spdifout_h_pins>;
++};
++
++&tdmif_c {
++	status = "okay";
++};
++
+ &ir {
+ 	status = "okay";
+ 	pinctrl-names = "default";
+diff --git a/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi b/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi
+index 8f8e20032f02..427cfd7e1641 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi
++++ b/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi
+@@ -6,6 +6,7 @@
+  * Copyright (c) 2019 Amlogic, Inc. All rights reserved.
+  */
+ #include <dt-bindings/clock/amlogic,sc2-clkc.h>
++#include <dt-bindings/clock/axg-audio-clkc.h>
+ #include <dt-bindings/gpio/gpio.h>
+ #include <dt-bindings/gpio/meson-sc2-gpio.h>
+ #include <dt-bindings/interrupt-controller/arm-gic.h>
+@@ -13,6 +14,8 @@
+ #include <dt-bindings/phy/phy.h>
+ #include <dt-bindings/power/meson-sc2-power.h>
+ #include <dt-bindings/reset/amlogic,meson-sc2-reset.h>
++#include <dt-bindings/reset/amlogic,meson-axg-audio-arb.h>
++#include <dt-bindings/reset/amlogic,meson-g12a-audio-reset.h>
+ 
+ / {
+ 	compatible = "amlogic,sc2";
+@@ -90,6 +93,17 @@ xtal: xtal-clk {
+ 		#clock-cells = <0>;
+ 	};
+ 
++	tdmif_c: audio-controller-2 {
++		compatible = "amlogic,axg-tdm-iface";
++		#sound-dai-cells = <0>;
++		sound-name-prefix = "TDM_C";
++		clocks = <&clkc_audio AUD_CLKID_MST_C_SCLK>,
++			 <&clkc_audio AUD_CLKID_MST_C_LRCLK>,
++			 <&clkc_audio AUD_CLKID_MST_C_MCLK>;
++		clock-names = "sclk", "lrclk", "mclk";
++		status = "disabled";
++	};
++
+ 	soc {
+ 		compatible = "simple-bus";
+ 		#address-cells = <2>;
+@@ -257,6 +271,97 @@ hdmi_tx_tmds_out: endpoint {
+ 			};
+ 		};
+ 
++		audiobus: bus@fe330000 {
++			compatible = "simple-pm-bus";
++			#address-cells = <2>;
++			#size-cells = <2>;
++			ranges = <0 0 0 0xfe330000 0 0x3000>;
++			power-domains = <&pwrc PWRC_SC2_AUDIO_ID>;
++			status = "disabled";
++
++			clkc_audio: clock-controller@0 {
++				compatible = "amlogic,sc2-audio-clkc";
++				reg = <0 0 0 0xd8>;
++				#clock-cells = <1>;
++				#reset-cells = <1>;
++				clocks = <&clkc CLKID_AUDIO>, <&clkc CLKID_MPLL0>,
++					 <&clkc CLKID_MPLL1>, <&clkc CLKID_MPLL2>,
++					 <&clkc CLKID_MPLL3>, <&clkc CLKID_HIFI_PLL>,
++					 <&clkc CLKID_FCLK_DIV3>, <&clkc CLKID_FCLK_DIV4>,
++					 <&clkc CLKID_FCLK_DIV5>;
++				clock-names = "pclk", "mst_in0", "mst_in1", "mst_in2",
++					      "mst_in3", "mst_in4", "mst_in5", "mst_in6",
++					      "mst_in7";
++				resets = <&reset RESET_AUDIO>;
++			};
++
++			frddr_a: audio-controller@1c0 {
++				compatible = "amlogic,sc2-frddr";
++				reg = <0 0x1c0 0 0x2c>;
++				#sound-dai-cells = <0>;
++				sound-name-prefix = "FRDDR_A";
++				interrupts = <GIC_SPI 36 IRQ_TYPE_EDGE_RISING>;
++				clocks = <&clkc_audio AUD_CLKID_FRDDR_A>;
++				resets = <&arb AXG_ARB_FRDDR_A>,
++					 <&clkc_audio AUD_RESET_FRDDR_A>;
++				reset-names = "arb", "rst";
++				amlogic,fifo-depth = <1024>;
++			};
++
++			frddr_b: audio-controller@200 {
++				compatible = "amlogic,sc2-frddr";
++				reg = <0 0x200 0 0x2c>;
++				#sound-dai-cells = <0>;
++				sound-name-prefix = "FRDDR_B";
++				interrupts = <GIC_SPI 37 IRQ_TYPE_EDGE_RISING>;
++				clocks = <&clkc_audio AUD_CLKID_FRDDR_B>;
++				resets = <&arb AXG_ARB_FRDDR_B>,
++					 <&clkc_audio AUD_RESET_FRDDR_B>;
++				reset-names = "arb", "rst";
++				amlogic,fifo-depth = <1024>;
++			};
++
++			arb: reset-controller@280 {
++				compatible = "amlogic,meson-sc2-audio-arb";
++				reg = <0 0x280 0 4>;
++				#reset-cells = <1>;
++				clocks = <&clkc_audio AUD_CLKID_DDR_ARB>;
++			};
++
++			spdifout_a: audio-controller@480 {
++				compatible = "amlogic,sc2-spdifout";
++				reg = <0 0x480 0 0x50>;
++				#sound-dai-cells = <0>;
++				sound-name-prefix = "SPDIFOUT_A";
++				clocks = <&clkc_audio AUD_CLKID_SPDIFOUT>,
++					 <&clkc_audio AUD_CLKID_SPDIFOUT_CLK>;
++				clock-names = "pclk", "mclk";
++				resets = <&clkc_audio AUD_RESET_SPDIFOUT>;
++				status = "disabled";
++			};
++
++			tdmout_c: audio-controller@580 {
++				compatible = "amlogic,sc2-tdmout";
++				reg = <0 0x580 0 0x40>;
++				sound-name-prefix = "TDMOUT_C";
++				resets = <&clkc_audio AUD_RESET_TDMOUT_C>;
++				clocks = <&clkc_audio AUD_CLKID_TDMOUT_C>,
++					 <&clkc_audio AUD_CLKID_TDMOUT_C_SCLK>,
++					 <&clkc_audio AUD_CLKID_TDMOUT_C_SCLK_SEL>,
++					 <&clkc_audio AUD_CLKID_TDMOUT_C_LRCLK>,
++					 <&clkc_audio AUD_CLKID_TDMOUT_C_LRCLK>;
++				clock-names = "pclk", "sclk", "sclk_sel", "lrclk",
++					      "lrclk_sel";
++			};
++
++			tohdmitx: audio-controller@744 {
++				compatible = "amlogic,sc2-tohdmitx";
++				reg = <0 0x744 0 4>;
++				#sound-dai-cells = <1>;
++				resets = <&clkc_audio AUD_RESET_TOHDMITX>;
++			};
++		};
++
+ 		ir: ir-receiver@fe084040 {
+ 			compatible = "amlogic,meson-sc2-ir", "amlogic,meson-gxbb-ir";
+ 			reg = <0 0xfe084040 0 0x24>;
+@@ -390,6 +495,14 @@ mux {
+ 		};
+ 	};
+ 
++	spdifout_h_pins: spdifout-h-pins {
++		mux {
++			groups = "spdif_out_h";
++			function = "spdif_out";
++			bias-disable;
++		};
++	};
++
+ 	remote_input_pins: remote-input-pins {
+ 		mux {
+ 			groups = "remote_input_d5";
+diff --git a/sound/soc/meson/axg-card.c b/sound/soc/meson/axg-card.c
+index b4dca80e15e4..b4a6e5a7e33d 100644
+--- a/sound/soc/meson/axg-card.c
++++ b/sound/soc/meson/axg-card.c
+@@ -291,7 +291,8 @@ static int axg_card_cpu_is_capture_fe(struct device_node *np)
+ 
+ static int axg_card_cpu_is_playback_fe(struct device_node *np)
+ {
+-	return of_device_is_compatible(np, DT_PREFIX "axg-frddr");
++	return of_device_is_compatible(np, DT_PREFIX "axg-frddr") ||
++		of_device_is_compatible(np, DT_PREFIX "sc2-frddr");
+ }
+ 
+ static int axg_card_cpu_is_tdm_iface(struct device_node *np)
+@@ -302,7 +303,9 @@ static int axg_card_cpu_is_tdm_iface(struct device_node *np)
+ static int axg_card_cpu_is_codec(struct device_node *np)
+ {
+ 	return of_device_is_compatible(np, DT_PREFIX "g12a-tohdmitx") ||
+-		of_device_is_compatible(np, DT_PREFIX "g12a-toacodec");
++		of_device_is_compatible(np, DT_PREFIX "g12a-toacodec") ||
++		of_device_is_compatible(np, DT_PREFIX "sc2-tohdmitx") ||
++		of_device_is_compatible(np, DT_PREFIX "sc2-toacodec");
+ }
+ 
+ static int axg_card_add_link(struct snd_soc_card *card, struct device_node *np,
+diff --git a/sound/soc/meson/axg-fifo.c b/sound/soc/meson/axg-fifo.c
+index 75909196b769..138f9ef42ee0 100644
+--- a/sound/soc/meson/axg-fifo.c
++++ b/sound/soc/meson/axg-fifo.c
+@@ -362,6 +362,17 @@ int axg_fifo_probe(struct platform_device *pdev)
+ 	if (IS_ERR(fifo->arb))
+ 		return dev_err_probe(dev, PTR_ERR(fifo->arb), "failed to get arb reset\n");
+ 
++	if (data->reset) {
++		struct reset_control *rst;
++
++		rst = devm_reset_control_get_exclusive(dev, "rst");
++		if (IS_ERR(rst))
++			return dev_err_probe(dev, PTR_ERR(rst), "failed to get fifo reset\n");
++		ret = reset_control_reset(rst);
++		if (ret)
++			return dev_err_probe(dev, ret, "failed to reset fifo\n");
++	}
++
+ 	fifo->irq = of_irq_get(dev->of_node, 0);
+ 	if (fifo->irq <= 0) {
+ 		dev_err(dev, "failed to get irq: %d\n", fifo->irq);
+diff --git a/sound/soc/meson/axg-fifo.h b/sound/soc/meson/axg-fifo.h
+index 4c48c0a08481..e22919232554 100644
+--- a/sound/soc/meson/axg-fifo.h
++++ b/sound/soc/meson/axg-fifo.h
+@@ -70,6 +70,7 @@ struct axg_fifo_match_data {
+ 	const struct snd_soc_component_driver *component_drv;
+ 	struct snd_soc_dai_driver *dai_drv;
+ 	struct reg_field field_threshold;
++	bool reset;
+ };
+ 
+ int axg_fifo_pcm_open(struct snd_soc_component *component,
+diff --git a/sound/soc/meson/axg-frddr.c b/sound/soc/meson/axg-frddr.c
+index e70c8c34c7db..2c614e872ae6 100644
+--- a/sound/soc/meson/axg-frddr.c
++++ b/sound/soc/meson/axg-frddr.c
+@@ -372,6 +372,77 @@ static const struct axg_fifo_match_data sm1_frddr_match_data = {
+ 	.dai_drv		= &g12a_frddr_dai_drv
+ };
+ 
++static int sc2_frddr_pcm_hw_params(struct snd_soc_component *component,
++				 struct snd_pcm_substream *ss,
++				 struct snd_pcm_hw_params *params)
++{
++	struct axg_fifo *fifo = snd_soc_component_get_drvdata(component);
++
++	regmap_update_bits(fifo->map, FIFO_CTRL2, GENMASK(31, 24),
++			   FIELD_PREP(GENMASK(31, 24), params_channels(params) - 1));
++
++	return g12a_fifo_pcm_hw_params(component, ss, params);
++}
++
++static int sc2_frddr_pcm_trigger(struct snd_soc_component *component,
++			       struct snd_pcm_substream *ss, int cmd)
++{
++	struct axg_fifo *fifo = snd_soc_component_get_drvdata(component);
++	unsigned int val, outputs;
++	int ret;
++
++	switch (cmd) {
++	case SNDRV_PCM_TRIGGER_START:
++	case SNDRV_PCM_TRIGGER_RESUME:
++	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
++		/* Requests must be disabled while enabling the DMA engine. */
++		regmap_read(fifo->map, FIFO_CTRL2, &outputs);
++		regmap_update_bits(fifo->map, FIFO_CTRL2,
++				   BIT(4) | BIT(12) | BIT(20), 0);
++		ret = axg_fifo_pcm_trigger(component, ss, cmd);
++		regmap_update_bits(fifo->map, FIFO_CTRL2,
++				   BIT(4) | BIT(12) | BIT(20), outputs);
++		return ret;
++	case SNDRV_PCM_TRIGGER_STOP:
++	case SNDRV_PCM_TRIGGER_SUSPEND:
++	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
++		regmap_read(fifo->map, FIFO_CTRL0, &val);
++		if (!(val & CTRL0_DMA_EN))
++			return 0;
++		/* Drain outstanding DDR bursts before disabling the engine. */
++		regmap_update_bits(fifo->map, FIFO_CTRL2, BIT(21), 0);
++		regmap_update_bits(fifo->map, FIFO_CTRL2, BIT(21), BIT(21));
++		ret = regmap_read_poll_timeout(fifo->map, FIFO_STATUS1, val,
++					       val & BIT(17), 1, 200);
++		axg_fifo_pcm_trigger(component, ss, cmd);
++		regmap_update_bits(fifo->map, FIFO_CTRL2, BIT(21), 0);
++		return ret;
++	default:
++		return -EINVAL;
++	}
++}
++
++static const struct snd_soc_component_driver sc2_frddr_component_drv = {
++	.dapm_widgets = sm1_frddr_dapm_widgets,
++	.num_dapm_widgets = ARRAY_SIZE(sm1_frddr_dapm_widgets),
++	.dapm_routes = g12a_frddr_dapm_routes,
++	.num_dapm_routes = ARRAY_SIZE(g12a_frddr_dapm_routes),
++	.open = axg_fifo_pcm_open,
++	.close = axg_fifo_pcm_close,
++	.hw_params = sc2_frddr_pcm_hw_params,
++	.hw_free = axg_fifo_pcm_hw_free,
++	.pointer = axg_fifo_pcm_pointer,
++	.trigger = sc2_frddr_pcm_trigger,
++	.legacy_dai_naming = 1,
++};
++
++static const struct axg_fifo_match_data sc2_frddr_match_data = {
++	.field_threshold = REG_FIELD(FIFO_CTRL1, 16, 23),
++	.component_drv = &sc2_frddr_component_drv,
++	.dai_drv = &g12a_frddr_dai_drv,
++	.reset = true,
++};
++
+ static const struct of_device_id axg_frddr_of_match[] = {
+ 	{
+ 		.compatible = "amlogic,axg-frddr",
+@@ -382,6 +453,9 @@ static const struct of_device_id axg_frddr_of_match[] = {
+ 	}, {
+ 		.compatible = "amlogic,sm1-frddr",
+ 		.data = &sm1_frddr_match_data,
++	}, {
++		.compatible = "amlogic,sc2-frddr",
++		.data = &sc2_frddr_match_data,
+ 	}, {}
+ };
+ MODULE_DEVICE_TABLE(of, axg_frddr_of_match);
+diff --git a/sound/soc/meson/axg-spdifout.c b/sound/soc/meson/axg-spdifout.c
+index e8a12f15f3b4..022236c377ec 100644
+--- a/sound/soc/meson/axg-spdifout.c
++++ b/sound/soc/meson/axg-spdifout.c
+@@ -7,6 +7,7 @@
+ #include <linux/module.h>
+ #include <linux/of_platform.h>
+ #include <linux/regmap.h>
++#include <linux/reset.h>
+ #include <sound/soc.h>
+ #include <sound/soc-dai.h>
+ #include <sound/pcm_params.h>
+@@ -34,7 +35,6 @@
+ #define  SPDIFOUT_CTRL0_VSEL		BIT(18)
+ #define  SPDIFOUT_CTRL0_VSET		BIT(17)
+ #define  SPDIFOUT_CTRL0_MASK_MASK	GENMASK(11, 4)
+-#define  SPDIFOUT_CTRL0_MASK(x)		((x) << 4)
+ #define SPDIFOUT_CTRL1			0x10
+ #define  SPDIFOUT_CTRL1_MSB_POS_MASK	GENMASK(12, 8)
+ #define  SPDIFOUT_CTRL1_MSB_POS(x)	((x) << 8)
+@@ -60,6 +60,12 @@ struct axg_spdifout {
+ 	struct regmap *map;
+ 	struct clk *mclk;
+ 	struct clk *pclk;
++	const struct axg_spdifout_match_data *data;
++};
++
++struct axg_spdifout_match_data {
++	unsigned int mask;
++	unsigned int shift;
+ };
+ 
+ static void axg_spdifout_enable(struct regmap *map)
+@@ -128,10 +134,10 @@ static int axg_spdifout_sample_fmt(struct snd_pcm_hw_params *params,
+ 	/* Set the samples spdifout will pull from the FIFO */
+ 	switch (params_channels(params)) {
+ 	case 1:
+-		val = SPDIFOUT_CTRL0_MASK(0x1);
++		val = 0x1 << priv->data->shift;
+ 		break;
+ 	case 2:
+-		val = SPDIFOUT_CTRL0_MASK(0x3);
++		val = 0x3 << priv->data->shift;
+ 		break;
+ 	default:
+ 		dev_err(dai->dev, "too many channels for spdif dai: %u\n",
+@@ -140,7 +146,7 @@ static int axg_spdifout_sample_fmt(struct snd_pcm_hw_params *params,
+ 	}
+ 
+ 	regmap_update_bits(priv->map, SPDIFOUT_CTRL0,
+-			   SPDIFOUT_CTRL0_MASK_MASK, val);
++			   priv->data->mask, val);
+ 
+ 	/* FIFO data are arranged in chunks of 64bits */
+ 	switch (params_physical_width(params)) {
+@@ -393,8 +399,20 @@ static const struct regmap_config axg_spdifout_regmap_cfg = {
+ 	.max_register	= SPDIFOUT_MUTE_VAL,
+ };
+ 
++static const struct axg_spdifout_match_data axg_spdifout_data = {
++	.mask = SPDIFOUT_CTRL0_MASK_MASK,
++	.shift = 4,
++};
++
++/* TM2-revb/SC2 moved the lane mask to bits 0..15. */
++static const struct axg_spdifout_match_data sc2_spdifout_data = {
++	.mask = GENMASK(15, 0),
++	.shift = 0,
++};
++
+ static const struct of_device_id axg_spdifout_of_match[] = {
+-	{ .compatible = "amlogic,axg-spdifout", },
++	{ .compatible = "amlogic,axg-spdifout", .data = &axg_spdifout_data },
++	{ .compatible = "amlogic,sc2-spdifout", .data = &sc2_spdifout_data },
+ 	{}
+ };
+ MODULE_DEVICE_TABLE(of, axg_spdifout_of_match);
+@@ -404,11 +422,17 @@ static int axg_spdifout_probe(struct platform_device *pdev)
+ 	struct device *dev = &pdev->dev;
+ 	struct axg_spdifout *priv;
+ 	void __iomem *regs;
++	int ret;
+ 
+ 	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
+ 	if (!priv)
+ 		return -ENOMEM;
+ 	platform_set_drvdata(pdev, priv);
++	priv->data = device_get_match_data(dev);
++
++	ret = device_reset(dev);
++	if (ret)
++		return ret;
+ 
+ 	regs = devm_platform_ioremap_resource(pdev, 0);
+ 	if (IS_ERR(regs))
+diff --git a/sound/soc/meson/axg-tdmout.c b/sound/soc/meson/axg-tdmout.c
+index c4039e4f0847..88e9a0ffd990 100644
+--- a/sound/soc/meson/axg-tdmout.c
++++ b/sound/soc/meson/axg-tdmout.c
+@@ -311,6 +311,23 @@ static const struct axg_tdm_formatter_driver sm1_tdmout_drv = {
+ 	},
+ };
+ 
++/* SC2 uses the common four-lane formatter, but a separate gain block. */
++static const struct snd_soc_component_driver sc2_tdmout_component_drv = {
++	.dapm_widgets = sm1_tdmout_dapm_widgets,
++	.num_dapm_widgets = ARRAY_SIZE(sm1_tdmout_dapm_widgets),
++	.dapm_routes = sm1_tdmout_dapm_routes,
++	.num_dapm_routes = ARRAY_SIZE(sm1_tdmout_dapm_routes),
++};
++
++static const struct axg_tdm_formatter_driver sc2_tdmout_drv = {
++	.component_drv = &sc2_tdmout_component_drv,
++	.regmap_cfg = &axg_tdmout_regmap_cfg,
++	.ops = &axg_tdmout_ops,
++	.quirks = &(const struct axg_tdm_formatter_hw) {
++		.skew_offset = 2,
++	},
++};
++
+ static const struct of_device_id axg_tdmout_of_match[] = {
+ 	{
+ 		.compatible = "amlogic,axg-tdmout",
+@@ -321,6 +338,9 @@ static const struct of_device_id axg_tdmout_of_match[] = {
+ 	}, {
+ 		.compatible = "amlogic,sm1-tdmout",
+ 		.data = &sm1_tdmout_drv,
++	}, {
++		.compatible = "amlogic,sc2-tdmout",
++		.data = &sc2_tdmout_drv,
+ 	}, {}
+ };
+ MODULE_DEVICE_TABLE(of, axg_tdmout_of_match);
+diff --git a/sound/soc/meson/g12a-toacodec.c b/sound/soc/meson/g12a-toacodec.c
+index 531bb8707a3e..6f3f5826a110 100644
+--- a/sound/soc/meson/g12a-toacodec.c
++++ b/sound/soc/meson/g12a-toacodec.c
+@@ -47,6 +47,7 @@ struct g12a_toacodec {
+ 	struct regmap_field *field_dat_sel;
+ 	struct regmap_field *field_lrclk_sel;
+ 	struct regmap_field *field_bclk_sel;
++	bool separate_channels;
+ };
+ 
+ struct g12a_toacodec_match_data {
+@@ -54,6 +55,7 @@ struct g12a_toacodec_match_data {
+ 	struct reg_field field_dat_sel;
+ 	struct reg_field field_lrclk_sel;
+ 	struct reg_field field_bclk_sel;
++	bool separate_channels;
+ };
+ 
+ static const char * const g12a_toacodec_mux_texts[] = {
+@@ -84,6 +86,9 @@ static int g12a_toacodec_mux_put_enum(struct snd_kcontrol *kcontrol,
+ 	snd_soc_dapm_mux_update_power(dapm, kcontrol, 0, NULL, NULL);
+ 
+ 	regmap_field_write(priv->field_dat_sel, mux);
++	if (priv->separate_channels)
++		snd_soc_component_update_bits(component, e->reg, GENMASK(23, 22),
++					      FIELD_PREP(GENMASK(23, 22), mux));
+ 	regmap_field_write(priv->field_lrclk_sel, mux);
+ 	regmap_field_write(priv->field_bclk_sel, mux);
+ 
+@@ -143,6 +148,26 @@ static const struct snd_soc_dapm_widget sm1_toacodec_widgets[] = {
+ 			    &g12a_toacodec_out_enable),
+ };
+ 
++static int sc2_toacodec_clock_event(struct snd_soc_dapm_widget *w,
++				  struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_component *c = snd_soc_dapm_to_component(w->dapm);
++	unsigned int mask = BIT(29) | BIT(30);
++	int ret;
++
++	ret = snd_soc_component_update_bits(c, TOACODEC_CTRL0, mask,
++			SND_SOC_DAPM_EVENT_ON(event) ? mask : 0);
++	return ret < 0 ? ret : 0;
++}
++
++static const struct snd_soc_dapm_widget sc2_toacodec_widgets[] = {
++	SND_SOC_DAPM_MUX("SRC", SND_SOC_NOPM, 0, 0,
++			 &sm1_toacodec_mux),
++	SND_SOC_DAPM_SWITCH_E("OUT EN", SND_SOC_NOPM, 0, 0,
++		&g12a_toacodec_out_enable, sc2_toacodec_clock_event,
++		SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMD),
++};
++
+ static int g12a_toacodec_input_hw_params(struct snd_pcm_substream *substream,
+ 					 struct snd_pcm_hw_params *params,
+ 					 struct snd_soc_dai *dai)
+@@ -220,6 +245,13 @@ static int sm1_toacodec_component_probe(struct snd_soc_component *c)
+ 				       CTRL0_BLK_CAP_INV_SM1);
+ }
+ 
++static int sc2_toacodec_component_probe(struct snd_soc_component *c)
++{
++	/* Channel 0 from the low word, channel 1 from the high word. */
++	return snd_soc_component_write(c, TOACODEC_CTRL0,
++				       CTRL0_BLK_CAP_INV_SM1 | BIT(20));
++}
++
+ static const struct snd_soc_dapm_route g12a_toacodec_routes[] = {
+ 	{ "SRC", "I2S A", "IN A Playback" },
+ 	{ "SRC", "I2S B", "IN B Playback" },
+@@ -258,6 +290,15 @@ static const struct snd_soc_component_driver sm1_toacodec_component_drv = {
+ 	.endianness		= 1,
+ };
+ 
++static const struct snd_soc_component_driver sc2_toacodec_component_drv = {
++	.probe = sc2_toacodec_component_probe,
++	.dapm_widgets = sc2_toacodec_widgets,
++	.num_dapm_widgets = ARRAY_SIZE(sc2_toacodec_widgets),
++	.dapm_routes = g12a_toacodec_routes,
++	.num_dapm_routes = ARRAY_SIZE(g12a_toacodec_routes),
++	.endianness = 1,
++};
++
+ static const struct regmap_config g12a_toacodec_regmap_cfg = {
+ 	.reg_bits	= 32,
+ 	.val_bits	= 32,
+@@ -278,6 +319,14 @@ static const struct g12a_toacodec_match_data sm1_toacodec_match_data = {
+ 	.field_bclk_sel	= REG_FIELD(TOACODEC_CTRL0, 4, 6),
+ };
+ 
++static const struct g12a_toacodec_match_data sc2_toacodec_match_data = {
++	.component_drv = &sc2_toacodec_component_drv,
++	.field_dat_sel = REG_FIELD(TOACODEC_CTRL0, 18, 19),
++	.field_lrclk_sel = REG_FIELD(TOACODEC_CTRL0, 12, 14),
++	.field_bclk_sel = REG_FIELD(TOACODEC_CTRL0, 4, 6),
++	.separate_channels = true,
++};
++
+ static const struct of_device_id g12a_toacodec_of_match[] = {
+ 	{
+ 		.compatible = "amlogic,g12a-toacodec",
+@@ -287,6 +336,10 @@ static const struct of_device_id g12a_toacodec_of_match[] = {
+ 		.compatible = "amlogic,sm1-toacodec",
+ 		.data = &sm1_toacodec_match_data,
+ 	},
++	{
++		.compatible = "amlogic,sc2-toacodec",
++		.data = &sc2_toacodec_match_data,
++	},
+ 	{}
+ };
+ MODULE_DEVICE_TABLE(of, g12a_toacodec_of_match);
+@@ -311,6 +364,7 @@ static int g12a_toacodec_probe(struct platform_device *pdev)
+ 		return -ENOMEM;
+ 
+ 	platform_set_drvdata(pdev, priv);
++	priv->separate_channels = data->separate_channels;
+ 
+ 	ret = device_reset(dev);
+ 	if (ret)
+diff --git a/sound/soc/meson/g12a-tohdmitx.c b/sound/soc/meson/g12a-tohdmitx.c
+index b92434125fac..721d01f1e481 100644
+--- a/sound/soc/meson/g12a-tohdmitx.c
++++ b/sound/soc/meson/g12a-tohdmitx.c
+@@ -68,6 +68,12 @@ static int g12a_tohdmitx_i2s_mux_put_enum(struct snd_kcontrol *kcontrol,
+ 				      FIELD_PREP(CTRL0_I2S_LRCLK_SEL, mux) |
+ 				      FIELD_PREP(CTRL0_I2S_BCLK_SEL, mux));
+ 
++	/* As on TOACODEC, interface A/B/C uses master clock A/B/C. */
++	if (of_device_is_compatible(component->dev->of_node,
++				    "amlogic,sc2-tohdmitx"))
++		snd_soc_component_update_bits(component, e->reg, GENMASK(18, 16),
++					      FIELD_PREP(GENMASK(18, 16), mux));
++
+ 	snd_soc_dapm_mux_update_power(dapm, kcontrol, mux, e, NULL);
+ 
+ 	return 1;
+@@ -145,6 +151,34 @@ static const struct snd_soc_dapm_widget g12a_tohdmitx_widgets[] = {
+ 			    &g12a_tohdmitx_out_enable),
+ };
+ 
++static int sc2_tohdmitx_clock_event(struct snd_soc_dapm_widget *w,
++				  struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_component *c = snd_soc_dapm_to_component(w->dapm);
++	unsigned int mask = BIT(w->shift - 1);
++	int ret;
++
++	ret = snd_soc_component_update_bits(c, TOHDMITX_CTRL0, mask,
++			SND_SOC_DAPM_EVENT_ON(event) ? mask : 0);
++	return ret < 0 ? ret : 0;
++}
++
++static const struct snd_kcontrol_new sc2_tohdmitx_i2s_enable =
++	SOC_DAPM_SINGLE_AUTODISABLE("Switch", TOHDMITX_CTRL0, 29, 1, 0);
++
++static const struct snd_soc_dapm_widget sc2_tohdmitx_widgets[] = {
++	SND_SOC_DAPM_MUX("I2S SRC", SND_SOC_NOPM, 0, 0,
++			 &g12a_tohdmitx_i2s_mux),
++	SND_SOC_DAPM_SWITCH_E("I2S OUT EN", SND_SOC_NOPM, 29, 0,
++		&sc2_tohdmitx_i2s_enable, sc2_tohdmitx_clock_event,
++		SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMD),
++	SND_SOC_DAPM_MUX("SPDIF SRC", SND_SOC_NOPM, 0, 0,
++			 &g12a_tohdmitx_spdif_mux),
++	SND_SOC_DAPM_SWITCH_E("SPDIF OUT EN", SND_SOC_NOPM, 31, 0,
++		&g12a_tohdmitx_out_enable, sc2_tohdmitx_clock_event,
++		SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMD),
++};
++
+ static const struct snd_soc_dai_ops g12a_tohdmitx_input_ops = {
+ 	.probe		= meson_codec_glue_input_dai_probe,
+ 	.remove		= meson_codec_glue_input_dai_remove,
+@@ -234,6 +268,23 @@ static const struct snd_soc_component_driver g12a_tohdmitx_component_drv = {
+ 	.endianness		= 1,
+ };
+ 
++static int sc2_tohdmi_component_probe(struct snd_soc_component *c)
++{
++	/* Feed the HDMI master clock through its documented divide-by-two. */
++	return snd_soc_component_write(c, TOHDMITX_CTRL0,
++		CTRL0_I2S_BLK_CAP_INV | CTRL0_SPDIF_CLK_CAP_INV |
++		BIT(19) | BIT(20));
++}
++
++static const struct snd_soc_component_driver sc2_tohdmitx_component_drv = {
++	.probe = sc2_tohdmi_component_probe,
++	.dapm_widgets = sc2_tohdmitx_widgets,
++	.num_dapm_widgets = ARRAY_SIZE(sc2_tohdmitx_widgets),
++	.dapm_routes = g12a_tohdmitx_routes,
++	.num_dapm_routes = ARRAY_SIZE(g12a_tohdmitx_routes),
++	.endianness = 1,
++};
++
+ static const struct regmap_config g12a_tohdmitx_regmap_cfg = {
+ 	.reg_bits	= 32,
+ 	.val_bits	= 32,
+@@ -241,7 +292,10 @@ static const struct regmap_config g12a_tohdmitx_regmap_cfg = {
+ };
+ 
+ static const struct of_device_id g12a_tohdmitx_of_match[] = {
+-	{ .compatible = "amlogic,g12a-tohdmitx", },
++	{ .compatible = "amlogic,g12a-tohdmitx",
++	  .data = &g12a_tohdmitx_component_drv },
++	{ .compatible = "amlogic,sc2-tohdmitx",
++	  .data = &sc2_tohdmitx_component_drv },
+ 	{}
+ };
+ MODULE_DEVICE_TABLE(of, g12a_tohdmitx_of_match);
+@@ -269,7 +323,7 @@ static int g12a_tohdmitx_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	return devm_snd_soc_register_component(dev,
+-			&g12a_tohdmitx_component_drv, g12a_tohdmitx_dai_drv,
++			device_get_match_data(dev), g12a_tohdmitx_dai_drv,
+ 			ARRAY_SIZE(g12a_tohdmitx_dai_drv));
+ }
+ 
+-- 
+2.47.3
+

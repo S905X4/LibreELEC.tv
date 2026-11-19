@@ -1,0 +1,43 @@
+From 1e16f085799bbfb701d997a7ca94ac556121284e Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Fri, 13 Nov 2026 06:08:16 +0800
+Subject: [PATCH] drm/meson: Select automatic AFBC frame resets on SC2
+
+SC2 no longer uses the G12A per-frame software-reset workaround,
+but still inherits its manual-reset bit. The first-frame observation
+keeps AFBC active through the first UHD frame, then observes its error
+state around the following VSYNC with the same header.
+
+Select automatic frame resets on SC2 during AFBCD initialization,
+after VIU initialization disables OSD and AFBC routing and before
+CRTC creation and IRQ registration. Retain G12A manual mode, the SC2
+activation reset, RDMA operation and existing buffer ownership.
+
+This is a startup-configured hardware candidate. Do not reproduce the
+unsafe live manual-bit restoration experiment; actual mode and UI
+acceptance must establish the result after a normal image restart.
+
+Change-Id: Ib3a861f85927e19b6efb8ea8fcb597c17ed25d43
+---
+ drivers/gpu/drm/meson/meson_osd_afbcd.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/meson/meson_osd_afbcd.c b/drivers/gpu/drm/meson/meson_osd_afbcd.c
+index 15fdc5e2f9a6..5c18fecebce3 100644
+--- a/drivers/gpu/drm/meson/meson_osd_afbcd.c
++++ b/drivers/gpu/drm/meson/meson_osd_afbcd.c
+@@ -305,8 +305,9 @@ static int meson_g12a_afbcd_init(struct meson_drm *priv)
+ 
+ 	meson_rdma_setup(priv);
+ 
+-	/* Handle AFBC Decoder reset manually */
+-	writel_bits_relaxed(MALI_AFBCD_MANUAL_RESET, MALI_AFBCD_MANUAL_RESET,
++	/* Use frame-boundary resets on SC2; retain G12A's manual workaround. */
++	writel_bits_relaxed(MALI_AFBCD_MANUAL_RESET,
++			    priv->sc2 ? 0 : MALI_AFBCD_MANUAL_RESET,
+ 			    priv->io_base + _REG(MALI_AFBCD_TOP_CTRL));
+ 
+ 	return 0;
+-- 
+2.47.3
+

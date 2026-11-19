@@ -1,0 +1,40 @@
+From 9ea247886dfc16547a4320c945ad383321db3ef0 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Sat, 14 Nov 2026 07:57:51 +0800
+Subject: [PATCH] drm/meson: keep SC2 VIU1 configuration sync disabled
+
+The SC2 donor leaves OSD configuration synchronization disabled for
+VIU1, unlike the independent VIU2 output. The inherited G12A AFBC path
+sets it on every atomic update instead.
+
+A held three-surface composition recovered from black when only the
+three CFG_SYN_EN bits were cleared, with backing and geometry unchanged.
+Keep the SC2 policy in normal state construction rather than adding a
+post-failure control write, delay or decoder reset. Preserve G12A.
+
+The targeted plane object builds. Full-image validation of the original
+transition sequence and timing observer is still required.
+
+Change-Id: Id57ea5044e2a441afce4de52f6b579424937777d
+---
+ drivers/gpu/drm/meson/meson_plane.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/meson/meson_plane.c b/drivers/gpu/drm/meson/meson_plane.c
+index d0314a541b45..d65af083ab24 100644
+--- a/drivers/gpu/drm/meson/meson_plane.c
++++ b/drivers/gpu/drm/meson/meson_plane.c
+@@ -277,7 +277,9 @@ static void meson_plane_atomic_update(struct drm_plane *plane,
+ 				(1 + meson_plane->index * (priv->sc2 ? 2 : 1));
+ 			osd->blk0_cfg[0] |= OSD_ENDIANNESS_BE;
+ 			osd->ctrl_stat2 |= OSD_PENDING_STAT_CLEAN;
+-			osd->ctrl_stat |= VIU_OSD1_CFG_SYN_EN;
++			/* SC2 VIU1 keeps configuration sync disabled. */
++			if (!priv->sc2)
++				osd->ctrl_stat |= VIU_OSD1_CFG_SYN_EN;
+ 		}
+ 
+ 		if (meson_vpu_is_compatible(priv, VPU_COMPATIBLE_GXM)) {
+-- 
+2.47.3
+

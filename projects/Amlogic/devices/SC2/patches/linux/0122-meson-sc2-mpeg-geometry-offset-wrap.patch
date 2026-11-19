@@ -1,0 +1,37 @@
+From 906949ba8b5933f10f0d71fe4847174c4c6d56c0 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Sat, 14 Nov 2026 05:08:50 +0800
+Subject: [PATCH] media: meson: advance MPEG geometry interval watermark
+
+Do not keep the original sequence offset forever when geometry stays
+unchanged. Advance the retained interval to each exact completed packet
+so signed offset comparisons remain within the bounded FIFO distance.
+
+The compiled production selector regression previously aborted after
+2 GiB of same-size input. It now passes progress past 4 GiB, changes
+across u32 wrap and future interval selection without changing pixels.
+
+Change-Id: Ic232b7b9d09e7d54566dade1e057cb3f33e9985f
+---
+ drivers/staging/media/meson/vdec/codec_mpeg12.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/drivers/staging/media/meson/vdec/codec_mpeg12.c b/drivers/staging/media/meson/vdec/codec_mpeg12.c
+index 33ae0d3e1f01..80a565584569 100644
+--- a/drivers/staging/media/meson/vdec/codec_mpeg12.c
++++ b/drivers/staging/media/meson/vdec/codec_mpeg12.c
+@@ -935,6 +935,11 @@ static int mpeg12_multi_picture_format(struct mpeg12_multi *m,
+ 		kfree(f);
+ 		f = next;
+ 	}
++	/* Completion offsets advance in coded order within the bounded FIFO.
++	 * Move the retained interval's watermark so unchanged geometry remains
++	 * valid across 2 GiB and full 32-bit stream-offset wraparound.
++	 */
++	f->offset = pic->packet_offset;
+ 	pic->width = f->width;
+ 	pic->height = f->height;
+ 	return 0;
+-- 
+2.47.3
+

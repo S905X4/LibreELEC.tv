@@ -1,0 +1,45 @@
+From 2b9203dc939b29ca4eeef4fe6bd67f3a82d58bd3 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Fri, 13 Nov 2026 07:54:23 +0800
+Subject: [PATCH] drm/meson: Initialize the SC2 video blend black background
+
+With VD1 disabled and VD2 still displaying its own native FBC image,
+the uncovered background is green. Native initialization leaves the
+older 10-bit dummy packing and firmware postblend alpha untouched.
+
+Initialize the SC2 ten-bit YCbCr dummy to the exact applicable BSP
+black value and initialize postblend dummy color and alpha. Preserve
+the independent video and OSD layer routes, scalers and DMA ownership.
+
+The real independent-plane capture is the repro; verify the formerly
+green stage on the matched image rather than accepting a DRM state
+or diagnostic exit status as pixel proof.
+
+Change-Id: I61bdd13501cba650ae33f32c47a66665420d85ab
+---
+ drivers/gpu/drm/meson/meson_vpp.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/drivers/gpu/drm/meson/meson_vpp.c b/drivers/gpu/drm/meson/meson_vpp.c
+index dcaafd0bd91c..a181584a1336 100644
+--- a/drivers/gpu/drm/meson/meson_vpp.c
++++ b/drivers/gpu/drm/meson/meson_vpp.c
+@@ -153,6 +153,15 @@ void meson_vpp_init(struct meson_drm *priv)
+ 	} else if (meson_vpu_is_compatible(priv, VPU_COMPATIBLE_G12A))
+ 		writel_relaxed(0xf, priv->io_base + _REG(DOLBY_PATH_CTRL));
+ 
++	/* SC2 blends ten-bit YCbCr, including when only VD2 remains enabled. */
++	if (priv->sc2) {
++		writel_relaxed(0x04080200, priv->io_base + _REG(VPP_DUMMY_DATA));
++		writel_relaxed(0x008080, priv->io_base +
++			       _REG(VPP_POST_BLEND_BLEND_DUMMY_DATA));
++		writel_relaxed(0x7fffffff, priv->io_base +
++			       _REG(VPP_POST_BLEND_DUMMY_ALPHA));
++	}
++
+ 	/* Initialize vpu fifo control registers */
+ 	if (meson_vpu_is_compatible(priv, VPU_COMPATIBLE_G12A))
+ 		writel_relaxed(VPP_OFIFO_SIZE_DEFAULT,
+-- 
+2.47.3
+

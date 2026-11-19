@@ -1,0 +1,86 @@
+From a96aa23ae5f53b7cab299dfd64dce35ed253337c Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Fri, 13 Nov 2026 02:02:08 +0800
+Subject: [PATCH] drm/meson: Validate effective TMDS for advertised 420 modes
+
+Keep source and sink limits separate. This is the final encoder delta
+against the packaged pre-0081 baseline; obsolete policy patches are removed.
+
+An EDID can advertise UHD50/60 as 420-only at a 300 MHz TMDS limit
+without SCDC. Rejecting its 594 MHz pixel clock removes the valid 297 MHz
+transport. The existing DW bridge negotiates 8-bpc 420 in this chain.
+
+Consolidate bandwidth admission in the existing Meson bridge validator.
+Use the same 420-only/420-also preference as DW for effective TMDS and
+clock prediction. Check the declared sink limit and require scrambling
+support only above 340 MHz effective TMDS. Retain high-rate RGB on sinks
+that support it; do not turn the capture-card limit into a SoC ceiling.
+
+Remove the duplicate platform and connector policies. Meson already
+validates every bridge in its no-connector chain; the DW-owned connector
+was not the connector instantiated by this board.
+
+Change-Id: Ia127d8920cc8e81ff0450e96f63869da084e88ad
+
+---
+diff --git a/drivers/gpu/drm/meson/meson_encoder_hdmi.c b/drivers/gpu/drm/meson/meson_encoder_hdmi.c
+index 8205ee56a691..bd861ab71779 100644
+--- a/drivers/gpu/drm/meson/meson_encoder_hdmi.c
++++ b/drivers/gpu/drm/meson/meson_encoder_hdmi.c
+@@ -123,8 +123,10 @@ static enum drm_mode_status meson_encoder_hdmi_mode_valid(struct drm_bridge *bri
+ {
+ 	struct meson_encoder_hdmi *encoder_hdmi = bridge_to_meson_encoder_hdmi(bridge);
+ 	struct meson_drm *priv = encoder_hdmi->priv;
+-	bool is_hdmi2_sink = display_info->hdmi.scdc.supported;
++	bool mode_is_420 = drm_mode_is_420_only(display_info, mode) ||
++			   drm_mode_is_420_also(display_info, mode);
+ 	unsigned long long clock = mode->clock * 1000ULL;
++	unsigned int tmds_clock = mode->clock;
+ 	unsigned long long phy_freq;
+ 	unsigned long long vclk_freq;
+ 	unsigned long long venc_freq;
+@@ -134,12 +136,16 @@ static enum drm_mode_status meson_encoder_hdmi_mode_valid(struct drm_bridge *bri
+ 
+ 	dev_dbg(priv->dev, "Modeline " DRM_MODE_FMT "\n", DRM_MODE_ARG(mode));
+ 
+-	/* If sink does not support 540MHz, reject the non-420 HDMI2 modes */
++	/* Match the 8-bpc format preference of the downstream DW-HDMI bridge. */
++	if (mode_is_420)
++		tmds_clock = DIV_ROUND_UP(tmds_clock, 2);
+ 	if (display_info->max_tmds_clock &&
+-	    mode->clock > display_info->max_tmds_clock &&
+-	    !drm_mode_is_420_only(display_info, mode) &&
+-	    !drm_mode_is_420_also(display_info, mode))
+-		return MODE_BAD;
++	    tmds_clock > display_info->max_tmds_clock)
++		return MODE_CLOCK_HIGH;
++	if (tmds_clock > 340000 &&
++	    (!display_info->hdmi.scdc.supported ||
++	     !display_info->hdmi.scdc.scrambling.supported))
++		return MODE_CLOCK_HIGH;
+ 
+ 	/* Check against non-VIC supported modes */
+ 	if (!vic) {
+@@ -155,9 +161,7 @@ static enum drm_mode_status meson_encoder_hdmi_mode_valid(struct drm_bridge *bri
+ 	vclk_freq = clock;
+ 
+ 	/* For 420, pixel clock is half unlike venc clock */
+-	if (drm_mode_is_420_only(display_info, mode) ||
+-	    (!is_hdmi2_sink &&
+-	     drm_mode_is_420_also(display_info, mode)))
++	if (mode_is_420)
+ 		vclk_freq /= 2;
+ 
+ 	/* TMDS clock is pixel_clock * 10 */
+@@ -171,10 +175,7 @@ static enum drm_mode_status meson_encoder_hdmi_mode_valid(struct drm_bridge *bri
+ 	hdmi_freq = vclk_freq;
+ 
+ 	/* VENC double pixels for 1080i, 720p and YUV420 modes */
+-	if (meson_venc_hdmi_venc_repeat(vic) ||
+-	    drm_mode_is_420_only(display_info, mode) ||
+-	    (!is_hdmi2_sink &&
+-	     drm_mode_is_420_also(display_info, mode)))
++	if (meson_venc_hdmi_venc_repeat(vic) || mode_is_420)
+ 		venc_freq *= 2;
+ 
+ 	vclk_freq = max(venc_freq, hdmi_freq);

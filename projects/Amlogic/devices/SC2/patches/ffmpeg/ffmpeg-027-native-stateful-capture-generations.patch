@@ -1,0 +1,26 @@
+From: hiper25 <whydonit@gmail.com>
+Subject: [PATCH] avcodec: honor native VP9 and AVS2 capture generations
+
+The native shared stateful node terminates old capture with LAST before
+reconfiguration. Apply the same explicit boundary and fresh-generation
+contract as H264. In particular, OUTPUT reset must discard stale EOS and
+orphan held capture before the next initial configuration. Otherwise a
+held-tail seek returns the old EOS without presenting the new sequence.
+
+--- a/libavcodec/v4l2_m2m_dec.c
++++ b/libavcodec/v4l2_m2m_dec.c
+@@ -1442,9 +1442,12 @@
+         s->quirks |= FF_V4L2_QUIRK_FIXED_CAPTURE;
+     if (strcmp(cap.driver, "meson-sc2-vdec") == 0 &&
+         (avctx->codec_id == AV_CODEC_ID_MPEG1VIDEO ||
+-         avctx->codec_id == AV_CODEC_ID_MPEG2VIDEO || avctx->codec_id == AV_CODEC_ID_H264))
++         avctx->codec_id == AV_CODEC_ID_MPEG2VIDEO || avctx->codec_id == AV_CODEC_ID_H264 ||
++         avctx->codec_id == AV_CODEC_ID_VP9 || avctx->codec_id == AV_CODEC_ID_AVS2))
+         s->quirks |= FF_V4L2_QUIRK_CAPTURE_BOUNDARY;
+-    if (strcmp(cap.driver, "meson-sc2-vdec") == 0 && avctx->codec_id == AV_CODEC_ID_H264)
++    if (strcmp(cap.driver, "meson-sc2-vdec") == 0 &&
++        (avctx->codec_id == AV_CODEC_ID_H264 || avctx->codec_id == AV_CODEC_ID_VP9 ||
++         avctx->codec_id == AV_CODEC_ID_AVS2))
+         s->quirks |= FF_V4L2_QUIRK_REINIT_ALWAYS;
+     if (strcmp(cap.driver, "meson-sc2-vdec") == 0 &&
+         avctx->codec_id == AV_CODEC_ID_MPEG4 &&

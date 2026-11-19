@@ -1,0 +1,103 @@
+From 5016b0eb9615822a87a27bf86387db6a81b02498 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Wed, 21 Oct 2026 22:08:03 +0800
+Subject: [PATCH] drm/meson: correct SC2 RDMA triggering and descriptor
+ accounting
+
+SC2 routes channel-one VSYNC through RDMA_AUTO_SRC1_SEL. Use that
+register for the SC2 variant and retain the original trigger for other
+SoCs. Count complete register/value descriptors so the programmed byte
+range excludes uninitialized entries, and do not arm an empty range.
+
+The actual LibreELEC candidate boots with Kodi scanning out AFBC at
+1920x1080p60. The same capture path was black before this correction;
+linear rendering was the discriminator, not the permanent fix.
+
+Change-Id: I85545fd6f398f0f64d60836711732b4103159994
+---
+ drivers/gpu/drm/meson/meson_rdma.c      | 34 +++++++++++++++++--------
+ drivers/gpu/drm/meson/meson_registers.h |  2 ++
+ 2 files changed, 26 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/meson/meson_rdma.c b/drivers/gpu/drm/meson/meson_rdma.c
+index 130382178c63..961ee43597e8 100644
+--- a/drivers/gpu/drm/meson/meson_rdma.c
++++ b/drivers/gpu/drm/meson/meson_rdma.c
+@@ -75,10 +75,15 @@ void meson_rdma_stop(struct meson_drm *priv)
+ 			    priv->io_base + _REG(RDMA_CTRL));
+ 
+ 	/* Stop Channel 1 */
+-	writel_bits_relaxed(RDMA_ACCESS_TRIGGER_CHAN1,
+-			    FIELD_PREP(RDMA_ACCESS_ADDR_INC_CHAN1,
+-				       RDMA_ACCESS_TRIGGER_STOP),
+-			    priv->io_base + _REG(RDMA_ACCESS_AUTO));
++	if (priv->sc2)
++		writel_bits_relaxed(RDMA_AUTO_SRC1_MASK,
++				    RDMA_ACCESS_TRIGGER_STOP,
++				    priv->io_base + _REG(RDMA_AUTO_SRC1_SEL));
++	else
++		writel_bits_relaxed(RDMA_ACCESS_TRIGGER_CHAN1,
++				    FIELD_PREP(RDMA_ACCESS_TRIGGER_CHAN1,
++					       RDMA_ACCESS_TRIGGER_STOP),
++				    priv->io_base + _REG(RDMA_ACCESS_AUTO));
+ }
+ 
+ void meson_rdma_reset(struct meson_drm *priv)
+@@ -96,8 +101,9 @@ static void meson_rdma_writel(struct meson_drm *priv, uint32_t val,
+ 		return;
+ 	}
+ 
+-	priv->rdma.addr[priv->rdma.offset++] = reg;
+-	priv->rdma.addr[priv->rdma.offset++] = val;
++	priv->rdma.addr[priv->rdma.offset * 2] = reg;
++	priv->rdma.addr[priv->rdma.offset * 2 + 1] = val;
++	priv->rdma.offset++;
+ }
+ 
+ /*
+@@ -117,6 +123,9 @@ void meson_rdma_flush(struct meson_drm *priv)
+ {
+ 	meson_rdma_stop(priv);
+ 
++	if (!priv->rdma.offset)
++		return;
++
+ 	/* Start of Channel 1 register writes buffer */
+ 	writel(priv->rdma.addr_dma,
+ 	       priv->io_base + _REG(RDMA_AHB_START_ADDR_1));
+@@ -126,10 +135,15 @@ void meson_rdma_flush(struct meson_drm *priv)
+ 	       priv->io_base + _REG(RDMA_AHB_END_ADDR_1));
+ 
+ 	/* Trigger Channel 1 on VSYNC event */
+-	writel_bits_relaxed(RDMA_ACCESS_TRIGGER_CHAN1,
+-			    FIELD_PREP(RDMA_ACCESS_TRIGGER_CHAN1,
+-				       RDMA_ACCESS_TRIGGER_VSYNC),
+-			    priv->io_base + _REG(RDMA_ACCESS_AUTO));
++	if (priv->sc2)
++		writel_bits_relaxed(RDMA_AUTO_SRC1_MASK,
++				    RDMA_ACCESS_TRIGGER_VSYNC,
++				    priv->io_base + _REG(RDMA_AUTO_SRC1_SEL));
++	else
++		writel_bits_relaxed(RDMA_ACCESS_TRIGGER_CHAN1,
++				    FIELD_PREP(RDMA_ACCESS_TRIGGER_CHAN1,
++					       RDMA_ACCESS_TRIGGER_VSYNC),
++				    priv->io_base + _REG(RDMA_ACCESS_AUTO));
+ 
+ 	priv->rdma.offset = 0;
+ }
+diff --git a/drivers/gpu/drm/meson/meson_registers.h b/drivers/gpu/drm/meson/meson_registers.h
+index 3d73d00a1f4c..e02e545a6b20 100644
+--- a/drivers/gpu/drm/meson/meson_registers.h
++++ b/drivers/gpu/drm/meson/meson_registers.h
+@@ -1282,6 +1282,8 @@
+ #define		RDMA_ACCESS_MAN_RW_FLAG		BIT(2)
+ #define		RDMA_ACCESS_MAN_ADDR_INC	BIT(1)
+ #define		RDMA_ACCESS_MAN_START		BIT(0)
++#define RDMA_AUTO_SRC1_SEL 0x1123
++#define		RDMA_AUTO_SRC1_MASK		GENMASK(15, 0)
+ #define RDMA_CTRL 0x1114
+ #define		RDMA_IRQ_CLEAR_CHAN7	BIT(31)
+ #define		RDMA_IRQ_CLEAR_CHAN6	BIT(30)
+-- 
+2.47.3
+

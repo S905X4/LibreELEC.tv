@@ -1,0 +1,139 @@
+From 2ce6f876ad5df1a8dc80b18ace9862b5d8c882e0 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Tue, 20 Oct 2026 00:14:32 +0800
+Subject: [PATCH] media: rc: Add the HK1 RBOX X4 stock NEC keytable
+
+Translate the stock map_0 command/keycode words into rc-core NEC
+scancodes. Address 0x04 and inverse 0xfb form the normal NEC address,
+so commands use 0x04xx rather than vendor-packed customcode words.
+
+Preserve all 51 stock key symbols without guessing button labels.
+The board selects this map separately; actual bundled-remote frame
+and key-event reception remain hardware acceptance requirements.
+
+Change-Id: Ia67dfc19c5f14fd336611a5fe2c0a8d6228aaa08
+---
+ drivers/media/rc/keymaps/Makefile         |  1 +
+ drivers/media/rc/keymaps/rc-hk1-rbox-x4.c | 88 +++++++++++++++++++++++
+ include/media/rc-map.h                    |  1 +
+ 3 files changed, 90 insertions(+)
+ create mode 100644 drivers/media/rc/keymaps/rc-hk1-rbox-x4.c
+
+diff --git a/drivers/media/rc/keymaps/Makefile b/drivers/media/rc/keymaps/Makefile
+index d04572627cdd0b7962c5035a9202ca265d36eeb1..f0b59798f293d8f858c0a24666cf1f0ef0a680dd 100644
+--- a/drivers/media/rc/keymaps/Makefile
++++ b/drivers/media/rc/keymaps/Makefile
+@@ -59,6 +59,7 @@ obj-$(CONFIG_RC_MAP) += \
+ 			rc-hauppauge.o \
+ 			rc-hisi-poplar.o \
+ 			rc-hisi-tv-demo.o \
++			rc-hk1-rbox-x4.o \
+ 			rc-imon-mce.o \
+ 			rc-imon-pad.o \
+ 			rc-imon-rsc.o \
+diff --git a/drivers/media/rc/keymaps/rc-hk1-rbox-x4.c b/drivers/media/rc/keymaps/rc-hk1-rbox-x4.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..1156bbf4f6c860d14e032a6a3f9e39c5ad7268f8
+--- /dev/null
++++ b/drivers/media/rc/keymaps/rc-hk1-rbox-x4.c
+@@ -0,0 +1,88 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * HK1 RBOX X4 stock NEC keytable (sc2_ah212_4g, customcode 0xfb04).
++ * Vendor words store command in bits 23:16 and Linux keycode in bits 15:0.
++ * NEC address 0x04 and inverse 0xfb become rc-core scancodes 0x04xx.
++ */
++
++#include <linux/module.h>
++#include <media/rc-map.h>
++
++static struct rc_map_table hk1_rbox_x4[] = {
++	{ 0x0447, KEY_0 },
++	{ 0x0413, KEY_1 },
++	{ 0x0410, KEY_2 },
++	{ 0x0411, KEY_3 },
++	{ 0x040f, KEY_4 },
++	{ 0x040c, KEY_5 },
++	{ 0x040d, KEY_6 },
++	{ 0x040b, KEY_7 },
++	{ 0x0408, KEY_8 },
++	{ 0x0409, KEY_9 },
++	{ 0x045c, KEY_RIGHTCTRL },
++	{ 0x0451, KEY_F3 },
++	{ 0x0450, KEY_F4 },
++	{ 0x0440, KEY_F5 },
++	{ 0x044d, KEY_F6 },
++	{ 0x0443, KEY_F7 },
++	{ 0x0417, KEY_F8 },
++	{ 0x0400, KEY_F9 },
++	{ 0x0401, KEY_F10 },
++	{ 0x0416, KEY_F11 },
++	{ 0x0449, KEY_BACKSPACE },
++	{ 0x0406, KEY_PROPS },
++	{ 0x0414, KEY_UNDO },
++	{ 0x0444, KEY_UP },
++	{ 0x041d, KEY_DOWN },
++	{ 0x041c, KEY_LEFT },
++	{ 0x0448, KEY_RIGHT },
++	{ 0x0453, KEY_LEFTMETA },
++	{ 0x0445, KEY_PAGEUP },
++	{ 0x0419, KEY_PAGEDOWN },
++	{ 0x0452, KEY_PAUSE },
++	{ 0x0405, KEY_HANGEUL },
++	{ 0x0459, KEY_HANJA },
++	{ 0x041b, KEY_SCALE },
++	{ 0x0404, KEY_KPCOMMA },
++	{ 0x041a, KEY_POWER },
++	{ 0x040a, KEY_TAB },
++	{ 0x040e, KEY_MUTE },
++	{ 0x041f, KEY_HOME },
++	{ 0x041e, KEY_FRONT },
++	{ 0x0407, KEY_COPY },
++	{ 0x0412, KEY_OPEN },
++	{ 0x0454, KEY_PASTE },
++	{ 0x0402, KEY_FIND },
++	{ 0x044f, KEY_A },
++	{ 0x0442, KEY_B },
++	{ 0x045d, KEY_C },
++	{ 0x044c, KEY_D },
++	{ 0x0458, KEY_CUT },
++	{ 0x0415, KEY_SEARCH },
++	{ 0x0455, KEY_CALC },
++};
++
++static struct rc_map_list hk1_rbox_x4_map = {
++	.map = {
++		.scan = hk1_rbox_x4,
++		.size = ARRAY_SIZE(hk1_rbox_x4),
++		.rc_proto = RC_PROTO_NEC,
++		.name = RC_MAP_HK1_RBOX_X4,
++	}
++};
++
++static int __init init_rc_map_hk1_rbox_x4(void)
++{
++	return rc_map_register(&hk1_rbox_x4_map);
++}
++
++static void __exit exit_rc_map_hk1_rbox_x4(void)
++{
++	rc_map_unregister(&hk1_rbox_x4_map);
++}
++
++module_init(init_rc_map_hk1_rbox_x4)
++module_exit(exit_rc_map_hk1_rbox_x4)
++
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("HK1 RBOX X4 stock remote controller keytable");
+diff --git a/include/media/rc-map.h b/include/media/rc-map.h
+index d95ed3e96de2839c77ca90bde819e3e9df21072c..20daaf15ecbe80ecb0ef6ff916ea9e8a312158d7 100644
+--- a/include/media/rc-map.h
++++ b/include/media/rc-map.h
+@@ -264,6 +264,7 @@ struct rc_map *rc_map_get(const char *name);
+ #define RC_MAP_HAUPPAUGE                 "rc-hauppauge"
+ #define RC_MAP_HISI_POPLAR               "rc-hisi-poplar"
+ #define RC_MAP_HISI_TV_DEMO              "rc-hisi-tv-demo"
++#define RC_MAP_HK1_RBOX_X4                "rc-hk1-rbox-x4"
+ #define RC_MAP_IMON_MCE                  "rc-imon-mce"
+ #define RC_MAP_IMON_PAD                  "rc-imon-pad"
+ #define RC_MAP_IMON_RSC                  "rc-imon-rsc"

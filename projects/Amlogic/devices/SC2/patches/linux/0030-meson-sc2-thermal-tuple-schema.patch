@@ -1,0 +1,30 @@
+From 764c99481f3210d9990c0a2f9d4ef08baadc3989 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Tue, 20 Oct 2026 00:37:36 +0800
+Subject: [PATCH] dt-bindings: thermal: Let the SC2 register tuple define its
+ length
+
+The binding meta-schema rejects redundant minItems when a fixed
+items tuple already declares exactly two SC2 resources. Remove that
+redundancy without weakening the sensor/trim resource contract.
+
+Found by dt-doc-validate in the post-commit combined validation round.
+The failing output is retained; verification resumes after this commit.
+
+Change-Id: I03bec09b485add955e680201a096954bc11e2774
+---
+ Documentation/devicetree/bindings/thermal/amlogic,thermal.yaml | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/Documentation/devicetree/bindings/thermal/amlogic,thermal.yaml b/Documentation/devicetree/bindings/thermal/amlogic,thermal.yaml
+index ba5e91cdd406c05e2726e91c3b8c35cfa88f9339..47117900b411f0ab668d83384ce6f3433d3b7b83 100644
+--- a/Documentation/devicetree/bindings/thermal/amlogic,thermal.yaml
++++ b/Documentation/devicetree/bindings/thermal/amlogic,thermal.yaml
+@@ -69,7 +69,6 @@ allOf:
+     then:
+       properties:
+         reg:
+-          minItems: 2
+           items:
+             - description: Sensor registers
+             - description: Calibrated trim word in the system controller

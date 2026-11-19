@@ -1,0 +1,61 @@
+From: hiper25 <whydonit@gmail.com>
+Subject: [PATCH] VideoPlayer: Keep stream-change drain startup in its epoch
+
+Drain existing decoder output before a codec replacement without sending
+PLAYER_STARTED for the decoder being retired. Such a stale startup/EOF
+message can reach the parent after the replacement opens and make audio
+start synchronization before its first real video timestamp.
+
+Keep normal output, actual final EOF and replacement first-frame startup
+notifications unchanged; do not alter timestamps, cache or wait limits.
+
+--- a/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp
++++ b/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp
+@@ -497,7 +497,8 @@
+       while (!m_bStop && m_pVideoCodec)
+       {
+         m_pVideoCodec->SetCodecControl(DVD_CODEC_CTRL_DRAIN);
+-        bool cont = ProcessDecoderOutput(frametime, pts);
++        // The old decoder's drain must not announce startup for its replacement.
++        bool cont = ProcessDecoderOutput(frametime, pts, false);
+ 
+         if (!cont)
+           break;
+@@ -604,7 +605,7 @@
+   }
+ }
+ 
+-bool CVideoPlayerVideo::ProcessDecoderOutput(double &frametime, double &pts)
++bool CVideoPlayerVideo::ProcessDecoderOutput(double& frametime, double& pts, bool notifyStarted)
+ {
+   CDVDVideoCodec::VCReturn decoderState = m_pVideoCodec->GetPicture(&m_picture);
+ 
+@@ -656,7 +657,7 @@
+ 
+   if (decoderState == CDVDVideoCodec::VC_EOF)
+   {
+-    if (m_syncState == IDVDStreamPlayer::SYNC_STARTING)
++    if (notifyStarted && m_syncState == IDVDStreamPlayer::SYNC_STARTING)
+     {
+       SStartMsg msg;
+       msg.player = VideoPlayer_VIDEO;
+@@ -759,7 +760,7 @@
+       m_ptsTracker.Flush();
+     }
+ 
+-    if (m_syncState == IDVDStreamPlayer::SYNC_STARTING &&
++    if (notifyStarted && m_syncState == IDVDStreamPlayer::SYNC_STARTING &&
+         m_outputSate != OUTPUT_DROPPED &&
+         !(m_picture.iFlags & DVP_FLAG_DROPPED))
+     {
+--- a/xbmc/cores/VideoPlayer/VideoPlayerVideo.h
++++ b/xbmc/cores/VideoPlayer/VideoPlayerVideo.h
+@@ -90,7 +90,7 @@
+   void OnExit() override;
+   void Process() override;
+ 
+-  bool ProcessDecoderOutput(double &frametime, double &pts);
++  bool ProcessDecoderOutput(double& frametime, double& pts, bool notifyStarted = true);
+   void SendMessageBack(const std::shared_ptr<CDVDMsg>& pMsg, int priority = 0);
+   MsgQueueReturnCode GetMessage(std::shared_ptr<CDVDMsg>& pMsg,
+                                 std::chrono::milliseconds timeout,

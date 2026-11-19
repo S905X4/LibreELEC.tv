@@ -1,0 +1,30 @@
+From b4cd2a8b26e37c95939cc6e1c3d4c10d9cf574d9 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Wed, 21 Oct 2026 01:06:33 +0800
+Subject: [PATCH] arm64: dts: amlogic: Match the HK1 stock panel enable level
+
+The recovered stock panel uses control byte 0x01 while enabled. Native
+FD6551 brightness level eight encodes this state; level one does not.
+Keep the segment layout and ACK handling unchanged.
+
+Series validation: production DTB and userspace panel transition smoke.
+Electrical ACK and optical output remain physical acceptance gates.
+
+Change-Id: I50908aa8993249b3d131f343bccedf9c041cee89
+---
+ arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts b/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
+index fa08def55fcabd27e45dc5fe5fad9fb5e4227841..4b371857aece105ec015b5048da22159b0f9d541 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
++++ b/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
+@@ -63,7 +63,7 @@ display-controller@24 {
+ 			compatible = "fdhisi,fd6551";
+ 			reg = <0x24>;
+ 			fdhisi,digits = <4 3 2 1>;
+-			default-brightness-level = <1>;
++			default-brightness-level = <8>;
+ 			#address-cells = <1>;
+ 			#size-cells = <0>;
+ 

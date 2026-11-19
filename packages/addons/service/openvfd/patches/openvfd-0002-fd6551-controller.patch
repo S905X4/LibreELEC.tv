@@ -1,0 +1,17 @@
+Subject: [PATCH] settings: expose FD655 and FD6551 controller selections
+
+The driver already implements controller 5 (FD655) and 6 (FD6551).
+Include them in the existing controller selector so HK1 RBOX X4 can retain
+its actual controller when using advanced configuration.
+
+--- a/resources/settings.xml
++++ b/resources/settings.xml
+@@ -34,7 +34,7 @@
+ 	<category label="32000">
+ 		<setting label="32001" type="bool" id="display.advanced" default="false" />
+ 		<setting label="32002" type="enum" id="display.type" values="0|1|2|3|4|5|6" default="1" enable="eq(-1,true)" />
+-		<setting label="32003" type="enum" id="display.controller" values="0|1|2|3|4" default="0" enable="eq(-2,true)" />
++		<setting label="32003" type="enum" id="display.controller" values="0|1|2|3|4|5|6" default="0" enable="eq(-2,true)" />
+ 		<setting label="32004" type="bool" id="display.common.anode" default="false" enable="eq(-3,true)" />
+ 		<setting type="lsep" label="32005" enable="eq(-4,true)" />
+ 		<setting label="32006" type="enum" id="display.char.index0" values="0|1|2|3|4|5|6" default="0" enable="eq(-5,true)" />

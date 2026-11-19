@@ -1,0 +1,29 @@
+From cf8a5866408ac079e21b4fdad525b4bc0dfeb650 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Tue, 20 Oct 2026 00:40:38 +0800
+Subject: [PATCH] dt-bindings: media: rc: List the HK1 RBOX X4 native keymap
+
+Full validation of the compiled HK1 DTB rejects rc-hk1-rbox-x4,
+which the consolidated candidate already implements and selects.
+Add its exact name to the shared keymap enum, in alphabetical order.
+
+Treat diagnostic output as failure even when dt-validate returns zero.
+No IR protocol, scancode, hardware wiring or existing keymap changes.
+
+Change-Id: Icf32f708d15edc234bb852e0e9c33878df54ac39
+---
+ Documentation/devicetree/bindings/media/rc.yaml | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/Documentation/devicetree/bindings/media/rc.yaml b/Documentation/devicetree/bindings/media/rc.yaml
+index dedc5a4b81ecb08d3554ea9aace0cc54b9e9aa71..4ad873d84ef530e20036d2a569a2d823dce82d7c 100644
+--- a/Documentation/devicetree/bindings/media/rc.yaml
++++ b/Documentation/devicetree/bindings/media/rc.yaml
+@@ -78,6 +78,7 @@ properties:
+       - rc-hauppauge
+       - rc-hisi-poplar
+       - rc-hisi-tv-demo
++      - rc-hk1-rbox-x4
+       - rc-imon-mce
+       - rc-imon-pad
+       - rc-imon-rsc

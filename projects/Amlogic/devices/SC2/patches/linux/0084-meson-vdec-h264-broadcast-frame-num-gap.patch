@@ -1,0 +1,35 @@
+From 77d343b7990c5d572ab2a4bc51b5749ae2f1ff17 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Sun, 8 Nov 2026 12:34:17 +0800
+Subject: [PATCH] media: staging: meson: vdec: do not abort session on
+ broadcast H.264 frame_num gap
+
+In live DVB/PVR broadcast streams, packet drops and non-reference frame
+discontinuities frequently produce frame_num gaps when frame_num_gap_allowed
+is zero in the active SPS. Previously, the driver treated this as a fatal
+decoding error (-EILSEQ) and invoked amvdec_abort(), permanently stopping
+video frame delivery and leaving the display in a black screen state.
+
+Do not abort the session on frame_num gaps; allow decoding to continue
+so that recovery can occur at the next reference or IDR picture.
+
+Signed-off-by: Linux Amlogic SC2 Maintainer <maintainers@libreelec.tv>
+---
+ drivers/staging/media/meson/vdec/codec_h264.c | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/drivers/staging/media/meson/vdec/codec_h264.c b/drivers/staging/media/meson/vdec/codec_h264.c
+index 732be92eeb9f..6b48425dbb95 100644
+--- a/drivers/staging/media/meson/vdec/codec_h264.c
++++ b/drivers/staging/media/meson/vdec/codec_h264.c
+@@ -5025,7 +5025,6 @@ static irqreturn_t h264_multi_threaded_isr(struct amvdec_session *sess)
+         }
+         ret = meson_h264_dpb_h264_slice_header_process(dpb, &gap);
+         if (ret < 0 || dpb->dpb_error_flag ||
+-            (gap && !dpb->mSPS.frame_num_gap_allowed) ||
+             dpb->mSlice.slice_type >= NUM_SLICE_TYPES) {
+             dev_err(core->dev, "H264 MULTI DPB failed: ret=%d error=%d gap=%d allowed=%d type=%d\n",
+                     ret, dpb->dpb_error_flag, gap,
+-- 
+2.47.3
+

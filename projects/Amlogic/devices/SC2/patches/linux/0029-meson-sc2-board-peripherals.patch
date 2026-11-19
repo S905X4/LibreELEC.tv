@@ -1,0 +1,623 @@
+From 0e800804171d895f30978004aa01c26a6a1c75fe Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Tue, 20 Oct 2026 00:31:43 +0800
+Subject: [PATCH] arm64: dts: amlogic: Complete the HK1 RBOX X4 peripheral
+ contracts
+
+Describe the native SC2 GPU, CECB, SDIO/H5 shared LPO, calibrated thermal
+zones and shared CPU/DSU/PWM_J supply using exact stock resources.
+Keep all thirteen stock OPPs and all thirty-seven voltage selectors.
+
+Correct panel offsets to GPIOA_14/15 rather than eMMC data pads. Complete
+TF detect and gated-clock pins, expose conservative 52 MHz eMMC for
+read-only inventory and enable the source-supported USB3 candidate cap.
+Add SC2 reset compatibility with the existing S4 layout fallback.
+
+Do not invent regulators, analog jack wiring, GPU domains, decoder
+nodes or 1.8 V storage switching. Physical acceptance follows the
+combined candidate build; boot firmware and USB2 root stay intact.
+
+Change-Id: I641b19ae9b50eed378b5aa811657a5bccbb96f69
+---
+ .../bindings/reset/amlogic,meson-reset.yaml   |   1 +
+ .../dts/amlogic/meson-sc2-hk1-rbox-x4.dts     | 284 +++++++++++++++++-
+ arch/arm64/boot/dts/amlogic/meson-sc2.dtsi    | 176 ++++++++++-
+ 3 files changed, 453 insertions(+), 8 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/reset/amlogic,meson-reset.yaml b/Documentation/devicetree/bindings/reset/amlogic,meson-reset.yaml
+index 150e95c0d9bed74c7045942610a311114a257889..cc6d03b9b17f3e61505c25c8d6a6fc71ad1b52e0 100644
+--- a/Documentation/devicetree/bindings/reset/amlogic,meson-reset.yaml
++++ b/Documentation/devicetree/bindings/reset/amlogic,meson-reset.yaml
+@@ -25,6 +25,7 @@ properties:
+           - enum:
+               - amlogic,a4-reset
+               - amlogic,a5-reset
++              - amlogic,meson-sc2-reset
+           - const: amlogic,meson-s4-reset
+ 
+   reg:
+diff --git a/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts b/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
+index 491c79050d87ce0e1d057072e237fe768b7155c5..7f1ca55b7032782555a8b054d0877874162a86a5 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
++++ b/arch/arm64/boot/dts/amlogic/meson-sc2-hk1-rbox-x4.dts
+@@ -2,7 +2,7 @@
+ /*
+  * HK1 RBOX X4, S905X4, 4GB variant.
+  * Wiring and usable-memory boundary: original sc2_ah212_4g vendor DT.
+- * CPU DVFS, Wi-Fi and hardware video decoding remain unmodelled.
++ * Native eMMC is exposed for read-only inventory, not installation.
+  */
+ /dts-v1/;
+ #include "meson-sc2.dtsi"
+@@ -15,6 +15,7 @@ / {
+ 
+ 	aliases {
+ 		serial0 = &uart_b;
++		serial1 = &uart_e;
+ 		mmc0 = &sd_emmc_b;
+ 		ethernet0 = &ethmac;
+ 	};
+@@ -52,8 +53,8 @@ led-status {
+ 
+ 	i2c-panel {
+ 		compatible = "i2c-gpio";
+-		sda-gpios = <&gpio GPIOB_0 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+-		scl-gpios = <&gpio GPIOB_1 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		sda-gpios = <&gpio GPIOA_14 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		scl-gpios = <&gpio GPIOA_15 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+ 		i2c-gpio,delay-us = <5>;
+ 		#address-cells = <1>;
+ 		#size-cells = <0>;
+@@ -159,6 +160,154 @@ codec {
+ 		};
+ 	};
+ 
++	wifi32k: wifi-32k-clock {
++		compatible = "pwm-clock";
++		#clock-cells = <0>;
++		clock-frequency = <32768>;
++		pwms = <&pwm_ef 0 30518 0>;
++	};
++
++	wifi_pwrseq: wifi-pwrseq {
++		compatible = "mmc-pwrseq-simple";
++		reset-gpios = <&gpio GPIOX_6 GPIO_ACTIVE_LOW>;
++		clocks = <&wifi32k>;
++		clock-names = "ext_clock";
++		post-power-on-delay-ms = <200>;
++		power-off-delay-us = <100000>;
++	};
++
++	vddcpu: regulator-vddcpu {
++		compatible = "pwm-regulator";
++		pwms = <&pwm_ij 1 1500 0>;
++		regulator-name = "vddcpu0";
++		regulator-min-microvolt = <689000>;
++		regulator-max-microvolt = <1049000>;
++		regulator-always-on;
++		regulator-settling-time-us = <200>;
++		regulator-max-step-microvolt = <30000>;
++		voltage-table = <1049000 0>, <1039000 3>, <1029000 6>,
++			<1019000 9>, <1009000 12>, <999000 14>, <989000 17>,
++			<979000 20>, <969000 23>, <959000 26>, <949000 29>,
++			<939000 31>, <929000 34>, <919000 37>, <909000 40>,
++			<899000 43>, <889000 45>, <879000 48>, <869000 51>,
++			<859000 54>, <849000 56>, <839000 59>, <829000 62>,
++			<819000 65>, <809000 68>, <799000 70>, <789000 73>,
++			<779000 76>, <769000 79>, <759000 81>, <749000 84>,
++			<739000 87>, <729000 89>, <719000 92>, <709000 95>,
++			<699000 98>, <689000 100>;
++	};
++
++	cpu_opp_table: opp-table-cpu {
++		compatible = "operating-points-v2";
++		opp-shared;
++
++		opp-100000000 {
++			opp-hz = /bits/ 64 <100000000>;
++			opp-microvolt = <779000>;
++		};
++		opp-250000000 {
++			opp-hz = /bits/ 64 <250000000>;
++			opp-microvolt = <779000>;
++		};
++		opp-500000000 {
++			opp-hz = /bits/ 64 <500000000>;
++			opp-microvolt = <779000>;
++		};
++		opp-666000000 {
++			opp-hz = /bits/ 64 <666000000>;
++			opp-microvolt = <799000>;
++		};
++		opp-1000000000 {
++			opp-hz = /bits/ 64 <1000000000>;
++			opp-microvolt = <799000>;
++		};
++		opp-1200000000 {
++			opp-hz = /bits/ 64 <1200000000>;
++			opp-microvolt = <809000>;
++		};
++		opp-1404000000 {
++			opp-hz = /bits/ 64 <1404000000>;
++			opp-microvolt = <839000>;
++		};
++		opp-1500000000 {
++			opp-hz = /bits/ 64 <1500000000>;
++			opp-microvolt = <849000>;
++		};
++		opp-1608000000 {
++			opp-hz = /bits/ 64 <1608000000>;
++			opp-microvolt = <879000>;
++		};
++		opp-1704000000 {
++			opp-hz = /bits/ 64 <1704000000>;
++			opp-microvolt = <919000>;
++		};
++		opp-1800000000 {
++			opp-hz = /bits/ 64 <1800000000>;
++			opp-microvolt = <959000>;
++		};
++		opp-1908000000 {
++			opp-hz = /bits/ 64 <1908000000>;
++			opp-microvolt = <989000>;
++		};
++		opp-2004000000 {
++			opp-hz = /bits/ 64 <2004000000>;
++			opp-microvolt = <1019000>;
++		};
++	};
++
++	thermal-zones {
++		cpu-thermal {
++			polling-delay = <1000>;
++			polling-delay-passive = <100>;
++			thermal-sensors = <&cpu_temp>;
++			trips {
++				cpu_warm: cpu-warm {
++					temperature = <85000>;
++					hysteresis = <5000>;
++					type = "passive";
++				};
++				cpu_hot: cpu-hot {
++					temperature = <95000>;
++					hysteresis = <5000>;
++					type = "passive";
++				};
++				cpu_critical: cpu-critical {
++					temperature = <105000>;
++					hysteresis = <1000>;
++					type = "critical";
++				};
++			};
++			cooling-maps {
++				map0 {
++					trip = <&cpu_hot>;
++					cooling-device = <&cpu0 0 8>;
++				};
++			};
++		};
++		ddr-thermal {
++			polling-delay = <2000>;
++			polling-delay-passive = <1000>;
++			thermal-sensors = <&ddr_temp>;
++			trips {
++				ddr-warm {
++					temperature = <85000>;
++					hysteresis = <5000>;
++					type = "passive";
++				};
++				ddr-hot {
++					temperature = <95000>;
++					hysteresis = <5000>;
++					type = "passive";
++				};
++				ddr-critical {
++					temperature = <105000>;
++					hysteresis = <1000>;
++					type = "critical";
++				};
++			};
++		};
++	};
++
+ 	reserved-memory {
+ 		#address-cells = <2>;
+ 		#size-cells = <2>;
+@@ -203,6 +352,16 @@ &vpu {
+ 	status = "okay";
+ };
+ 
++&gpu {
++	status = "okay";
++};
++
++&cec {
++	status = "okay";
++	pinctrl-names = "default";
++	pinctrl-0 = <&cec_b_h_pins>;
++};
++
+ &hdmi_tx {
+ 	status = "okay";
+ 	pinctrl-names = "default";
+@@ -227,12 +386,14 @@ &ir {
+ 	status = "okay";
+ 	pinctrl-names = "default";
+ 	pinctrl-0 = <&remote_input_pins>;
++	linux,rc-map-name = "rc-hk1-rbox-x4";
+ };
+ 
+ &sd_emmc_b {
+ 	status = "okay";
+-	pinctrl-names = "default";
++	pinctrl-names = "default", "clk-gate";
+ 	pinctrl-0 = <&sdcard_pins>;
++	pinctrl-1 = <&sdcard_clk_gate_pins>;
+ 	bus-width = <4>;
+ 	cap-sd-highspeed;
+ 	max-frequency = <50000000>;
+@@ -241,6 +402,21 @@ &sd_emmc_b {
+ 	cd-gpios = <&gpio GPIOC_6 GPIO_ACTIVE_LOW>;
+ };
+ 
++/* Userspace must force this MMC device read-only before inventory tools run. */
++&sd_emmc_c {
++	status = "okay";
++	pinctrl-names = "default", "clk-gate";
++	pinctrl-0 = <&emmc_pins>;
++	pinctrl-1 = <&emmc_clk_gate_pins>;
++	bus-width = <8>;
++	cap-mmc-highspeed;
++	max-frequency = <52000000>;
++	non-removable;
++	disable-wp;
++	no-sd;
++	no-sdio;
++};
++
+ &ethmac {
+ 	status = "okay";
+ 	pinctrl-names = "default";
+@@ -270,8 +446,104 @@ &usb {
+ };
+ 
+ &dwc3 {
+-	/* Preserve the original board DT's limit, not an assumed USB3 result. */
+-	maximum-speed = "high-speed";
++	/* SC2 combo PHY supplies the lane, reference PLL and CR-bus tuning. */
++	maximum-speed = "super-speed";
+ 	snps,dis_enblslpm_quirk;
+ 	snps,dis-u2-freeclk-exists-quirk;
++	snps,dis_u3_susphy_quirk;
++	snps,dis-del-phy-power-chg-quirk;
++};
++
++&cpu0 {
++	clocks = <&clkc CLKID_CPU_CLK>, <&clkc CLKID_CPU_CLK_DYN>,
++		 <&clkc CLKID_SYS_PLL>, <&clkc CLKID_DSU_CLK>,
++		 <&clkc CLKID_DSU_CLK_FINAL>, <&clkc CLKID_PWM_J_GATE>;
++	clock-names = "core", "low", "high", "dsu", "dsu-pre", "vddcpu-pwm";
++	operating-points-v2 = <&cpu_opp_table>;
++	cpu-supply = <&vddcpu>;
++	#cooling-cells = <2>;
++};
++
++&cpu1 {
++	clocks = <&clkc CLKID_CPU_CLK>, <&clkc CLKID_CPU_CLK_DYN>,
++		 <&clkc CLKID_SYS_PLL>, <&clkc CLKID_DSU_CLK>,
++		 <&clkc CLKID_DSU_CLK_FINAL>, <&clkc CLKID_PWM_J_GATE>;
++	clock-names = "core", "low", "high", "dsu", "dsu-pre", "vddcpu-pwm";
++	operating-points-v2 = <&cpu_opp_table>;
++	cpu-supply = <&vddcpu>;
++	#cooling-cells = <2>;
++};
++
++&cpu2 {
++	clocks = <&clkc CLKID_CPU_CLK>, <&clkc CLKID_CPU_CLK_DYN>,
++		 <&clkc CLKID_SYS_PLL>, <&clkc CLKID_DSU_CLK>,
++		 <&clkc CLKID_DSU_CLK_FINAL>, <&clkc CLKID_PWM_J_GATE>;
++	clock-names = "core", "low", "high", "dsu", "dsu-pre", "vddcpu-pwm";
++	operating-points-v2 = <&cpu_opp_table>;
++	cpu-supply = <&vddcpu>;
++	#cooling-cells = <2>;
++};
++
++&cpu3 {
++	clocks = <&clkc CLKID_CPU_CLK>, <&clkc CLKID_CPU_CLK_DYN>,
++		 <&clkc CLKID_SYS_PLL>, <&clkc CLKID_DSU_CLK>,
++		 <&clkc CLKID_DSU_CLK_FINAL>, <&clkc CLKID_PWM_J_GATE>;
++	clock-names = "core", "low", "high", "dsu", "dsu-pre", "vddcpu-pwm";
++	operating-points-v2 = <&cpu_opp_table>;
++	cpu-supply = <&vddcpu>;
++	#cooling-cells = <2>;
++};
++
++&pwm_ij {
++	status = "okay";
++};
++
++&clkc {
++	assigned-clocks = <&clkc CLKID_DSU_CLK>,
++		<&clkc CLKID_DSU_CLK_DYN0_SEL>, <&clkc CLKID_DSU_CLK_DYN0>,
++		<&clkc CLKID_DSU_CLK_DYN>, <&clkc CLKID_DSU_CLK_FINAL>;
++	assigned-clock-parents = <&clkc CLKID_CPU_CLK>,
++		<&clkc CLKID_GP1_PLL>, <&clkc CLKID_DSU_CLK_DYN0_SEL>,
++		<&clkc CLKID_DSU_CLK_DYN0>, <&clkc CLKID_DSU_CLK_DYN>;
++};
++
++&sd_emmc_a {
++	status = "okay";
++	pinctrl-names = "default";
++	pinctrl-0 = <&sdio_pins>;
++	bus-width = <4>;
++	cap-sd-highspeed;
++	cap-sdio-irq;
++	non-removable;
++	no-sd;
++	no-mmc;
++	no-1-8-v;
++	keep-power-in-suspend;
++	max-frequency = <50000000>;
++	post-power-on-delay-ms = <100>;
++	mmc-pwrseq = <&wifi_pwrseq>;
++};
++
++&pwm_ef {
++	status = "okay";
++	pinctrl-names = "default";
++	pinctrl-0 = <&pwm_e_pins>;
++	assigned-clocks = <&clkc CLKID_PWM_E_MUX>;
++	assigned-clock-parents = <&clkc CLKID_FCLK_DIV3>;
++};
++
++&uart_e {
++	status = "okay";
++	pinctrl-names = "default";
++	pinctrl-0 = <&uart_e_pins>;
++	uart-has-rtscts;
++
++	bluetooth {
++		compatible = "realtek,rtl8821cs-bt", "realtek,rtl8723bs-bt";
++		enable-gpios = <&gpio GPIOX_17 GPIO_ACTIVE_HIGH>;
++		host-wake-gpios = <&gpio GPIOX_19 GPIO_ACTIVE_HIGH>;
++		clocks = <&wifi32k>;
++		clock-names = "lpo";
++		max-speed = <1500000>;
++	};
+ };
+diff --git a/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi b/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi
+index 8f77b43de3b8d995ed21617c9c201c8dec523055..101e79487f139bf821c1ed06d931d71e47f8a3b3 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi
++++ b/arch/arm64/boot/dts/amlogic/meson-sc2.dtsi
+@@ -16,6 +16,7 @@
+ #include <dt-bindings/reset/amlogic,meson-sc2-reset.h>
+ #include <dt-bindings/reset/amlogic,meson-axg-audio-arb.h>
+ #include <dt-bindings/reset/amlogic,meson-g12a-audio-reset.h>
++#include <dt-bindings/thermal/thermal.h>
+ 
+ / {
+ 	compatible = "amlogic,sc2";
+@@ -153,7 +154,7 @@ clkc: clock-controller@0 {
+ 			};
+ 
+ 			reset: reset-controller@2000 {
+-				compatible = "amlogic,meson-s4-reset";
++				compatible = "amlogic,meson-sc2-reset", "amlogic,meson-s4-reset";
+ 				reg = <0 0x2000 0 0x98>;
+ 				#reset-cells = <1>;
+ 			};
+@@ -202,6 +203,22 @@ ext_mdio: mdio@0 {
+ 				};
+ 			};
+ 
++			pwm_ef: pwm@5c000 {
++				compatible = "amlogic,meson-sc2-pwm", "amlogic,meson-s4-pwm";
++				reg = <0 0x5c000 0 0x24>;
++				clocks = <&clkc CLKID_PWM_E_GATE>, <&clkc CLKID_PWM_F_GATE>;
++				#pwm-cells = <3>;
++				status = "disabled";
++			};
++
++			pwm_ij: pwm@60000 {
++				compatible = "amlogic,meson-sc2-pwm", "amlogic,meson-s4-pwm";
++				reg = <0 0x60000 0 0x24>;
++				clocks = <&clkc CLKID_PWM_I_GATE>, <&clkc CLKID_PWM_J_GATE>;
++				#pwm-cells = <3>;
++				status = "disabled";
++			};
++
+ 			uart_b: serial@7a000 {
+ 				compatible = "amlogic,meson-g12a-uart",
+ 					     "amlogic,meson-gx-uart",
+@@ -212,6 +229,65 @@ uart_b: serial@7a000 {
+ 				clock-names = "xtal", "pclk", "baud";
+ 				status = "disabled";
+ 			};
++
++			uart_e: serial@80000 {
++				compatible = "amlogic,meson-g12a-uart", "amlogic,meson-gx-uart";
++				reg = <0 0x80000 0 0x18>;
++				interrupts = <GIC_SPI 172 IRQ_TYPE_EDGE_RISING>;
++				clocks = <&xtal>, <&clkc CLKID_UART_E>, <&xtal>;
++				clock-names = "xtal", "pclk", "baud";
++				fifo-size = <64>;
++				status = "disabled";
++			};
++		};
++
++		gpu: gpu@fe400000 {
++			compatible = "amlogic,meson-sc2-mali", "arm,mali-bifrost";
++			reg = <0 0xfe400000 0 0x4000>;
++			interrupts = <GIC_SPI 146 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SPI 145 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SPI 144 IRQ_TYPE_LEVEL_HIGH>;
++			interrupt-names = "job", "mmu", "gpu";
++			clocks = <&clkc CLKID_MALI>;
++			resets = <&reset RESET_MALI>, <&reset RESET_MALI_APB>;
++			assigned-clocks = <&clkc CLKID_MALI_0_SEL>,
++					  <&clkc CLKID_MALI_0>, <&clkc CLKID_MALI>;
++			assigned-clock-parents = <&clkc CLKID_FCLK_DIV2P5>,
++						 <0>, <&clkc CLKID_MALI_0>;
++			assigned-clock-rates = <0>, <800000000>, <0>;
++			status = "disabled";
++		};
++
++		cec: cec@fe044000 {
++			compatible = "amlogic,meson-sc2-ao-cec";
++			reg = <0 0xfe044000 0 0x54>;
++			interrupts = <GIC_SPI 180 IRQ_TYPE_EDGE_RISING>;
++			clocks = <&clkc CLKID_CECB_32K_CLKOUT>;
++			clock-names = "core";
++			assigned-clocks = <&clkc CLKID_CECB_32K_SEL_PRE>,
++					  <&clkc CLKID_CECB_32K_SEL>,
++					  <&clkc CLKID_CECB_32K_CLKOUT>;
++			assigned-clock-parents = <&clkc CLKID_CECB_32K_DIV>,
++						 <&clkc CLKID_CECB_32K_SEL_PRE>, <0>;
++			assigned-clock-rates = <0>, <0>, <32768>;
++			hdmi-phandle = <&hdmi_tx>;
++			status = "disabled";
++		};
++
++		cpu_temp: temperature-sensor@fe020000 {
++			compatible = "amlogic,sc2-cpu-thermal";
++			reg = <0 0xfe020000 0 0x50>, <0 0xfe010328 0 4>;
++			interrupts = <GIC_SPI 30 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&clkc CLKID_TS_CLK_GATE>;
++			#thermal-sensor-cells = <0>;
++		};
++
++		ddr_temp: temperature-sensor@fe022000 {
++			compatible = "amlogic,sc2-ddr-thermal";
++			reg = <0 0xfe022000 0 0x50>, <0 0xfe010370 0 4>;
++			interrupts = <GIC_SPI 31 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&clkc CLKID_TS_CLK_GATE>;
++			#thermal-sensor-cells = <0>;
+ 		};
+ 
+ 		canvas: video-lut@fe036048 {
+@@ -384,6 +460,19 @@ ir: ir-receiver@fe084040 {
+ 			status = "disabled";
+ 		};
+ 
++		sd_emmc_a: mmc@fe088000 {
++			compatible = "amlogic,meson-axg-mmc";
++			reg = <0 0xfe088000 0 0x800>;
++			interrupts = <GIC_SPI 176 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&clkc CLKID_SD_EMMC_A>, <&xtal>,
++				 <&clkc CLKID_FCLK_DIV2>;
++			clock-names = "core", "clkin0", "clkin1";
++			resets = <&reset RESET_SD_EMMC_A>;
++			#address-cells = <1>;
++			#size-cells = <0>;
++			status = "disabled";
++		};
++
+ 		sd_emmc_b: mmc@fe08a000 {
+ 			compatible = "amlogic,meson-axg-mmc";
+ 			reg = <0 0xfe08a000 0 0x800>;
+@@ -400,7 +489,6 @@ sd_emmc_b: mmc@fe08a000 {
+ 			status = "disabled";
+ 		};
+ 
+-		/* Deliberately disabled: the original eMMC firmware is not a target. */
+ 		sd_emmc_c: mmc@fe08c000 {
+ 			compatible = "amlogic,meson-axg-mmc";
+ 			reg = <0 0xfe08c000 0 0x800>;
+@@ -408,6 +496,11 @@ sd_emmc_c: mmc@fe08c000 {
+ 			clocks = <&clkc CLKID_NAND>,
+ 				 <&clkc CLKID_SD_EMMC_C_CLK>, <&clkc CLKID_FCLK_DIV2>;
+ 			clock-names = "core", "clkin0", "clkin1";
++			assigned-clocks = <&clkc CLKID_SD_EMMC_C_CLK_MUX>,
++					  <&clkc CLKID_SD_EMMC_C_CLK>;
++			assigned-clock-parents = <&xtal>;
++			assigned-clock-rates = <0>, <24000000>;
++			resets = <&reset RESET_NAND_EMMC>;
+ 			status = "disabled";
+ 		};
+ 
+@@ -531,6 +624,85 @@ mux {
+ 				 "sdcard_d3_c", "sdcard_cmd_c", "sdcard_clk_c";
+ 			function = "sdcard";
+ 			bias-pull-up;
++			drive-strength-microamp = <4000>;
++		};
++
++		cd {
++			groups = "GPIOC_6";
++			function = "gpio_periphs";
++			bias-pull-up;
++			input-enable;
++		};
++	};
++
++	sdcard_clk_gate_pins: sdcard-clk-gate-pins {
++		mux {
++			groups = "GPIOC_4";
++			function = "gpio_periphs";
++			bias-pull-down;
++			drive-strength-microamp = <4000>;
++		};
++	};
++
++	emmc_pins: emmc-pins {
++		data-cmd {
++			groups = "emmc_nand_d0", "emmc_nand_d1", "emmc_nand_d2",
++				 "emmc_nand_d3", "emmc_nand_d4", "emmc_nand_d5",
++				 "emmc_nand_d6", "emmc_nand_d7", "emmc_cmd";
++			function = "emmc";
++			bias-pull-up;
++			drive-strength-microamp = <4000>;
++		};
++
++		clk {
++			groups = "emmc_clk";
++			function = "emmc";
++			bias-disable;
++			drive-strength-microamp = <4000>;
++		};
++	};
++
++	emmc_clk_gate_pins: emmc-clk-gate-pins {
++		mux {
++			groups = "GPIOB_8";
++			function = "gpio_periphs";
++			bias-pull-down;
++			drive-strength-microamp = <4000>;
++		};
++	};
++
++	cec_b_h_pins: cec-b-h-pins {
++		mux {
++			groups = "cec_b_h";
++			function = "cec_b";
++			bias-disable;
++		};
++	};
++
++	sdio_pins: sdio-pins {
++		mux {
++			groups = "sdio_d0_x", "sdio_d1_x", "sdio_d2_x", "sdio_d3_x",
++				 "sdio_clk_x", "sdio_cmd_x";
++			function = "sdio";
++			bias-disable;
++			drive-strength-microamp = <4000>;
++		};
++	};
++
++	uart_e_pins: uart-e-pins {
++		mux {
++			groups = "uart_e_tx", "uart_e_rx", "uart_e_cts", "uart_e_rts";
++			function = "uart_e";
++			bias-pull-up;
++		};
++	};
++
++	pwm_e_pins: pwm-e-pins {
++		mux {
++			groups = "pwm_e";
++			function = "pwm_e";
++			bias-disable;
++			drive-strength-microamp = <500>;
+ 		};
+ 	};
+ 

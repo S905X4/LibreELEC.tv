@@ -1,0 +1,315 @@
+Subject: [PATCH] v4l2m2m: admit parsed H264 recovery input after flush
+
+A terminal error can consume a first PAFF field before flushing. Pairing
+its orphan mate with the next first field then rejects and consumes every
+subsequent first field, including genuine broadcast recovery pictures.
+
+Cancel retained fields, not parsed parameter sets. After flush discard
+dependent preroll until an actual IDR or intra picture carrying zero-count,
+exact recovery-point SEI. Its complementary field may be inter-coded.
+Resend the parsed parameter sets to the reset device and preserve a recovery
+SEI delivered separately from VCL. Submitted coded bytes are unchanged.
+Packet key flags are not authority: HTSP may leave them zero even on IDRs.
+
+Ordinary packet pairing does not decompose SEI or allocate restart headers.
+Malformed packets/pairs and EOF before recovery remain errors; no hardware
+reference validation or output/EOS completion rules are relaxed.
+
+--- a/libavcodec/v4l2_m2m_dec.c
++++ b/libavcodec/v4l2_m2m_dec.c
+@@ -548,6 +548,11 @@
+     CodedBitstreamContext *cbs;
+     CodedBitstreamFragment fragment;
+     AVPacket first;
++    AVPacket recovery_prefix;
++    int need_recovery;
++    int recovery_point;
++    int recovery_discarded;
++    int recovery_headers_pending;
+     V4L2H264FieldIdentity identity;
+ } V4L2H264FieldPair;
+ 
+@@ -558,9 +563,29 @@
+     if (!pair)
+         return;
+     av_packet_unref(&pair->first);
++    av_packet_unref(&pair->recovery_prefix);
+     ff_cbs_fragment_free(&pair->fragment);
+     ff_cbs_close(&pair->cbs);
+     av_freep(&priv->h264_field_pair);
++}
++
++static void h264_field_pair_flush(V4L2m2mPriv *priv)
++{
++    V4L2H264FieldPair *pair = priv->h264_field_pair;
++
++    if (!pair)
++        return;
++    av_packet_unref(&pair->first);
++    av_packet_unref(&pair->recovery_prefix);
++    ff_cbs_fragment_reset(&pair->fragment);
++    pair->need_recovery = 1;
++    pair->recovery_point = 0;
++    pair->recovery_discarded = 0;
++    pair->recovery_headers_pending = 0;
++    /* Keep parsed parameter sets, but no field from the cancelled epoch.
++     * Retaining an orphan mate after flush makes every following first field
++     * fail pairing; consuming that field on error repeats the phase lock.
++     */
+ }
+ 
+ static int h264_fields_match(const V4L2H264FieldIdentity *first,
+@@ -595,18 +620,93 @@
+     return 0;
+ }
+ 
+-/* Native SINGLE firmware presents a complementary field pair once. Submit
+- * that pair as one OUTPUT packet, preserving every coded byte and the first
+- * field's PTS/DTS/properties. Frame-coded AUs need no copy or extra latency.
+- * Return one only while retaining a first field, zero for a ready packet.
++static int h264_recovery_headers(V4L2m2mContext *s, V4L2H264FieldPair *pair,
++                                  unsigned int first_pps)
++{
++    CodedBitstreamH264Context *h264 = pair->cbs->priv_data;
++    CodedBitstreamFragment params = { 0 };
++    unsigned int pps_id[2], sps_id[2];
++    uint8_t *data;
++    size_t size;
++    int i, count, ret;
++
++    /* Parameter sets encountered in discarded preroll still apply to the
++     * restart picture. Resend the parsed sets to the reset hardware without
++     * rewriting or copying its coded packet. Include both fields' PPSs.
++     */
++    if (first_pps >= H264_MAX_PPS_COUNT || !h264->active_pps)
++        return AVERROR_INVALIDDATA;
++    pps_id[0] = first_pps;
++    pps_id[1] = h264->active_pps->pic_parameter_set_id;
++    count = pps_id[0] == pps_id[1] ? 1 : 2;
++    for (i = 0; i < count; i++) {
++        if (!h264->pps[pps_id[i]]) {
++            ret = AVERROR_INVALIDDATA;
++            goto done;
++        }
++        sps_id[i] = h264->pps[pps_id[i]]->seq_parameter_set_id;
++        if (sps_id[i] >= H264_MAX_SPS_COUNT || !h264->sps[sps_id[i]]) {
++            ret = AVERROR_INVALIDDATA;
++            goto done;
++        }
++        if (i && sps_id[i] == sps_id[0])
++            continue;
++        ret = ff_cbs_insert_unit_content(&params, -1, H264_NAL_SPS,
++                                         h264->sps[sps_id[i]], h264->sps_ref[sps_id[i]]);
++        if (ret < 0)
++            goto done;
++    }
++    for (i = 0; i < count; i++) {
++        ret = ff_cbs_insert_unit_content(&params, -1, H264_NAL_PPS,
++                                         h264->pps[pps_id[i]], h264->pps_ref[pps_id[i]]);
++        if (ret < 0)
++            goto done;
++    }
++    ret = ff_cbs_write_fragment_data(pair->cbs, &params);
++    if (ret < 0)
++        goto done;
++    if (params.data_size > INT_MAX - pair->recovery_prefix.size) {
++        ret = AVERROR_INVALIDDATA;
++        goto done;
++    }
++    size = params.data_size + pair->recovery_prefix.size;
++    data = av_mallocz(size + AV_INPUT_BUFFER_PADDING_SIZE);
++    if (!data) {
++        ret = AVERROR(ENOMEM);
++        goto done;
++    }
++    memcpy(data, params.data, params.data_size);
++    if (pair->recovery_prefix.size)
++        memcpy(data + params.data_size, pair->recovery_prefix.data,
++               pair->recovery_prefix.size);
++    av_freep(&s->extdata_data);
++    s->extdata_data = data;
++    s->extdata_size = size;
++    s->extdata_sent = 0;
++done:
++    ff_cbs_fragment_free(&params);
++    return ret;
++}
++
++/* Submit complementary fields as one OUTPUT packet, preserving every coded
++ * byte and the first field's PTS/DTS/properties. After flush, discard dependent
++ * preroll until parsed IDR or zero-count exact recovery on an intra picture;
++ * a PAFF recovery picture may pair an I first field with a P second field.
++ * Frame-coded AUs need no copy or extra latency. Return one for retained or
++ * discarded input, zero for a ready packet.
+  */
+ static int h264_pair_packet(AVCodecContext *avctx, V4L2m2mContext *s)
+ {
++    static const CodedBitstreamUnitType types[] = {
++        H264_NAL_SPS, H264_NAL_PPS, H264_NAL_SLICE, H264_NAL_IDR_SLICE,
++        H264_NAL_SEI,
++    };
+     V4L2m2mPriv *priv = avctx->priv_data;
+     V4L2H264FieldPair *pair = priv->h264_field_pair;
+     V4L2H264FieldIdentity identity = { 0 };
+     AVPacket *pkt = &s->buf_pkt;
+-    int ret, i, pictures = 0, complete = 0;
++    int ret, i, pictures = 0, complete = 0, restart = 0;
++    unsigned int recovery_pps = 0;
+ 
+     if (avctx->codec_id != AV_CODEC_ID_H264 ||
+         !(s->quirks & FF_V4L2_QUIRK_EXPLICIT_DRAIN))
+@@ -622,13 +722,8 @@
+             h264_field_pair_free(priv);
+             return ret;
+         }
+-        {
+-            static const CodedBitstreamUnitType types[] = {
+-                H264_NAL_SPS, H264_NAL_PPS, H264_NAL_SLICE, H264_NAL_IDR_SLICE,
+-            };
+-            pair->cbs->decompose_unit_types = types;
+-            pair->cbs->nb_decompose_unit_types = FF_ARRAY_ELEMS(types);
+-        }
++        pair->cbs->decompose_unit_types = types;
++        pair->cbs->nb_decompose_unit_types = FF_ARRAY_ELEMS(types) - 1;
+         /* Normalised Annex B extradata matches the BSF's packet framing. */
+         if (s->extdata_size) {
+             ret = ff_cbs_read(pair->cbs, &pair->fragment,
+@@ -638,6 +733,8 @@
+                 return ret;
+         }
+     }
++    /* Ordinary field pairing does not need to decompose SEI payloads. */
++    pair->cbs->nb_decompose_unit_types = FF_ARRAY_ELEMS(types) - !pair->need_recovery;
+     ret = ff_cbs_read_packet(pair->cbs, &pair->fragment, pkt);
+     if (ret < 0)
+         goto done;
+@@ -646,6 +743,26 @@
+         const H264RawSlice *slice;
+         V4L2H264FieldIdentity next;
+ 
++        if (pair->need_recovery && unit->type == H264_NAL_SEI) {
++            const H264RawSEI *sei = unit->content;
++            int j;
++
++            if (!sei) {
++                ret = AVERROR_INVALIDDATA;
++                goto done;
++            }
++            for (j = 0; j < sei->message_list.nb_messages; j++) {
++                const SEIRawMessage *message = &sei->message_list.messages[j];
++                const H264RawSEIRecoveryPoint *point;
++
++                if (message->payload_type != SEI_TYPE_RECOVERY_POINT)
++                    continue;
++                point = message->payload;
++                pair->recovery_point = point && !point->recovery_frame_cnt &&
++                                       point->exact_match_flag;
++            }
++            continue;
++        }
+         if (unit->type != H264_NAL_SLICE && unit->type != H264_NAL_IDR_SLICE)
+             continue;
+         if (!unit->content) {
+@@ -666,11 +783,18 @@
+             identity = next;
+             pictures = 1;
+             complete = !next.field;
++            if (pair->need_recovery) {
++                restart = next.idr || (slice->header.slice_type % 5 == 2 &&
++                                      pair->recovery_point);
++                pair->recovery_point = 0;
++            }
+         } else if (identity.frame_num == next.frame_num &&
+                    identity.pps_id == next.pps_id &&
+                    identity.field == next.field &&
+                    (!next.field || identity.bottom == next.bottom)) {
+             /* Another slice of the same picture. */
++            if (pair->need_recovery && !next.idr && slice->header.slice_type % 5 != 2)
++                restart = 0;
+         } else if (h264_fields_match(&identity, &next)) {
+             complete = 1;
+         } else {
+@@ -679,6 +803,37 @@
+         }
+     }
+ 
++    if (pair->need_recovery) {
++        if (!pictures) {
++            /* A recovery SEI may precede its VCL in a metadata-only packet.
++             * Preserve those original bytes in the eventual enqueue prefix.
++             */
++            ret = 0;
++            if (pair->recovery_prefix.size)
++                ret = h264_field_append(&pair->recovery_prefix, pkt, 0);
++            else if (pair->recovery_point)
++                av_packet_move_ref(&pair->recovery_prefix, pkt);
++            else
++                av_packet_unref(pkt);
++            if (ret >= 0)
++                ret = 1;
++            goto done;
++        }
++        if (!restart) {
++            av_packet_unref(pkt);
++            av_packet_unref(&pair->recovery_prefix);
++            pair->recovery_discarded = 1;
++            ret = 1;
++            goto done;
++        }
++        pair->need_recovery = 0;
++        pair->recovery_point = 0;
++        pair->recovery_discarded = 0;
++        pair->recovery_headers_pending = 1;
++    }
++
++    if (pair->recovery_headers_pending)
++        recovery_pps = pair->first.size ? pair->identity.pps_id : identity.pps_id;
+     if (pair->first.size) {
+         if (pictures && (complete || !h264_fields_match(&pair->identity, &identity))) {
+             av_log(avctx, AV_LOG_ERROR, "Unmatched native H264 field before next picture\n");
+@@ -700,6 +855,13 @@
+         ret = 1;
+     } else {
+         ret = 0;
++    }
++    if (ret == 0 && pair->recovery_headers_pending) {
++        ret = h264_recovery_headers(s, pair, recovery_pps);
++        if (ret < 0)
++            goto done;
++        av_packet_unref(&pair->recovery_prefix);
++        pair->recovery_headers_pending = 0;
+     }
+ done:
+     ff_cbs_fragment_reset(&pair->fragment);
+@@ -767,6 +929,11 @@
+         }
+         // If i >= 256 something has gone wrong
+         if (i >= 256) {
++#if CONFIG_H264_V4L2M2M_DECODER
++            V4L2H264FieldPair *pair = ((V4L2m2mPriv *)avctx->priv_data)->h264_field_pair;
++            if (pair && pair->need_recovery && pair->recovery_discarded)
++                return stream_started(s) ? NQ_SRC_EMPTY : NQ_DEAD;
++#endif
+             av_log(avctx, AV_LOG_ERROR, "Too many side-data only packets\n");
+             return AVERROR(EIO);
+         }
+@@ -782,6 +949,10 @@
+         if (ret == AVERROR_EOF) {
+ #if CONFIG_H264_V4L2M2M_DECODER
+             V4L2H264FieldPair *pair = ((V4L2m2mPriv *)avctx->priv_data)->h264_field_pair;
++            if (pair && pair->recovery_discarded) {
++                av_log(avctx, AV_LOG_ERROR, "Native H264 input ended before a recovery picture\n");
++                return AVERROR_INVALIDDATA;
++            }
+             if (pair && pair->first.size) {
+                 av_log(avctx, AV_LOG_ERROR, "Native H264 input ended with an unmatched field\n");
+                 return AVERROR_INVALIDDATA;
+@@ -1648,7 +1819,7 @@
+     // Clear any buffered input packet
+     av_packet_unref(&s->buf_pkt);
+ #if CONFIG_H264_V4L2M2M_DECODER
+-    h264_field_pair_free(priv);
++    h264_field_pair_flush(priv);
+ #endif
+ 
+     // Native abort marks both VB2 queues in error. Cancel both queues even

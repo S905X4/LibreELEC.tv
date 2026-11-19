@@ -1,0 +1,73 @@
+From 185a36a4070599c59d46abde45183a2515365979 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Fri, 13 Nov 2026 07:54:22 +0800
+Subject: [PATCH] drm/meson: Bound register maps to their mapped resources
+
+The shared map configuration permits register 0x1000 even for an
+exactly 0x1000-byte MMIO resource. Reading its debugfs register table
+therefore reaches the unmapped next page and faults in regmap MMIO.
+SC2 also maps three banks under the same device without unique names.
+
+Set each map maximum to its actual last 32-bit word and give each
+bank a stable name. Keep the same mappings and register operations;
+no bank size is guessed from another SoC or extended past its resource.
+
+The real regmap debugfs read fault is retained as the repro. Exact
+resource-end checks and actual new-boot debugfs boundary access are
+separate from display functionality acceptance.
+
+Change-Id: I2214ca959a249e4714a5fdf8e7c7a02224af8f3d
+---
+ drivers/gpu/drm/meson/meson_drv.c | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/meson/meson_drv.c b/drivers/gpu/drm/meson/meson_drv.c
+index 027fe97dedf7..b30f22f60e9d 100644
+--- a/drivers/gpu/drm/meson/meson_drv.c
++++ b/drivers/gpu/drm/meson/meson_drv.c
+@@ -217,6 +217,7 @@ static int meson_drv_bind_master(struct device *dev, bool has_components)
+ 	struct meson_drm *priv;
+ 	struct drm_device *drm;
+ 	struct resource *res;
++	struct regmap_config map_config = meson_regmap_config;
+ 	void __iomem *regs;
+ 	unsigned int video_canvases = 0;
+ 	int ret, i;
+@@ -261,6 +262,8 @@ static int meson_drv_bind_master(struct device *dev, bool has_components)
+ 		ret = -EINVAL;
+ 		goto free_drm;
+ 	}
++	map_config.name = priv->sc2 ? "clkctrl" : "hhi";
++	map_config.max_register = resource_size(res) - sizeof(u32);
+ 	/* Simply ioremap since it may be a shared register zone */
+ 	regs = devm_ioremap(dev, res->start, resource_size(res));
+ 	if (!regs) {
+@@ -269,7 +272,7 @@ static int meson_drv_bind_master(struct device *dev, bool has_components)
+ 	}
+ 
+ 	priv->hhi = devm_regmap_init_mmio(dev, regs,
+-					  &meson_regmap_config);
++					  &map_config);
+ 	if (IS_ERR(priv->hhi)) {
+ 		dev_err(&pdev->dev, "Couldn't create the HHI regmap\n");
+ 		ret = PTR_ERR(priv->hhi);
+@@ -288,13 +291,15 @@ static int meson_drv_bind_master(struct device *dev, bool has_components)
+ 				ret = -EINVAL;
+ 				goto free_drm;
+ 			}
++			map_config.name = banks[i];
++			map_config.max_register = resource_size(res) - sizeof(u32);
+ 			regs = devm_ioremap(dev, res->start, resource_size(res));
+ 			if (!regs) {
+ 				ret = -ENOMEM;
+ 				goto free_drm;
+ 			}
+ 			*maps[i] = devm_regmap_init_mmio(dev, regs,
+-							 &meson_regmap_config);
++							 &map_config);
+ 			if (IS_ERR(*maps[i])) {
+ 				ret = PTR_ERR(*maps[i]);
+ 				goto free_drm;
+-- 
+2.47.3
+

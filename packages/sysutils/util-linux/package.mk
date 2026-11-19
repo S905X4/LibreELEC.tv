@@ -63,6 +63,11 @@ if [ "${SWAP_SUPPORT}" = "yes" ]; then
   PKG_CONFIGURE_OPTS_TARGET+=" --enable-swapon"
 fi
 
+# Authenticated serial consoles use agetty with the existing BusyBox login.
+if [ -n "${SERIAL_CONSOLE}" ]; then
+  PKG_CONFIGURE_OPTS_TARGET+=" --enable-agetty"
+fi
+
 PKG_CONFIGURE_OPTS_HOST="--enable-static \
                          --disable-shared \
                          --enable-all-programs \

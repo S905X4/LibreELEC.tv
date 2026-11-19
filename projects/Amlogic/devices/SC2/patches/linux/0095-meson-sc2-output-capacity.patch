@@ -1,0 +1,40 @@
+From fefab95abf2b7b916fbaccb4410253ce2eb41515 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Fri, 13 Nov 2026 05:03:40 +0800
+Subject: [PATCH] media: meson-sc2: Honor explicit compressed OUTPUT capacities
+
+SC2_SOURCE_SIZE is both the default compressed buffer capacity and the
+minimum used by TRY_FMT. This rounds an explicit smaller userspace
+capacity back to 8 MiB. Six HEVC source buffers then consume 48 MiB even
+when userspace negotiated a sufficient smaller capacity.
+
+Retain the 8 MiB default when sizeimage is unspecified. For explicit
+capacities, retain the existing upper bound and use a 4 KiB lower bound.
+The negotiated queue size, bytesused checks and private parser staging
+bounds continue to define ownership and reject oversized submissions.
+
+This does not change CAPTURE slots, DPB demand, CMA reservation, parser
+staging allocation or codec/profile admission.
+
+Change-Id: Ibf1adcfb48cd766427f6b42e9bb53c110baf69d1
+---
+ .../media/platform/amlogic/meson-sc2-vdec/meson_sc2_vdec.c  | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_vdec.c b/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_vdec.c
+index a81af5d469a6..d2504c06fc46 100644
+--- a/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_vdec.c
++++ b/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_vdec.c
+@@ -141,8 +141,10 @@ static int sc2_try_fmt(struct file *file, void *priv, struct v4l2_format *f)
+ 	pix->field = V4L2_FIELD_NONE;
+ 	pix->num_planes = 1;
+ 	memset(pix->plane_fmt, 0, sizeof(pix->plane_fmt));
+-	pix->plane_fmt[0].sizeimage = clamp_t(u32, size, SC2_SOURCE_SIZE,
+-					     32U * 1024U * 1024U);
++	/* The default is not a minimum for an explicit userspace capacity. */
++	pix->plane_fmt[0].sizeimage = size ?
++		clamp_t(u32, size, 4U * 1024U, 32U * 1024U * 1024U) :
++		SC2_SOURCE_SIZE;
+ 	if (!pix->colorspace)
+ 		pix->colorspace = V4L2_COLORSPACE_REC709;
+ 	memset(pix->reserved, 0, sizeof(pix->reserved));

@@ -1,0 +1,27 @@
+From 4b360d81199c7a976c41381a6f7c1ccdab1a0f53 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Thu, 22 Oct 2026 15:31:55 +0800
+Subject: [PATCH] media: meson: Check VP9 adaptation against its API
+ declaration
+
+Include the shared VP9 API in the probability adaptation unit so the
+compiler checks the exported function signature against its declaration.
+The complete integration build identified the missing prototype.
+
+Change-Id: I72d85f872d36ad95e8c211ef09cf55d440eb6f10
+---
+ .../media/platform/amlogic/meson-sc2-vdec/meson_sc2_vp9_prob.c   | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_vp9_prob.c b/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_vp9_prob.c
+index ab5bfc9eea349c197022e0c1d387b3d263fc42a7..fe2fe4225637cfb10a13a534172c6f88b7deaaf3 100644
+--- a/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_vp9_prob.c
++++ b/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_vp9_prob.c
+@@ -6,6 +6,7 @@
+ #include <linux/kernel.h>
+ #include <linux/math64.h>
+ #include <linux/types.h>
++#include "meson_sc2_vp9_api.h"
+ 
+ /* VP9 PROB processing defines */
+ #define VP9_PARTITION_START      0

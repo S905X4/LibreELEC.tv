@@ -1,0 +1,46 @@
+From f58413567a6a73af59110b30477f9fd261dc22f5 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Sat, 14 Nov 2026 14:06:16 +0800
+Subject: [PATCH] drm/meson: enable the SC2 semiplanar 422 formatter
+
+Two-plane422 needs an enabled1:1 vertical formatter handshake,
+unlike packedUYVY bypass. Keep step16, full-height chroma scopes,
+byte order and GEN3 state unchanged.
+
+A held genuineDI-produced NV16 surface was black with FMT310c20.
+Changing only enablebit0 to310c21 restored the actual image;
+clearing it restored black. The same DRM state and backing stayed
+held, and the restored capture matched the NV12 reference within
+3/255. Preserve this negative/positive/negative evidence rather
+than shipping a post-commit MMIO workaround.
+
+Change-Id: Id815713f3bf99b5877f050da785eef0799d818e8
+---
+ drivers/gpu/drm/meson/meson_overlay.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/meson/meson_overlay.c b/drivers/gpu/drm/meson/meson_overlay.c
+index 57e64285c67f..051451d4ba91 100644
+--- a/drivers/gpu/drm/meson/meson_overlay.c
++++ b/drivers/gpu/drm/meson/meson_overlay.c
+@@ -685,12 +685,16 @@ static void meson_overlay_atomic_update(struct drm_plane *plane,
+ 
+ 	if (vd->uyvy || fb->format->format == DRM_FORMAT_NV16 ||
+ 	    fb->format->format == DRM_FORMAT_NV61) {
+-		/* SC2 video_hw.c: 4:2:2 has no vertical formatter. */
++		/* Packed422 bypasses vertical formatting; separate planes need
++		 * the enabled 1:1 formatter handshake, as planar YUV422 does.
++		 */
+ 		vd->fmt_ctrl = VD_HORZ_Y_C_RATIO(1) | VD_HORZ_FMT_EN |
+ 			VD_VERT_RPT_LINE0 | VD_VERT_INITIAL_PHASE(12) |
+ 			VD_VERT_PHASE_STEP(16);
+ 		if (FIELD_GET(GENMASK(14, 0), vd->if0_luma_x0) & 1)
+ 			vd->fmt_ctrl |= VD_HORZ_INITIAL_PHASE(8);
++		if (!vd->uyvy)
++			vd->fmt_ctrl |= VD_VERT_FMT_EN;
+ 	}
+ 
+ 	/* Update Canvas with buffer address */
+-- 
+2.47.3
+

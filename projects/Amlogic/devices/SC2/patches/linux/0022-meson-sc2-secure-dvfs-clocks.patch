@@ -1,0 +1,809 @@
+From c2f5c7ef0ed29e5a65b93cc1af31a7e1cc8e8ea3 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Tue, 20 Oct 2026 00:31:39 +0800
+Subject: [PATCH] clk: meson: Make SC2 secure DVFS transitions hardware-checked
+
+Bound secure PLL requests to the evidenced DCO tables, check firmware
+programming, and preserve notifier parents across completion or abort.
+Report actual secure mux and divider topology rather than a CCF cache
+that can accept a rejected automatic reparent.
+
+Park CPU dynamic changes on the existing crystal branch, below every
+stock OPP, rather than running the low-voltage OPPs briefly at 1 GHz.
+Keep PWM_J critical because a rejected regulator probe must not gate
+the always-on CPU rail. Correct its J mux parent, preserve explicit PWM
+parents and propagate thermal rate requests.
+
+GP1 output-divider behavior and board transitions remain hardware
+acceptance requirements. No new power IDs or HDMI/audio programming
+paths are introduced. This commit precedes the combined series build.
+
+Change-Id: I7ec7afa6273cc26456926c51445046c1dde23ac2
+---
+ .../bindings/clock/amlogic,sc2-clkc.yaml      |  10 +
+ drivers/clk/meson/clk-pll.c                   |  25 +-
+ drivers/clk/meson/sc2.c                       | 230 +++++++-----------
+ drivers/clk/meson/sc2_clk_regmap.c            |  50 +++-
+ 4 files changed, 163 insertions(+), 152 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/clock/amlogic,sc2-clkc.yaml b/Documentation/devicetree/bindings/clock/amlogic,sc2-clkc.yaml
+index 40985b31a0673f553008d93fb376b3738dc1fe9c..fba280a4ed481dcde700c384c08df24e1e9de1b5 100644
+--- a/Documentation/devicetree/bindings/clock/amlogic,sc2-clkc.yaml
++++ b/Documentation/devicetree/bindings/clock/amlogic,sc2-clkc.yaml
+@@ -15,6 +15,16 @@ description: |
+   clock services (SMC 0x8200009a and 0x8200009b). Clock indices are defined
+   in dt-bindings/clock/amlogic,sc2-clkc.h.
+ 
++  Secure clock services must implement the SC2 CPU/DSU register read and
++  write ABI; registration alone does not establish firmware rate support.
++  Read-only output dividers retain their firmware-programmed divisor when
++  rounding rates. CPU consumers must coordinate the DSU clock and supply
++  voltage before changing the CPU clock; the provider's parking notifiers
++  protect clock reprogramming, not the board's DVFS policy.
++  Secure PLL rate requests are limited to the documented SC2 DCO tables;
++  a fixed firmware output divisor does not imply every CPU/DSU OPP can be
++  generated. Consumers must reject an unachievable output rate.
++
+ properties:
+   compatible:
+     const: amlogic,sc2-clkc
+diff --git a/drivers/clk/meson/clk-pll.c b/drivers/clk/meson/clk-pll.c
+index f707d34b26b4a818a190b60d3a9055a2763df0e2..2f7650d160f87ab8daf25c00f80da8a4a35c8766 100644
+--- a/drivers/clk/meson/clk-pll.c
++++ b/drivers/clk/meson/clk-pll.c
+@@ -33,6 +33,7 @@
+ #include <linux/delay.h>
+ #include <linux/err.h>
+ #include <linux/io.h>
++#include <linux/limits.h>
+ #include <linux/math64.h>
+ #include <linux/module.h>
+ 
+@@ -504,6 +505,8 @@ static int meson_secure_clk_pll_set_rate(struct clk_hw *hw, unsigned long rate,
+ 			__func__, clk_hw_get_name(hw), rate);
+ 		ret = __meson_secure_clk_pll_set_rate(hw, rate, parent_rate);
+ 	}
++	if (!ret && meson_clk_pll_recalc_rate(hw, parent_rate) != rate)
++		return -EIO;
+ 
+ 	return ret;
+ }
+@@ -511,8 +514,26 @@ static int meson_secure_clk_pll_set_rate(struct clk_hw *hw, unsigned long rate,
+ static long meson_secure_clk_pll_round_rate(struct clk_hw *hw, unsigned long rate,
+ 					    unsigned long *parent_rate)
+ {
+-	/* The secure firmware selects the PLL parameters for the requested rate. */
+-	return rate;
++	struct clk_regmap *clk = to_clk_regmap(hw);
++	struct meson_clk_pll_data *pll = meson_clk_pll_data(clk);
++	const struct pll_params_table *entry;
++	unsigned long prate = parent_rate ? *parent_rate :
++		clk_hw_get_rate(clk_hw_get_parent(hw));
++	unsigned long best = 0, best_delta = ULONG_MAX;
++
++	/* Do not advertise arbitrary, potentially out-of-range DCO requests. */
++	for (entry = pll->table; entry && entry->n; entry++) {
++		unsigned long now = __pll_params_to_rate(prate, entry->m,
++							entry->n, 0, pll);
++		unsigned long delta = now > rate ? now - rate : rate - now;
++
++		if (delta < best_delta) {
++			best = now;
++			best_delta = delta;
++		}
++	}
++
++	return best ? best : -EINVAL;
+ }
+ 
+ static int meson_secure_clk_pll_enable(struct clk_hw *hw)
+diff --git a/drivers/clk/meson/sc2.c b/drivers/clk/meson/sc2.c
+index a487e9b5488c713f478729aea98d2ed2ac956d9c..db7879a13966de940ede7614a99eaddd5f643ac5 100644
+--- a/drivers/clk/meson/sc2.c
++++ b/drivers/clk/meson/sc2.c
+@@ -71,7 +71,7 @@ static struct clk_regmap sc2_fixed_pll = {
+ 		.offset = ANACTRL_FIXPLL_CTRL0,
+ 		.shift = 16,
+ 		.width = 2,
+-		.flags = CLK_DIVIDER_POWER_OF_TWO,
++		.flags = CLK_DIVIDER_POWER_OF_TWO | CLK_DIVIDER_READ_ONLY,
+ 	},
+ 	.hw.init = &(struct clk_init_data){
+ 		.name = "fixed_pll",
+@@ -484,8 +484,8 @@ static struct clk_regmap sc2_gp1_pll = {
+ 		.offset = ANACTRL_GP1PLL_CTRL0,
+ 		.shift = 16,
+ 		.width = 3,
+-		.flags = (CLK_DIVIDER_POWER_OF_TWO |
+-			  CLK_DIVIDER_ROUND_CLOSEST),
++		.flags = CLK_DIVIDER_POWER_OF_TWO | CLK_DIVIDER_ROUND_CLOSEST |
++			 CLK_DIVIDER_READ_ONLY,
+ 	},
+ 	.hw.init = &(struct clk_init_data){
+ 		.name = "gp1_pll",
+@@ -516,7 +516,7 @@ static struct clk_regmap sc2_cpu_clk_premux0 = {
+ 			{ .hw = &sc2_fclk_div3.hw },
+ 		},
+ 		.num_parents = 3,
+-		.flags = CLK_SET_RATE_PARENT,
++		.flags = CLK_SET_RATE_PARENT | CLK_GET_RATE_NOCACHE,
+ 	},
+ };
+ 
+@@ -537,7 +537,7 @@ static struct clk_regmap sc2_cpu_clk_premux1 = {
+ 		},
+ 		.num_parents = 3,
+ 		/* This sub-tree is used a parking clock */
+-		.flags = CLK_SET_RATE_NO_REPARENT
++		.flags = CLK_SET_RATE_NO_REPARENT | CLK_GET_RATE_NOCACHE
+ 	},
+ };
+ 
+@@ -562,7 +562,7 @@ static struct clk_regmap sc2_cpu_clk_mux0_div = {
+ 			&sc2_cpu_clk_premux0.hw
+ 		},
+ 		.num_parents = 1,
+-		.flags = CLK_SET_RATE_PARENT,
++		.flags = CLK_SET_RATE_PARENT | CLK_GET_RATE_NOCACHE,
+ 	},
+ };
+ 
+@@ -582,7 +582,7 @@ static struct clk_regmap sc2_cpu_clk_postmux0 = {
+ 			&sc2_cpu_clk_mux0_div.hw,
+ 		},
+ 		.num_parents = 2,
+-		.flags = CLK_SET_RATE_PARENT,
++		.flags = CLK_SET_RATE_PARENT | CLK_GET_RATE_NOCACHE,
+ 	},
+ };
+ 
+@@ -592,6 +592,7 @@ static struct clk_regmap sc2_cpu_clk_mux1_div = {
+ 		.offset = CPUCTRL_SYS_CPU_CLK_CTRL,
+ 		.shift = 20,
+ 		.width = 6,
++		.flags = CLK_DIVIDER_READ_ONLY,
+ 	},
+ 	.hw.init = &(struct clk_init_data){
+ 		.name = "cpu_clk_dyn1_div",
+@@ -600,6 +601,7 @@ static struct clk_regmap sc2_cpu_clk_mux1_div = {
+ 			&sc2_cpu_clk_premux1.hw
+ 		},
+ 		.num_parents = 1,
++		.flags = CLK_GET_RATE_NOCACHE,
+ 	},
+ };
+ 
+@@ -619,7 +621,7 @@ static struct clk_regmap sc2_cpu_clk_postmux1 = {
+ 		},
+ 		.num_parents = 2,
+ 		/* This sub-tree is used a parking clock */
+-		.flags = CLK_SET_RATE_NO_REPARENT,
++		.flags = CLK_SET_RATE_NO_REPARENT | CLK_GET_RATE_NOCACHE,
+ 	},
+ };
+ 
+@@ -639,7 +641,7 @@ static struct clk_regmap sc2_cpu_clk_dyn = {
+ 			&sc2_cpu_clk_postmux1.hw,
+ 		},
+ 		.num_parents = 2,
+-		.flags = CLK_SET_RATE_PARENT,
++		.flags = CLK_SET_RATE_PARENT | CLK_GET_RATE_NOCACHE,
+ 	},
+ };
+ 
+@@ -659,7 +661,7 @@ static struct clk_regmap sc2_cpu_clk = {
+ 			&sc2_sys_pll.hw,
+ 		},
+ 		.num_parents = 2,
+-		.flags = CLK_SET_RATE_PARENT,
++		.flags = CLK_SET_RATE_PARENT | CLK_GET_RATE_NOCACHE,
+ 	},
+ };
+ 
+@@ -682,7 +684,8 @@ static struct clk_regmap sc2_dsu_clk_premux0 = {
+ 			{ .hw = &sc2_gp1_pll.hw },
+ 		},
+ 		.num_parents = 4,
+-		.flags = CLK_SET_RATE_PARENT | CLK_SET_RATE_NO_REPARENT,
++		.flags = CLK_SET_RATE_PARENT | CLK_SET_RATE_NO_REPARENT |
++			 CLK_GET_RATE_NOCACHE,
+ 	},
+ };
+ 
+@@ -703,7 +706,8 @@ static struct clk_regmap sc2_dsu_clk_premux1 = {
+ 			{ .hw = &sc2_gp1_pll.hw },
+ 		},
+ 		.num_parents = 4,
+-		.flags = CLK_SET_RATE_PARENT | CLK_SET_RATE_NO_REPARENT,
++		.flags = CLK_SET_RATE_PARENT | CLK_SET_RATE_NO_REPARENT |
++			 CLK_GET_RATE_NOCACHE,
+ 	},
+ };
+ 
+@@ -713,6 +717,7 @@ static struct clk_regmap sc2_dsu_clk_mux0_div = {
+ 		.offset = CPUCTRL_SYS_CPU_CLK_CTRL5,
+ 		.shift = 4,
+ 		.width = 6,
++		.flags = CLK_DIVIDER_READ_ONLY,
+ 	},
+ 	.hw.init = &(struct clk_init_data){
+ 		.name = "dsu_clk_dyn0_div",
+@@ -721,7 +726,7 @@ static struct clk_regmap sc2_dsu_clk_mux0_div = {
+ 			&sc2_dsu_clk_premux0.hw
+ 		},
+ 		.num_parents = 1,
+-		.flags = CLK_SET_RATE_PARENT,
++		.flags = CLK_SET_RATE_PARENT | CLK_GET_RATE_NOCACHE,
+ 	},
+ };
+ 
+@@ -740,7 +745,7 @@ static struct clk_regmap sc2_dsu_clk_postmux0 = {
+ 			&sc2_dsu_clk_mux0_div.hw,
+ 		},
+ 		.num_parents = 2,
+-		.flags = CLK_SET_RATE_PARENT,
++		.flags = CLK_SET_RATE_PARENT | CLK_GET_RATE_NOCACHE,
+ 	},
+ };
+ 
+@@ -750,6 +755,7 @@ static struct clk_regmap sc2_dsu_clk_mux1_div = {
+ 		.offset = CPUCTRL_SYS_CPU_CLK_CTRL5,
+ 		.shift = 20,
+ 		.width = 6,
++		.flags = CLK_DIVIDER_READ_ONLY,
+ 	},
+ 	.hw.init = &(struct clk_init_data){
+ 		.name = "dsu_clk_dyn1_div",
+@@ -758,7 +764,7 @@ static struct clk_regmap sc2_dsu_clk_mux1_div = {
+ 			&sc2_dsu_clk_premux1.hw
+ 		},
+ 		.num_parents = 1,
+-		.flags = CLK_SET_RATE_PARENT,
++		.flags = CLK_SET_RATE_PARENT | CLK_GET_RATE_NOCACHE,
+ 	},
+ };
+ 
+@@ -777,7 +783,7 @@ static struct clk_regmap sc2_dsu_clk_postmux1 = {
+ 			&sc2_dsu_clk_mux1_div.hw,
+ 		},
+ 		.num_parents = 2,
+-		.flags = CLK_SET_RATE_PARENT,
++		.flags = CLK_SET_RATE_PARENT | CLK_GET_RATE_NOCACHE,
+ 	},
+ };
+ 
+@@ -796,7 +802,8 @@ static struct clk_regmap sc2_dsu_clk_dyn = {
+ 			&sc2_dsu_clk_postmux1.hw,
+ 		},
+ 		.num_parents = 2,
+-		.flags = CLK_SET_RATE_PARENT | CLK_SET_RATE_NO_REPARENT,
++		.flags = CLK_SET_RATE_PARENT | CLK_SET_RATE_NO_REPARENT |
++			 CLK_GET_RATE_NOCACHE,
+ 	},
+ };
+ 
+@@ -815,7 +822,8 @@ static struct clk_regmap sc2_dsu_final_clk = {
+ 			&sc2_sys_pll.hw,
+ 		},
+ 		.num_parents = 2,
+-		.flags = CLK_SET_RATE_PARENT | CLK_SET_RATE_NO_REPARENT,
++		.flags = CLK_SET_RATE_PARENT | CLK_SET_RATE_NO_REPARENT |
++			 CLK_GET_RATE_NOCACHE,
+ 	},
+ };
+ 
+@@ -834,6 +842,7 @@ static struct clk_regmap sc2_cpu1_clk = {
+ 			/* This CPU also have a dedicated clock tree */
+ 		},
+ 		.num_parents = 1,
++		.flags = CLK_GET_RATE_NOCACHE,
+ 	},
+ };
+ 
+@@ -852,6 +861,7 @@ static struct clk_regmap sc2_cpu2_clk = {
+ 			/* This CPU also have a dedicated clock tree */
+ 		},
+ 		.num_parents = 1,
++		.flags = CLK_GET_RATE_NOCACHE,
+ 	},
+ };
+ 
+@@ -870,6 +880,7 @@ static struct clk_regmap sc2_cpu3_clk = {
+ 			/* This CPU also have a dedicated clock tree */
+ 		},
+ 		.num_parents = 1,
++		.flags = CLK_GET_RATE_NOCACHE,
+ 	},
+ };
+ 
+@@ -888,89 +899,46 @@ static struct clk_regmap sc2_dsu_clk = {
+ 			&sc2_dsu_final_clk.hw,
+ 		},
+ 		.num_parents = 2,
++		.flags = CLK_GET_RATE_NOCACHE,
+ 	},
+ };
+ 
+ struct sc2_cpu_clk_postmux_nb_data {
+ 	struct notifier_block nb;
+-	struct clk_hw *fclk_div2;
++	struct clk_hw *xtal;
+ 	struct clk_hw *cpu_clk_dyn;
+-	struct clk_hw *cpu_clk_postmux0;
++	struct clk_hw *saved_parent;
+ 	struct clk_hw *cpu_clk_postmux1;
+ 	struct clk_hw *cpu_clk_premux1;
+ };
+ 
+ static int sc2_cpu_clk_postmux_notifier_cb(struct notifier_block *nb,
+-					   unsigned long event, void *data)
++					unsigned long event, void *data)
+ {
+ 	struct sc2_cpu_clk_postmux_nb_data *nb_data =
+ 		container_of(nb, struct sc2_cpu_clk_postmux_nb_data, nb);
++	int ret;
+ 
+ 	switch (event) {
+ 	case PRE_RATE_CHANGE:
+-		/*
+-		 * This notifier means cpu_clk_postmux0 clock will be changed
+-		 * to feed cpu_clk, this is the current path :
+-		 * cpu_clk
+-		 *    \- cpu_clk_dyn
+-		 *          \- cpu_clk_postmux0
+-		 *                \- cpu_clk_muxX_div
+-		 *                      \- cpu_clk_premux0
+-		 *				\- fclk_div3 or fclk_div2
+-		 *		OR
+-		 *                \- cpu_clk_premux0
+-		 *			\- fclk_div3 or fclk_div2
+-		 */
+-
+-		/* Setup cpu_clk_premux1 to fclk_div2 */
+-		clk_hw_set_parent(nb_data->cpu_clk_premux1,
+-				  nb_data->fclk_div2);
+-
+-		/* Setup cpu_clk_postmux1 to bypass divider */
+-		clk_hw_set_parent(nb_data->cpu_clk_postmux1,
+-				  nb_data->cpu_clk_premux1);
+-
+-		/* Switch to parking clk on cpu_clk_postmux1 */
+-		clk_hw_set_parent(nb_data->cpu_clk_dyn,
+-				  nb_data->cpu_clk_postmux1);
+-
+-		/*
+-		 * Now, cpu_clk is fclk_div2 in the current path :
+-		 * cpu_clk
+-		 *    \- cpu_clk_dyn
+-		 *          \- cpu_clk_postmux1
+-		 *                \- cpu_clk_premux1
+-		 *                      \- fclk_div2
+-		 */
+-
+-		return NOTIFY_OK;
+-
++		nb_data->saved_parent = clk_hw_get_parent(nb_data->cpu_clk_dyn);
++		/* The crystal is below every CPU OPP, including the 779 mV ones. */
++		ret = clk_hw_set_parent(nb_data->cpu_clk_premux1,
++					nb_data->xtal);
++		if (ret)
++			return notifier_from_errno(ret);
++		ret = clk_hw_set_parent(nb_data->cpu_clk_postmux1,
++					nb_data->cpu_clk_premux1);
++		if (ret)
++			return notifier_from_errno(ret);
++		ret = clk_hw_set_parent(nb_data->cpu_clk_dyn,
++					nb_data->cpu_clk_postmux1);
++		return notifier_from_errno(ret);
+ 	case POST_RATE_CHANGE:
+-		/*
+-		 * The cpu_clk_postmux0 has ben updated, now switch back
+-		 * cpu_clk_dyn to cpu_clk_postmux0 and take the changes
+-		 * in account.
+-		 */
+-
+-		/* Configure cpu_clk_dyn back to cpu_clk_postmux0 */
+-		clk_hw_set_parent(nb_data->cpu_clk_dyn,
+-				  nb_data->cpu_clk_postmux0);
+-
+-		/*
+-		 * new path :
+-		 * cpu_clk
+-		 *    \- cpu_clk_dyn
+-		 *          \- cpu_clk_postmux0
+-		 *                \- cpu_clk_muxX_div
+-		 *                      \- cpu_clk_premux0
+-		 *				\- fclk_div3 or fclk_div2
+-		 *		OR
+-		 *                \- cpu_clk_premux0
+-		 *			\- fclk_div3 or fclk_div2
+-		 */
+-
+-		return NOTIFY_OK;
+-
++	case ABORT_RATE_CHANGE:
++		ret = clk_hw_set_parent(nb_data->cpu_clk_dyn,
++					nb_data->saved_parent);
++		return notifier_from_errno(ret);
+ 	default:
+ 		return NOTIFY_DONE;
+ 	}
+@@ -978,7 +946,6 @@ static int sc2_cpu_clk_postmux_notifier_cb(struct notifier_block *nb,
+ 
+ static struct sc2_cpu_clk_postmux_nb_data sc2_cpu_clk_postmux0_nb_data = {
+ 	.cpu_clk_dyn = &sc2_cpu_clk_dyn.hw,
+-	.cpu_clk_postmux0 = &sc2_cpu_clk_postmux0.hw,
+ 	.cpu_clk_postmux1 = &sc2_cpu_clk_postmux1.hw,
+ 	.cpu_clk_premux1 = &sc2_cpu_clk_premux1.hw,
+ 	.nb.notifier_call = sc2_cpu_clk_postmux_notifier_cb,
+@@ -986,69 +953,36 @@ static struct sc2_cpu_clk_postmux_nb_data sc2_cpu_clk_postmux0_nb_data = {
+ 
+ struct sc2_sys_pll_nb_data {
+ 	struct notifier_block nb;
+-	struct clk_hw *sys_pll;
++	struct clk_hw *saved_parent;
+ 	struct clk_hw *cpu_clk;
+ 	struct clk_hw *cpu_clk_dyn;
+ };
+ 
+ static int sc2_sys_pll_notifier_cb(struct notifier_block *nb,
+-				   unsigned long event, void *data)
++				 unsigned long event, void *data)
+ {
+ 	struct sc2_sys_pll_nb_data *nb_data =
+ 		container_of(nb, struct sc2_sys_pll_nb_data, nb);
++	int ret;
+ 
+ 	switch (event) {
+ 	case PRE_RATE_CHANGE:
+-		/*
+-		 * This notifier means sys_pll clock will be changed
+-		 * to feed cpu_clk, this the current path :
+-		 * cpu_clk
+-		 *    \- sys_pll
+-		 *          \- sys_pll_dco
+-		 */
+-
+-		/* Configure cpu_clk to use cpu_clk_dyn */
+-		clk_hw_set_parent(nb_data->cpu_clk,
+-				  nb_data->cpu_clk_dyn);
+-
+-		/*
+-		 * Now, cpu_clk uses the dyn path
+-		 * cpu_clk
+-		 *    \- cpu_clk_dyn
+-		 *          \- cpu_clk_dynX
+-		 *                \- cpu_clk_dynX_sel
+-		 *		     \- cpu_clk_dynX_div
+-		 *                      \- xtal/fclk_div2/fclk_div3
+-		 *                   \- xtal/fclk_div2/fclk_div3
+-		 */
+-
+-		return NOTIFY_OK;
+-
++		nb_data->saved_parent = clk_hw_get_parent(nb_data->cpu_clk);
++		/* The CPU must not run from the PLL while firmware relocks it. */
++		ret = clk_hw_set_parent(nb_data->cpu_clk,
++					nb_data->cpu_clk_dyn);
++		return notifier_from_errno(ret);
+ 	case POST_RATE_CHANGE:
+-		/*
+-		 * The sys_pll has ben updated, now switch back cpu_clk to
+-		 * sys_pll
+-		 */
+-
+-		/* Configure cpu_clk to use sys_pll */
+-		clk_hw_set_parent(nb_data->cpu_clk,
+-				  nb_data->sys_pll);
+-
+-		/* new path :
+-		 * cpu_clk
+-		 *    \- sys_pll
+-		 *          \- sys_pll_dco
+-		 */
+-
+-		return NOTIFY_OK;
+-
++	case ABORT_RATE_CHANGE:
++		ret = clk_hw_set_parent(nb_data->cpu_clk,
++					nb_data->saved_parent);
++		return notifier_from_errno(ret);
+ 	default:
+ 		return NOTIFY_DONE;
+ 	}
+ }
+ 
+ static struct sc2_sys_pll_nb_data sc2_sys_pll_nb_data = {
+-	.sys_pll = &sc2_sys_pll.hw,
+ 	.cpu_clk = &sc2_cpu_clk.hw,
+ 	.cpu_clk_dyn = &sc2_cpu_clk_dyn.hw,
+ 	.nb.notifier_call = sc2_sys_pll_notifier_cb,
+@@ -1058,7 +992,7 @@ static struct sc2_sys_pll_nb_data sc2_sys_pll_nb_data = {
+ struct sc2_dsu_clk_postmux_nb_data {
+ 	struct notifier_block nb;
+ 	struct clk_hw *dsu_clk_dyn;
+-	struct clk_hw *dsu_clk_postmux0;
++	struct clk_hw *saved_parent;
+ 	struct clk_hw *dsu_clk_postmux1;
+ };
+ 
+@@ -1071,14 +1005,16 @@ static int sc2_dsu_clk_postmux_notifier_cb(struct notifier_block *nb,
+ 
+ 	switch (event) {
+ 	case PRE_RATE_CHANGE:
++		nb_data->saved_parent = clk_hw_get_parent(nb_data->dsu_clk_dyn);
+ 		ret = clk_hw_set_parent(nb_data->dsu_clk_dyn,
+ 					nb_data->dsu_clk_postmux1);
+ 		if (ret)
+ 			return notifier_from_errno(ret);
+ 		return NOTIFY_OK;
+ 	case POST_RATE_CHANGE:
++	case ABORT_RATE_CHANGE:
+ 		ret = clk_hw_set_parent(nb_data->dsu_clk_dyn,
+-					nb_data->dsu_clk_postmux0);
++					nb_data->saved_parent);
+ 		if (ret)
+ 			return notifier_from_errno(ret);
+ 		return NOTIFY_OK;
+@@ -1089,7 +1025,6 @@ static int sc2_dsu_clk_postmux_notifier_cb(struct notifier_block *nb,
+ 
+ static struct sc2_dsu_clk_postmux_nb_data sc2_dsu_clk_postmux0_nb_data = {
+ 	.dsu_clk_dyn = &sc2_dsu_clk_dyn.hw,
+-	.dsu_clk_postmux0 = &sc2_dsu_clk_postmux0.hw,
+ 	.dsu_clk_postmux1 = &sc2_dsu_clk_postmux1.hw,
+ 	.nb.notifier_call = sc2_dsu_clk_postmux_notifier_cb,
+ };
+@@ -3064,6 +2999,7 @@ static struct clk_regmap sc2_ts_clk_gate = {
+ 			&sc2_ts_clk_div.hw
+ 		},
+ 		.num_parents = 1,
++		.flags = CLK_SET_RATE_PARENT,
+ 	},
+ };
+ 
+@@ -4670,7 +4606,7 @@ static struct clk_regmap sc2_pwm_a_mux = {
+ 		.ops = &clk_regmap_mux_ops,
+ 		.parent_data = sc2_pwm_parent_data,
+ 		.num_parents = ARRAY_SIZE(sc2_pwm_parent_data),
+-		.flags = CLK_IGNORE_UNUSED,
++		.flags = CLK_IGNORE_UNUSED | CLK_SET_RATE_NO_REPARENT,
+ 	},
+ };
+ 
+@@ -4718,7 +4654,7 @@ static struct clk_regmap sc2_pwm_b_mux = {
+ 		.ops = &clk_regmap_mux_ops,
+ 		.parent_data = sc2_pwm_parent_data,
+ 		.num_parents = ARRAY_SIZE(sc2_pwm_parent_data),
+-		.flags = CLK_IGNORE_UNUSED,
++		.flags = CLK_IGNORE_UNUSED | CLK_SET_RATE_NO_REPARENT,
+ 	},
+ };
+ 
+@@ -4766,7 +4702,7 @@ static struct clk_regmap sc2_pwm_c_mux = {
+ 		.ops = &clk_regmap_mux_ops,
+ 		.parent_data = sc2_pwm_parent_data,
+ 		.num_parents = ARRAY_SIZE(sc2_pwm_parent_data),
+-		.flags = CLK_IGNORE_UNUSED,
++		.flags = CLK_IGNORE_UNUSED | CLK_SET_RATE_NO_REPARENT,
+ 	},
+ };
+ 
+@@ -4814,7 +4750,7 @@ static struct clk_regmap sc2_pwm_d_mux = {
+ 		.ops = &clk_regmap_mux_ops,
+ 		.parent_data = sc2_pwm_parent_data,
+ 		.num_parents = ARRAY_SIZE(sc2_pwm_parent_data),
+-		.flags = CLK_IGNORE_UNUSED,
++		.flags = CLK_IGNORE_UNUSED | CLK_SET_RATE_NO_REPARENT,
+ 	},
+ };
+ 
+@@ -4862,7 +4798,7 @@ static struct clk_regmap sc2_pwm_e_mux = {
+ 		.ops = &clk_regmap_mux_ops,
+ 		.parent_data = sc2_pwm_parent_data,
+ 		.num_parents = ARRAY_SIZE(sc2_pwm_parent_data),
+-		.flags = CLK_IGNORE_UNUSED,
++		.flags = CLK_IGNORE_UNUSED | CLK_SET_RATE_NO_REPARENT,
+ 	},
+ };
+ 
+@@ -4910,7 +4846,7 @@ static struct clk_regmap sc2_pwm_f_mux = {
+ 		.ops = &clk_regmap_mux_ops,
+ 		.parent_data = sc2_pwm_parent_data,
+ 		.num_parents = ARRAY_SIZE(sc2_pwm_parent_data),
+-		.flags = CLK_IGNORE_UNUSED,
++		.flags = CLK_IGNORE_UNUSED | CLK_SET_RATE_NO_REPARENT,
+ 	},
+ };
+ 
+@@ -4958,7 +4894,7 @@ static struct clk_regmap sc2_pwm_g_mux = {
+ 		.ops = &clk_regmap_mux_ops,
+ 		.parent_data = sc2_pwm_parent_data,
+ 		.num_parents = ARRAY_SIZE(sc2_pwm_parent_data),
+-		.flags = CLK_IGNORE_UNUSED,
++		.flags = CLK_IGNORE_UNUSED | CLK_SET_RATE_NO_REPARENT,
+ 	},
+ };
+ 
+@@ -5006,7 +4942,7 @@ static struct clk_regmap sc2_pwm_h_mux = {
+ 		.ops = &clk_regmap_mux_ops,
+ 		.parent_data = sc2_pwm_parent_data,
+ 		.num_parents = ARRAY_SIZE(sc2_pwm_parent_data),
+-		.flags = CLK_IGNORE_UNUSED,
++		.flags = CLK_IGNORE_UNUSED | CLK_SET_RATE_NO_REPARENT,
+ 	},
+ };
+ 
+@@ -5054,7 +4990,7 @@ static struct clk_regmap sc2_pwm_i_mux = {
+ 		.ops = &clk_regmap_mux_ops,
+ 		.parent_data = sc2_pwm_parent_data,
+ 		.num_parents = ARRAY_SIZE(sc2_pwm_parent_data),
+-		.flags = CLK_IGNORE_UNUSED,
++		.flags = CLK_IGNORE_UNUSED | CLK_SET_RATE_NO_REPARENT,
+ 	},
+ };
+ 
+@@ -5102,7 +5038,7 @@ static struct clk_regmap sc2_pwm_j_mux = {
+ 		.ops = &clk_regmap_mux_ops,
+ 		.parent_data = sc2_pwm_parent_data,
+ 		.num_parents = ARRAY_SIZE(sc2_pwm_parent_data),
+-		.flags = CLK_IGNORE_UNUSED,
++		.flags = CLK_IGNORE_UNUSED | CLK_SET_RATE_NO_REPARENT,
+ 	},
+ };
+ 
+@@ -5116,7 +5052,7 @@ static struct clk_regmap sc2_pwm_j_div = {
+ 		.name = "pwm_j_div",
+ 		.ops = &clk_regmap_divider_ops,
+ 		.parent_hws = (const struct clk_hw *[]) {
+-			&sc2_pwm_h_mux.hw
++			&sc2_pwm_j_mux.hw
+ 		},
+ 		.num_parents = 1,
+ 		.flags = CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED,
+@@ -5135,7 +5071,8 @@ static struct clk_regmap sc2_pwm_j_gate = {
+ 			&sc2_pwm_j_div.hw
+ 		},
+ 		.num_parents = 1,
+-		.flags = CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED,
++		/* PWM_J supplies the always-on CPU rail, including failed handover. */
++		.flags = CLK_SET_RATE_PARENT | CLK_IS_CRITICAL,
+ 	},
+ };
+ 
+@@ -6022,7 +5959,10 @@ static int meson_sc2_dvfs_setup_common(struct platform_device *pdev)
+ 	int ret;
+ 
+ 	/* Setup clock notifier for cpu_clk_postmux0 */
+-	sc2_cpu_clk_postmux0_nb_data.fclk_div2 = &sc2_fclk_div2.hw;
++	sc2_cpu_clk_postmux0_nb_data.xtal =
++		clk_hw_get_parent_by_index(&sc2_cpu_clk_premux1.hw, 0);
++	if (!sc2_cpu_clk_postmux0_nb_data.xtal)
++		return -ENOENT;
+ 	notifier_clk = sc2_cpu_clk_postmux0.hw.clk;
+ 	ret = devm_clk_notifier_register(&pdev->dev, notifier_clk,
+ 					 &sc2_cpu_clk_postmux0_nb_data.nb);
+diff --git a/drivers/clk/meson/sc2_clk_regmap.c b/drivers/clk/meson/sc2_clk_regmap.c
+index 61b3babda5b7cf2193a978e2c194540ddef5011a..5c8341f2eb3773363824bbbaaf80fa320096a936 100644
+--- a/drivers/clk/meson/sc2_clk_regmap.c
++++ b/drivers/clk/meson/sc2_clk_regmap.c
+@@ -24,6 +24,9 @@ static unsigned long clk_regmap_secure_div_recalc_rate(struct clk_hw *hw,
+ 		arm_smccc_smc(CPUCLK_SECURE_RW, CLK_DSU_REG_RW,
+ 			      0, 0, 0, 0, 0, 0, &res);
+ 	val = res.a0;
++	if ((int)res.a0 == SMCCC_RET_NOT_SUPPORTED)
++		return 0;
++	prate = clk_hw_get_rate(clk_hw_get_parent(hw));
+ 
+ 	val >>= div->shift;
+ 	val &= clk_div_mask(div->width);
+@@ -48,6 +51,8 @@ static int clk_regmap_secure_div_determine_rate(struct clk_hw *hw,
+ 			arm_smccc_smc(CPUCLK_SECURE_RW, CLK_DSU_REG_RW,
+ 				      0, 0, 0, 0, 0, 0, &res);
+ 		val = res.a0;
++		if ((int)res.a0 == SMCCC_RET_NOT_SUPPORTED)
++			return -EOPNOTSUPP;
+ 
+ 		val >>= div->shift;
+ 		val &= clk_div_mask(div->width);
+@@ -73,13 +78,22 @@ static int clk_regmap_secure_div_set_rate(struct clk_hw *hw, unsigned long rate,
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	if (!strcmp(clk_hw_get_name(hw), "cpu_clk_dyn1_div"))
++	if (!strcmp(clk_hw_get_name(hw), "cpu_clk_dyn1_div")) {
+ 		arm_smccc_smc(CPUCLK_SECURE_RW, CPU_DIVIDER_SET_RATE, ret,
+ 			      div->width, div->shift, 0, 0, 0, &res);
+-	else
++		arm_smccc_smc(CPUCLK_SECURE_RW, CLK_CPU_REG_RW,
++			      0, 0, 0, 0, 0, 0, &res);
++	} else {
+ 		arm_smccc_smc(CPUCLK_SECURE_RW, DSU_DIVIDER_SET_RATE, ret,
+ 			      div->width, div->shift, 0, 0, 0, &res);
+-	return 0;
++		arm_smccc_smc(CPUCLK_SECURE_RW, CLK_DSU_REG_RW,
++			      0, 0, 0, 0, 0, 0, &res);
++	}
++	if ((int)res.a0 == SMCCC_RET_NOT_SUPPORTED)
++		return -EOPNOTSUPP;
++
++	return ((res.a0 >> div->shift) & clk_div_mask(div->width)) == ret ?
++		0 : -EIO;
+ };
+ 
+ /* Would prefer clk_regmap_div_ro_ops but clashes with qcom */
+@@ -121,11 +135,26 @@ static u8 clk_regmap_secure_mux_get_parent(struct clk_hw *hw)
+ 			      0, 0, 0, 0, 0, 0, &res);
+ 
+ 	val = res.a0;
++	if ((int)res.a0 == SMCCC_RET_NOT_SUPPORTED)
++		return clk_hw_get_num_parents(hw);
++
+ 	val >>= mux->shift;
+ 	val &= mux->mask;
+ 	return clk_mux_val_to_index(hw, mux->table, mux->flags, val);
+ }
+ 
++static unsigned long clk_regmap_secure_mux_recalc_rate(struct clk_hw *hw,
++						      unsigned long parent_rate)
++{
++	u8 index = clk_regmap_secure_mux_get_parent(hw);
++	struct clk_hw *parent;
++
++	if (index >= clk_hw_get_num_parents(hw))
++		return 0;
++	parent = clk_hw_get_parent_by_index(hw, index);
++	return parent ? clk_hw_get_rate(parent) : 0;
++}
++
+ static int clk_regmap__secure_mux_set_parent(struct clk_hw *hw, u8 index)
+ {
+ 	struct clk_regmap *clk = to_clk_regmap(hw);
+@@ -151,7 +180,7 @@ static int clk_regmap__secure_mux_set_parent(struct clk_hw *hw, u8 index)
+ 		arm_smccc_smc(CPUCLK_SECURE_RW, SET_DSU_PRE_MUX_PARENT,
+ 			      val, mux->mask, mux->shift, 0, 0, 0, &res);
+ 
+-	return 0;
++	return clk_regmap_secure_mux_get_parent(hw) == index ? 0 : -EIO;
+ }
+ 
+ static int clk_regmap_secure_mux_determine_rate(struct clk_hw *hw,
+@@ -164,12 +193,14 @@ static int clk_regmap_secure_mux_determine_rate(struct clk_hw *hw,
+ }
+ 
+ const struct clk_ops meson_clk_regmap_secure_mux_ops = {
++	.recalc_rate = clk_regmap_secure_mux_recalc_rate,
+ 	.get_parent = clk_regmap_secure_mux_get_parent,
+ 	.set_parent = clk_regmap__secure_mux_set_parent,
+ 	.determine_rate = clk_regmap_secure_mux_determine_rate,
+ };
+ 
+ const struct clk_ops meson_clk_regmap_secure_mux_ro_ops = {
++	.recalc_rate = clk_regmap_secure_mux_recalc_rate,
+ 	.get_parent = clk_regmap_secure_mux_get_parent,
+ };
+ 
+@@ -191,6 +222,9 @@ meson_secure_clk_cpu_dyndiv_recalc_rate(struct clk_hw *hw,
+ 	arm_smccc_smc(CPUCLK_SECURE_RW, CLK_CPU_REG_RW,
+ 		      0, 0, 0, 0, 0, 0, &res);
+ 	val = res.a0;
++	if ((int)res.a0 == SMCCC_RET_NOT_SUPPORTED)
++		return 0;
++	prate = clk_hw_get_rate(clk_hw_get_parent(hw));
+ 
+ 	val >>= data->div.shift;
+ 	val &= clk_div_mask(data->div.width);
+@@ -222,7 +256,13 @@ static int meson_secure_clk_cpu_dyndiv_set_rate(struct clk_hw *hw,
+ 
+ 	arm_smccc_smc(CPUCLK_SECURE_RW, CPU_DIVIDER_SET_RATE, ret,
+ 		      data->div.width, data->div.shift, 0, 0, 0, &res);
+-	return 0;
++	arm_smccc_smc(CPUCLK_SECURE_RW, CLK_CPU_REG_RW,
++		      0, 0, 0, 0, 0, 0, &res);
++	if ((int)res.a0 == SMCCC_RET_NOT_SUPPORTED)
++		return -EOPNOTSUPP;
++
++	return ((res.a0 >> data->div.shift) & clk_div_mask(data->div.width)) == ret ?
++		0 : -EIO;
+ };
+ 
+ const struct clk_ops meson_secure_clk_cpu_dyndiv_ops = {

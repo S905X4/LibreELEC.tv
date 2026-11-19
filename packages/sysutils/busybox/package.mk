@@ -203,6 +203,7 @@ makeinstall_init() {
   sed -e "s/@DISTRONAME@/${DISTRONAME}/g" \
       -e "s/@KERNEL_NAME@/${KERNEL_NAME}/g" \
       -e "s/@SYSTEM_SIZE@/${SYSTEM_SIZE}/g" \
+      -e "s/@INITRAMFS_DEBUG_SHELL@/${INITRAMFS_DEBUG_SHELL:-yes}/g" \
       -i ${INSTALL}/init
   chmod 755 ${INSTALL}/init
 }

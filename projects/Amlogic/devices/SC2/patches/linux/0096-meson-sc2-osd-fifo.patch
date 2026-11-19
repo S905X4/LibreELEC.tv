@@ -1,0 +1,44 @@
+From f6c8126b86feb4d1a29babdbacfaf5a30531651b Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Fri, 13 Nov 2026 05:50:18 +0800
+Subject: [PATCH] drm/meson: Program the SC2 OSD FIFO parameters
+
+SC2 currently inherits the G12A OSD FIFO configuration: 32 depth
+units, 32-word bursts and 31 hold lines. The SC2 OSD_HIGH_ONE device
+entry uses 64 depth units (512 words), 128-word bursts and eight hold
+lines in the applicable Amlogic implementation.
+
+Select those parameters for SC2 without changing the other compatible
+SoCs, AFBC reset policy, RDMA triggering or framebuffer lifetime. The
+reported UHD AFBC black screen remains a separate hardware acceptance
+item; this sourced initialization correction does not establish its
+root cause.
+
+Change-Id: Iaf9353f1e572ed78369d7f9f4a4e316fba58e3ca
+---
+ drivers/gpu/drm/meson/meson_viu.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/meson/meson_viu.c b/drivers/gpu/drm/meson/meson_viu.c
+index fa01a066915b..e7454abb590f 100644
+--- a/drivers/gpu/drm/meson/meson_viu.c
++++ b/drivers/gpu/drm/meson/meson_viu.c
+@@ -457,11 +457,13 @@ void meson_viu_init(struct meson_drm *priv)
+ 
+ 	/* Initialize OSD1 fifo control register */
+ 	reg = VIU_OSD_DDR_PRIORITY_URGENT |
+-		VIU_OSD_FIFO_DEPTH_VAL(32) | /* fifo_depth_val: 32*8=256 */
++		VIU_OSD_FIFO_DEPTH_VAL(priv->sc2 ? 64 : 32) |
+ 		VIU_OSD_WORDS_PER_BURST(4) | /* 4 words in 1 burst */
+ 		VIU_OSD_FIFO_LIMITS(2);      /* fifo_lim: 2*16=32 */
+ 
+-	if (meson_vpu_is_compatible(priv, VPU_COMPATIBLE_G12A))
++	if (priv->sc2)
++		reg |= VIU_OSD_BURST_LENGTH_128 | VIU_OSD_HOLD_FIFO_LINES(8);
++	else if (meson_vpu_is_compatible(priv, VPU_COMPATIBLE_G12A))
+ 		reg |= (VIU_OSD_BURST_LENGTH_32 | VIU_OSD_HOLD_FIFO_LINES(31));
+ 	else
+ 		reg |= (VIU_OSD_BURST_LENGTH_64 | VIU_OSD_HOLD_FIFO_LINES(4));
+-- 
+2.47.3
+

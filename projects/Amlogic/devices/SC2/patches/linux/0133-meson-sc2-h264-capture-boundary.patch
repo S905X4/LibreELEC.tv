@@ -1,0 +1,253 @@
+From a6fdf56beb44798db79420b3861c7db2c8e6bd9e Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Sat, 14 Nov 2026 19:16:56 +0800
+Subject: [PATCH] media: meson: terminate SC2 H264 capture before source
+ reconfiguration
+
+Flush completed old DPB output before a driver-owned empty LAST buffer. Keep source-change and terminal drain separate, resume only after the old boundary, and notify the SC2 host DPB synchronously when CAPTURE returns so no old recycle entry crosses reallocation. Preserve explicit draining across capture-only streamoff. Leave legacy firmware recycling unchanged.
+
+Change-Id: I09adb5732e42765d649012bd63e815ad87c94ef8
+---
+ drivers/staging/media/meson/vdec/codec_h264.c | 68 +++++++++++++++++--
+ drivers/staging/media/meson/vdec/vdec.c       | 20 +++++-
+ drivers/staging/media/meson/vdec/vdec.h       |  3 +
+ .../staging/media/meson/vdec/vdec_helpers.c   |  2 +-
+ 4 files changed, 84 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/staging/media/meson/vdec/codec_h264.c b/drivers/staging/media/meson/vdec/codec_h264.c
+index 26b80322f1b3..9036f3ac9345 100644
+--- a/drivers/staging/media/meson/vdec/codec_h264.c
++++ b/drivers/staging/media/meson/vdec/codec_h264.c
+@@ -4181,6 +4181,7 @@ struct h264_multi {
+     bool empty;
+     bool incomplete;
+     bool eos_sent;
++    bool source_last;
+ };
+ 
+ static int h264_multi_stop(struct amvdec_session *sess);
+@@ -4822,6 +4823,30 @@ static int h264_multi_configure_slice(struct amvdec_session *sess)
+     return 0;
+ }
+ 
++/* CONFIG has stopped picture reconstruction and every old DPB picture has
++ * been returned before this empty marker. Only a queued, driver-owned buffer
++ * can terminate CAPTURE; a held export is never borrowed for the marker.
++ */
++static void h264_multi_source_boundary(struct amvdec_session *sess)
++{
++    struct h264_multi *m = ((struct codec_h264 *)sess->priv)->multi;
++    struct vb2_v4l2_buffer *vb;
++    unsigned int plane;
++
++    if (!sess->source_change_pending || m->source_last)
++        return;
++    vb = v4l2_m2m_dst_buf_remove(sess->m2m_ctx);
++    if (!vb)
++        return;
++    for (plane = 0; plane < vb->vb2_buf.num_planes; plane++)
++        vb2_set_plane_payload(&vb->vb2_buf, plane, 0);
++    vb->flags |= V4L2_BUF_FLAG_LAST;
++    vb->field = V4L2_FIELD_NONE;
++    vb->sequence = sess->sequence_cap++;
++    m->source_last = true;
++    v4l2_m2m_buf_done(vb, VB2_BUF_STATE_DONE);
++}
++
+ static int h264_multi_parameters(struct amvdec_session *sess)
+ {
+     struct codec_h264 *h264 = sess->priv;
+@@ -4885,6 +4910,11 @@ static int h264_multi_parameters(struct amvdec_session *sess)
+         meson_h264_dpb_flush_dpb(dpb);
+         if (m->error)
+             return m->error;
++        for (i = 0; i < dpb->mDPB.used_size; i++)
++            if (!dpb->mDPB.fs[i]->is_output && !dpb->mDPB.fs[i]->pre_output)
++                return -EILSEQ;
++        m->source_last = false;
++        WRITE_ONCE(sess->source_change_pending, true);
+     }
+     if (!reuse) {
+         meson_h264_dpb_dpb_init_global(dpb, 0, 0, refs + 1);
+@@ -4935,6 +4965,11 @@ static int h264_multi_parameters(struct amvdec_session *sess)
+         return 0;
+     }
+     m->waiting_capture = true;
++    if (sess->source_change_pending) {
++        amvdec_src_change(sess, width * 16, height * 16, capacity + 6);
++        h264_multi_source_boundary(sess);
++        return 0;
++    }
+     return 1;
+ }
+ 
+@@ -4950,9 +4985,14 @@ static void h264_multi_resume(struct amvdec_session *sess)
+     int ret;
+ 
+     mutex_lock(&m->lock);
++    if (sess->source_change_pending && !m->source_last) {
++        ret = -EPROTO;
++        goto error;
++    }
+     if (!m->waiting_capture || !bytes ||
+         sess->num_dst_bufs < h264->max_dpb + 6 ||
+-        sess->num_dst_bufs > ARRAY_SIZE(m->surface)) {
++        sess->num_dst_bufs > ARRAY_SIZE(m->surface) ||
++        v4l2_m2m_num_dst_bufs_ready(sess->m2m_ctx) != sess->num_dst_bufs) {
+         ret = -EINVAL;
+         goto error;
+     }
+@@ -4979,6 +5019,7 @@ static void h264_multi_resume(struct amvdec_session *sess)
+     dpb->colocated_mv_addr_end = h264->ref_paddr + bytes;
+     amvdec_set_output_format(sess);
+     m->waiting_capture = false;
++    WRITE_ONCE(sess->source_change_pending, false);
+     amvdec_write_dos(core, AV_SCRATCH_J, H264_ACTION_CONFIG_DONE);
+     /* CONFIG_PARAM waits for allocation in scratch 0; scratch 7 is run restore. */
+     amvdec_write_dos(core, AV_SCRATCH_0, (h264->max_refs << 24) |
+@@ -5168,6 +5209,10 @@ static void h264_multi_recycle(struct amvdec_core *core, u32 index)
+     int ret = 0;
+ 
+     mutex_lock(&m->lock);
++    if (m->waiting_capture) {
++        h264_multi_source_boundary(sess);
++        goto error;
++    }
+     if (index >= sess->num_dst_bufs || !m->surface[index].displayed) {
+         ret = -EINVAL;
+         goto error;
+@@ -5193,6 +5238,20 @@ static void h264_multi_recycle(struct amvdec_core *core, u32 index)
+         amvdec_abort(sess);
+ }
+ 
++static void codec_h264_capture_queued(struct amvdec_session *sess,
++                                      struct vb2_v4l2_buffer *vb)
++{
++    struct codec_h264 *h264 = sess->priv;
++    unsigned int index;
++
++    if (!h264 || !h264->multi)
++        return;
++    for (index = 0; index < sess->num_dst_bufs; index++)
++        if (sess->fw_idx_to_vb2_idx[index] == vb->vb2_buf.index)
++            break;
++    h264_multi_recycle(sess->core, index);
++}
++
+ static int codec_h264_drain_step(struct amvdec_session *sess)
+ {
+     struct codec_h264 *h264 = sess->priv;
+@@ -5263,18 +5322,12 @@ static int codec_h264_drain_step(struct amvdec_session *sess)
+ 
+ static int codec_h264_can_recycle(struct amvdec_core *core)
+ {
+-	if (core->platform->revision == VDEC_REVISION_SC2)
+-		return 1;
+ 	return !amvdec_read_dos(core, AV_SCRATCH_7) ||
+ 	       !amvdec_read_dos(core, AV_SCRATCH_8);
+ }
+ 
+ static void codec_h264_recycle(struct amvdec_core *core, u32 buf_idx)
+ {
+-	if (core->platform->revision == VDEC_REVISION_SC2) {
+-		h264_multi_recycle(core, buf_idx);
+-		return;
+-	}
+ 	/*
+ 	 * Tell the firmware it can recycle this buffer.
+ 	 * AV_SCRATCH_8 serves the same purpose.
+@@ -5696,4 +5749,5 @@ struct amvdec_codec_ops codec_h264_ops = {
+ 	.input_committed = codec_h264_input_committed,
+ 	.input_read_pointer = codec_h264_input_read_pointer,
+ 	.drain_step = codec_h264_drain_step,
++	.capture_queued = codec_h264_capture_queued,
+ };
+diff --git a/drivers/staging/media/meson/vdec/vdec.c b/drivers/staging/media/meson/vdec/vdec.c
+index 44945e394cf3..05be78ed921f 100644
+--- a/drivers/staging/media/meson/vdec/vdec.c
++++ b/drivers/staging/media/meson/vdec/vdec.c
+@@ -65,6 +65,10 @@ static int vdec_codec_needs_recycle(struct amvdec_session *sess)
+ {
+ 	struct amvdec_codec_ops *codec_ops = sess->fmt_out->codec_ops;
+ 
++	if (sess->core->platform->revision == VDEC_REVISION_SC2 &&
++	    codec_ops->capture_queued)
++		return 0;
++
+ 	return codec_ops->can_recycle && codec_ops->recycle;
+ }
+ 
+@@ -314,6 +318,13 @@ static void vdec_vb2_buf_queue(struct vb2_buffer *vb)
+ 	if (!sess->streamon_out)
+ 		return;
+ 
++	if (sess->streamon_cap &&
++	    (sess->status == STATUS_RUNNING || sess->status == STATUS_NEEDS_RESUME) &&
++	    vb->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE &&
++	    sess->core->platform->revision == VDEC_REVISION_SC2 &&
++	    sess->fmt_out->codec_ops->capture_queued)
++		sess->fmt_out->codec_ops->capture_queued(sess, vbuf);
++
+ 	if (sess->streamon_cap &&
+ 	    vb->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE &&
+ 	    vdec_codec_needs_recycle(sess) &&
+@@ -377,6 +388,11 @@ static int vdec_start_streaming(struct vb2_queue *q, unsigned int count)
+ 			sess->processor_started = true;
+ 		}
+ 		sess->status = STATUS_RUNNING;
++		if (sess->draining) {
++			sess->drain_deadline = jiffies + msecs_to_jiffies(5000);
++			schedule_delayed_work(&sess->drain_work, 0);
++		}
++		schedule_work(&sess->esparser_queue_work);
+ 		return 0;
+ 	}
+ 
+@@ -496,7 +512,9 @@ static void vdec_stop_streaming(struct vb2_queue *q)
+ 	struct amvdec_codec_ops *codec_ops = sess->fmt_out->codec_ops;
+ 	struct amvdec_core *core = sess->core;
+ 	struct vb2_v4l2_buffer *buf;
+-	sess->draining = false;
++	if (q->type != V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE ||
++	    !READ_ONCE(sess->source_change_pending))
++		sess->draining = false;
+ 	cancel_delayed_work_sync(&sess->drain_work);
+ 
+ 	if (sess->status == STATUS_RUNNING ||
+diff --git a/drivers/staging/media/meson/vdec/vdec.h b/drivers/staging/media/meson/vdec/vdec.h
+index 3bb7cd21c184..4f347d2ebe26 100644
+--- a/drivers/staging/media/meson/vdec/vdec.h
++++ b/drivers/staging/media/meson/vdec/vdec.h
+@@ -137,6 +137,8 @@ struct amvdec_ops {
+  * @drain_step: optional SC2 host-DPB drain after all OUTPUT buffers are committed;
+  *              0 waits, 1 means EOS was published, negative errors abort
+  *              These input/drain callbacks run with the session mutex held.
++ * @capture_queued: optional synchronous SC2 CAPTURE return notification; replaces
++ *                  the recycle thread and also runs while awaiting source change
+  * @manages_processor: SC2 codec starts its processor only after input and an
+  *                     owned reconstruction surface are ready
+  * @can_recycle: optional call to know if the codec is ready to recycle
+@@ -164,6 +166,7 @@ struct amvdec_codec_ops {
+ 	void (*input_committed)(struct amvdec_session *sess, u32 offset, u32 bytes);
+ 	u32 (*input_read_pointer)(struct amvdec_session *sess);
+ 	int (*drain_step)(struct amvdec_session *sess);
++	void (*capture_queued)(struct amvdec_session *sess, struct vb2_v4l2_buffer *vbuf);
+ 	int (*can_recycle)(struct amvdec_core *core);
+ 	void (*recycle)(struct amvdec_core *core, u32 buf_idx);
+ 	void (*drain)(struct amvdec_session *sess);
+diff --git a/drivers/staging/media/meson/vdec/vdec_helpers.c b/drivers/staging/media/meson/vdec/vdec_helpers.c
+index 72137b214a50..0fa6d4287b07 100644
+--- a/drivers/staging/media/meson/vdec/vdec_helpers.c
++++ b/drivers/staging/media/meson/vdec/vdec_helpers.c
+@@ -521,7 +521,7 @@ void amvdec_src_change(struct amvdec_session *sess, u32 width,
+ 	 * Check if the capture queue is already configured well for our
+ 	 * usecase. If so, keep decoding with it and do not send the event
+ 	 */
+-	if (sess->streamon_cap &&
++	if (!READ_ONCE(sess->source_change_pending) && sess->streamon_cap &&
+ 	    sess->width == width &&
+ 	    sess->height == height &&
+ 	    dpb_size <= sess->num_dst_bufs &&
+-- 
+2.47.3
+

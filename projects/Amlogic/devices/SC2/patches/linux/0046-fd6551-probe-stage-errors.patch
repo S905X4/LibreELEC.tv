@@ -1,0 +1,168 @@
+From 3e214359327e9db54e8d1ca8ba28759c4697a14c Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Wed, 21 Oct 2026 02:08:08 +0800
+Subject: [PATCH] auxdisplay: fd6551: Report the failing probe stage
+
+A registered but unbound client previously left most probe failures
+without context. A controlled live bind returned ENXIO, and isolated
+I2C/SMBus tracing stopped at the first control-address write.
+
+Report validation, transaction and interface-registration failures with
+their stage and address. Preserve bytes, ordering, timing and ACK checks;
+there is no evidence authorizing an ACK bypass or transport change.
+
+The integrated production Image/modules/DTB build passed. The physical
+address-phase failure remains unresolved; diagnostic text has not yet
+been exercised by booting this new built-in driver on hardware.
+
+Change-Id: I640f2e84b65e4381b7620821d5a9f4d922384082
+---
+ drivers/auxdisplay/fd6551.c | 61 +++++++++++++++++++++++++------------
+ 1 file changed, 42 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/auxdisplay/fd6551.c b/drivers/auxdisplay/fd6551.c
+index 8e32e4e139fd948cac242cf775ec91c4aff0c164..f5768b0efec1cdd5f8159bb401b5f4dd730613b0 100644
+--- a/drivers/auxdisplay/fd6551.c
++++ b/drivers/auxdisplay/fd6551.c
+@@ -158,10 +158,13 @@ static int fd6551_probe(struct i2c_client *client)
+ 	int i, ret;
+ 
+ 	if (client->addr != FD6551_CONTROL_ADDR)
+-		return -EINVAL;
++		return dev_err_probe(dev, -EINVAL,
++				     "expected control address 0x%02x\n",
++				     FD6551_CONTROL_ADDR);
+ 
+ 	if (!i2c_check_functionality(client->adapter, I2C_FUNC_SMBUS_WRITE_BYTE))
+-		return -EOPNOTSUPP;
++		return dev_err_probe(dev, -EOPNOTSUPP,
++				     "SMBus write-byte transfers unavailable\n");
+ 
+ 	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
+ 	if (!priv)
+@@ -174,49 +177,59 @@ static int fd6551_probe(struct i2c_client *client)
+ 	ret = device_property_read_u32_array(dev, "fdhisi,digits", priv->digits,
+ 					     FD6551_DIGITS);
+ 	if (ret)
+-		return ret;
++		return dev_err_probe(dev, ret, "failed to read fdhisi,digits\n");
+ 	for (i = 0; i < FD6551_DIGITS; i++) {
+ 		u32 grid = priv->digits[i];
+ 		u64 mask;
+ 
+ 		if (grid >= FD6551_GRIDS)
+-			return -EINVAL;
++			return dev_err_probe(dev, -EINVAL,
++					     "digit %d has invalid grid %u\n", i, grid);
+ 		mask = GENMASK_ULL(grid * FD6551_SEGMENTS + 6,
+ 				   grid * FD6551_SEGMENTS);
+ 		if (used & mask)
+-			return -EINVAL;
++			return dev_err_probe(dev, -EINVAL,
++					     "digit %d reuses grid %u\n", i, grid);
+ 		used |= mask;
+ 	}
+ 
+ 	ret = device_property_read_u32(dev, "default-brightness-level", &brightness);
+ 	if (ret)
+-		return ret;
++		return dev_err_probe(dev, ret,
++				     "failed to read default-brightness-level\n");
+ 	if (brightness > FD6551_MAX_BRIGHTNESS)
+-		return -EINVAL;
++		return dev_err_probe(dev, -EINVAL,
++				     "invalid default brightness %u\n", brightness);
+ 
+ 	for (i = 0; i < FD6551_GRIDS; i++) {
+ 		priv->grids[i] = devm_i2c_new_dummy_device(dev, client->adapter,
+ 							FD6551_GRID_ADDR + i);
+ 		if (IS_ERR(priv->grids[i]))
+-			return PTR_ERR(priv->grids[i]);
++			return dev_err_probe(dev, PTR_ERR(priv->grids[i]),
++					     "failed to reserve grid address 0x%02x\n",
++					     FD6551_GRID_ADDR + i);
+ 	}
+ 
+ 	/* RAM contents are undefined at power-on: blank before enabling. */
+ 	ret = i2c_smbus_write_byte(client, 0);
+ 	if (ret)
+-		return ret;
++		return dev_err_probe(dev, ret,
++				     "failed to blank control address 0x%02x\n",
++				     client->addr);
+ 	for (i = 0; i < FD6551_GRIDS; i++) {
+ 		ret = i2c_smbus_write_byte(priv->grids[i], 0);
+ 		if (ret)
+-			return ret;
++			return dev_err_probe(dev, ret,
++					     "failed to clear grid %d (0x%02x)\n",
++					     i, priv->grids[i]->addr);
+ 	}
+ 	ret = devm_add_action_or_reset(dev, fd6551_power_off, priv);
+ 	if (ret)
+-		return ret;
++		return dev_err_probe(dev, ret, "failed to register power-off action\n");
+ 
+ 	display = device_get_named_child_node(dev, "display");
+ 	if (!display)
+-		return -EINVAL;
++		return dev_err_probe(dev, -EINVAL, "missing display child node\n");
+ 	init.fwnode = display;
+ 	priv->display.max_brightness = FD6551_MAX_BRIGHTNESS;
+ 	priv->display.brightness = brightness;
+@@ -224,10 +237,12 @@ static int fd6551_probe(struct i2c_client *client)
+ 	priv->display.flags = LED_CORE_SUSPENDRESUME;
+ 	ret = fd6551_brightness_set(&priv->display, brightness);
+ 	if (ret)
+-		return ret;
++		return dev_err_probe(dev, ret,
++				     "failed to set brightness at 0x%02x\n",
++				     client->addr);
+ 	ret = devm_led_classdev_register_ext(dev, &priv->display, &init);
+ 	if (ret)
+-		return ret;
++		return dev_err_probe(dev, ret, "failed to register display LED\n");
+ 
+ 	device_for_each_child_node_scoped(dev, child) {
+ 		struct fd6551_led *led;
+@@ -237,10 +252,13 @@ static int fd6551_probe(struct i2c_client *client)
+ 			continue;
+ 		ret = fwnode_property_read_u32(child, "reg", &index);
+ 		if (ret)
+-			return ret;
++			return dev_err_probe(dev, ret,
++					     "failed to read icon index for %pfw\n", child);
+ 		if (index >= FD6551_GRIDS * FD6551_SEGMENTS ||
+ 		    (used & BIT_ULL(index)))
+-			return -EINVAL;
++			return dev_err_probe(dev, -EINVAL,
++					     "invalid/reused icon index %u for %pfw\n",
++					     index, child);
+ 		used |= BIT_ULL(index);
+ 		led = devm_kzalloc(dev, sizeof(*led), GFP_KERNEL);
+ 		if (!led)
+@@ -253,16 +271,21 @@ static int fd6551_probe(struct i2c_client *client)
+ 		init.fwnode = child;
+ 		ret = devm_led_classdev_register_ext(dev, &led->cdev, &init);
+ 		if (ret)
+-			return ret;
++			return dev_err_probe(dev, ret,
++					     "failed to register icon %u LED\n", index);
+ 	}
+ 
+ 	ret = linedisp_register(&priv->linedisp, dev, FD6551_DIGITS,
+ 				&fd6551_linedisp_ops);
+ 	if (ret) {
+ 		cancel_work_sync(&priv->work);
+-		return ret;
++		return dev_err_probe(dev, ret, "failed to register line display\n");
+ 	}
+-	return devm_add_action_or_reset(dev, fd6551_unregister_display, priv);
++	ret = devm_add_action_or_reset(dev, fd6551_unregister_display, priv);
++	if (ret)
++		return dev_err_probe(dev, ret,
++				     "failed to register line-display cleanup action\n");
++	return 0;
+ }
+ 
+ static const struct of_device_id fd6551_of_match[] = {

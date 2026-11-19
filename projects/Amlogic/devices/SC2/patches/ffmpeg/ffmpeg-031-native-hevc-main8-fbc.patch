@@ -1,0 +1,94 @@
+Subject: [PATCH] avcodec: carry native HEVC Main8 FBC and use driver-owned input
+
+Accept the local AMF8 capture ABI for eight-bit HEVC and describe its real
+DRM YU08 scatter/MEM_SAVING layout. Preserve AMF0 ten-bit output and explicit
+linear NV12/NV21 descriptors. Compressed FBC headers and all body PFNs stay
+in the complete decoder-owned exported object.
+
+SC2 normalizes compressed OUTPUT on the CPU into its coherent input ring.
+For the native FBC formats, use driver MMAP allocation for both queues so
+OUTPUT can use ordinary memory while CAPTURE retains its DMA constraints.
+Keep source sizes, six source buffers and the existing DPB/thread-derived
+capture count; do not add a copy, reduce image depth or resize CMA.
+
+--- a/libavcodec/v4l2_request_hevc.h
++++ b/libavcodec/v4l2_request_hevc.h
+@@ -30,6 +30,9 @@
+ #include <linux/videodev2.h>
+ 
+ /* Local proposed SC2 ABI, not an upstream-assigned V4L2 pixel format. */
++#ifndef V4L2_PIX_FMT_AMLOGIC_FBC8
++#define V4L2_PIX_FMT_AMLOGIC_FBC8 v4l2_fourcc('A', 'M', 'F', '8')
++#endif
+ #ifndef V4L2_PIX_FMT_AMLOGIC_FBC10
+ #define V4L2_PIX_FMT_AMLOGIC_FBC10 v4l2_fourcc('A', 'M', 'F', '0')
+ #endif
+--- a/libavcodec/v4l2_request_hevc.c
++++ b/libavcodec/v4l2_request_hevc.c
+@@ -128,7 +128,8 @@
+     if (h->ps.sps->bit_depth == 8) {
+         if (fmtdesc->pixelformat == V4L2_PIX_FMT_NV12_COL128 ||
+             fmtdesc->pixelformat == V4L2_PIX_FMT_NV12 ||
+-            fmtdesc->pixelformat == V4L2_PIX_FMT_NV21) {
++            fmtdesc->pixelformat == V4L2_PIX_FMT_NV21 ||
++            fmtdesc->pixelformat == V4L2_PIX_FMT_AMLOGIC_FBC8) {
+             return 1;
+         }
+     }
+@@ -269,9 +270,17 @@
+         const uint32_t fourcc = V4L2_TYPE_IS_MULTIPLANAR(fmt->type) ?
+             fmt->fmt.pix_mp.pixelformat : fmt->fmt.pix.pixelformat;
+ 
+-        /* AMF0 embeds physical body PFNs; the decoder owns the entire object. */
+-        if (fourcc == V4L2_PIX_FMT_AMLOGIC_FBC10)
++        /* Native SC2 reads compressed OUTPUT on the CPU and exports FBC's
++         * complete physical object. Let each queue allocate its own backing. */
++        if (fourcc == V4L2_PIX_FMT_AMLOGIC_FBC8 ||
++            fourcc == V4L2_PIX_FMT_AMLOGIC_FBC10) {
++            src_memtype = MEDIABUFS_MEMORY_MMAP;
+             dst_memtype = MEDIABUFS_MEMORY_MMAP;
++            if (mediabufs_src_chk_memtype(ctx->mbufs, src_memtype)) {
++                av_log(avctx, AV_LOG_ERROR, "Native CPU source MMAP is unavailable\n");
++                goto fail4;
++            }
++        }
+     }
+ 
+     if (mediabufs_src_pool_create(ctx->mbufs, ctx->dbufs, 6, src_memtype)) {
+--- a/libavcodec/v4l2_req_hevc_vx.c
++++ b/libavcodec/v4l2_req_hevc_vx.c
+@@ -107,6 +107,7 @@
+     switch (V4L2_TYPE_IS_MULTIPLANAR(format->type) ?
+             format->fmt.pix_mp.pixelformat : format->fmt.pix.pixelformat) {
+     case V4L2_PIX_FMT_YUV420:
++    case V4L2_PIX_FMT_AMLOGIC_FBC8:
+         return AV_PIX_FMT_YUV420P;
+     case V4L2_PIX_FMT_NV12:
+         return AV_PIX_FMT_NV12;
+@@ -826,6 +827,7 @@
+     }
+ 
+     switch (pixelformat) {
++    case V4L2_PIX_FMT_AMLOGIC_FBC8:
+     case V4L2_PIX_FMT_AMLOGIC_FBC10:
+         if (!V4L2_TYPE_IS_MULTIPLANAR(format->type) ||
+             format->fmt.pix_mp.num_planes != 1 || bpl ||
+@@ -835,13 +837,15 @@
+             .nb_objects = 1,
+             .objects = {{
+                 .fd = -1,
+-                /* Main10 is 4096 bytes/block, never MEM_SAVING. */
+                 .format_modifier = DRM_FORMAT_MOD_AMLOGIC_FBC(
+-                    AMLOGIC_FBC_LAYOUT_SCATTER, 0),
++                    AMLOGIC_FBC_LAYOUT_SCATTER,
++                    pixelformat == V4L2_PIX_FMT_AMLOGIC_FBC8 ?
++                        AMLOGIC_FBC_OPTION_MEM_SAVING : 0),
+             }},
+             .nb_layers = 1,
+             .layers = {{
+-                .format = DRM_FORMAT_YUV420_10BIT,
++                .format = pixelformat == V4L2_PIX_FMT_AMLOGIC_FBC8 ?
++                    DRM_FORMAT_YUV420_8BIT : DRM_FORMAT_YUV420_10BIT,
+                 .nb_planes = 1,
+                 /* Header at offset zero; body PFNs are embedded in it. */
+                 .planes = {{ .object_index = 0, .offset = 0, .pitch = width }},

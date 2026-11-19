@@ -1,0 +1,63 @@
+From 357276119d539780da32958dea7fc9c2ffc07d7e Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Fri, 13 Nov 2026 17:17:22 +0800
+Subject: [PATCH] media: meson: Latch the MPEG cold input cursor before refill
+
+Latch programmed cold RP/WP before enabling the FIFO refill. Keep the
+restored checkpoint and reservoir snapshot path unchanged.
+
+The matching LibreELEC kernel package builds; target cold decode and
+pixel regression remain separate acceptance conditions.
+
+Change-Id: Ia73a78941641f321fdb9ef5607895bc54dc71e3d
+---
+ drivers/staging/media/meson/vdec/codec_mpeg12.c | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/staging/media/meson/vdec/codec_mpeg12.c b/drivers/staging/media/meson/vdec/codec_mpeg12.c
+index d006c8db56d0..6f0216b18a84 100644
+--- a/drivers/staging/media/meson/vdec/codec_mpeg12.c
++++ b/drivers/staging/media/meson/vdec/codec_mpeg12.c
+@@ -529,6 +529,7 @@ static int mpeg12_multi_run(struct amvdec_session *sess)
+ 	struct mpeg12_multi *m = sess->priv;
+ 	struct amvdec_core *core = sess->core;
+ 	u32 rp, size, fifo = 0;
++	bool restored = m->swap_valid;
+ 	unsigned int i;
+ 	int ret, index = -1;
+ 
+@@ -552,12 +553,13 @@ static int mpeg12_multi_run(struct amvdec_session *sess)
+ 	if (ret)
+ 		return ret;
+ 	amvdec_write_dos_bits(core, POWER_CTL_VLD, BIT(4));
+-	if (m->swap_valid) {
++	if (restored) {
+ 		ret = mpeg12_multi_swap(sess, false);
+ 		if (ret)
+ 			return ret;
+ 		/* Snapshot the restored reservoir BEFORE CONTROL/WP can refill it. */
+ 		fifo = amvdec_read_dos(core, VLD_MEM_VIFIFO_LEVEL);
++		rp = amvdec_read_dos(core, VLD_MEM_VIFIFO_RP);
+ 	} else {
+ 		amvdec_write_dos(core, VLD_MEM_VIFIFO_START_PTR, sess->vififo_paddr);
+ 		amvdec_write_dos(core, VLD_MEM_VIFIFO_END_PTR,
+@@ -568,9 +570,15 @@ static int mpeg12_multi_run(struct amvdec_session *sess)
+ 		amvdec_write_dos(core, VLD_MEM_VIFIFO_BUF_CNTL, MEM_BUFCTRL_MANUAL);
+ 		amvdec_write_dos(core, VLD_MEM_VIFIFO_RP, sess->vififo_paddr);
+ 	}
+-	rp = amvdec_read_dos(core, VLD_MEM_VIFIFO_RP);
+ 	amvdec_write_dos(core, VLD_MEM_VIFIFO_WP,
+ 			 sess->vififo_paddr + sess->stream_write);
++	if (!restored) {
++		/* Load the programmed cold RP/WP before enabling input again. */
++		amvdec_write_dos(core, VLD_MEM_VIFIFO_BUF_CNTL,
++				 MEM_BUFCTRL_MANUAL | 1);
++		amvdec_write_dos(core, VLD_MEM_VIFIFO_BUF_CNTL, MEM_BUFCTRL_MANUAL);
++		rp = amvdec_read_dos(core, VLD_MEM_VIFIFO_RP);
++	}
+ 	amvdec_write_dos(core, VLD_MEM_VIFIFO_CONTROL,
+ 			 (0x11 << 16) | BIT(10) | (7 << 3));
+ 	/* rp and fifo describe the same pre-refill restored checkpoint. */
+-- 
+2.47.3
+

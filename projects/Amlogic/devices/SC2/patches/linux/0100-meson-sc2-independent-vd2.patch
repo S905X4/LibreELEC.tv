@@ -1,0 +1,1878 @@
+From 951588f19e12f31474753dc49e3bb1e83e3a43c4 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Fri, 13 Nov 2026 07:22:17 +0800
+Subject: [PATCH] drm/meson: Add the independent SC2 VD2 video layer
+
+Represent each video layer with independent format, address, canvas,
+scaler and applied field-phase state. Route SC2 VD2 through its actual
+MIF, AFBC, PPS, blend and memory resources instead of mirroring VD1.
+Publish and consume both layer updates before completing the flip.
+
+Keep VD1 format coverage and older SoC behavior. VD2 exposes only its
+implemented linear NV12/NV21 and Amlogic FBC 8/10-bit paths. Use fixed
+VD1/VD2/OSD1 ordering and add no unsupported alpha or z-order controls.
+Shut down DRM and release IRQ ownership before freeing canvases.
+
+Real simultaneous-plane, scaling, field-phase and lifetime acceptance
+must run on the matched image; source correspondence is not DMA-idle
+or pixel-output proof.
+
+Change-Id: I787a7cf0d0c5875c7358402ac27fcb552b4aad80
+---
+ drivers/gpu/drm/meson/meson_crtc.c      | 611 +++++++++++-------------
+ drivers/gpu/drm/meson/meson_drv.c       |  57 +--
+ drivers/gpu/drm/meson/meson_drv.h       | 143 +++---
+ drivers/gpu/drm/meson/meson_overlay.c   | 287 ++++++-----
+ drivers/gpu/drm/meson/meson_plane.c     |   2 +-
+ drivers/gpu/drm/meson/meson_registers.h |  22 +
+ drivers/gpu/drm/meson/meson_viu.c       |  30 +-
+ drivers/gpu/drm/meson/meson_viu.h       |  11 +-
+ drivers/gpu/drm/meson/meson_vpp.c       |  63 ++-
+ drivers/gpu/drm/meson/meson_vpp.h       |  24 +
+ 10 files changed, 681 insertions(+), 569 deletions(-)
+
+diff --git a/drivers/gpu/drm/meson/meson_crtc.c b/drivers/gpu/drm/meson/meson_crtc.c
+index 6b9b803602e4..14747e85e25a 100644
+--- a/drivers/gpu/drm/meson/meson_crtc.c
++++ b/drivers/gpu/drm/meson/meson_crtc.c
+@@ -40,9 +40,11 @@ struct meson_crtc {
+ 	void (*disable_osd1_afbc)(struct meson_drm *priv);
+ 	bool vsync_forced;
+ 	bool osd1_afbcd;
+-	bool vd1_interlace;
+-	u32 vd1_vsc_ini_phase[2];
+-	u32 vd1_vsc_phase_ctrl[2];
++	struct {
++		bool interlace;
++		u32 vsc_ini_phase[2];
++		u32 vsc_phase_ctrl[2];
++	} video[2];
+ };
+ #define to_meson_crtc(x) container_of(x, struct meson_crtc, base)
+ 
+@@ -171,11 +173,22 @@ static void meson_crtc_disable_osd1(struct meson_crtc *meson_crtc)
+ 	}
+ }
+ 
+-static void meson_crtc_disable_vd1(struct meson_crtc *meson_crtc)
++static void meson_crtc_disable_video(struct meson_crtc *meson_crtc,
++				     unsigned int index)
+ {
+ 	struct meson_drm *priv = meson_crtc->priv;
+ 
+-	if (meson_vpu_is_compatible(priv, VPU_COMPATIBLE_G12A)) {
++	if (priv->sc2) {
++		/* video_sink disable_vd2_blend: stop only this layer's fetchers. */
++		writel_relaxed(0, priv->io_base +
++			       _REG(index ? VD2_BLEND_SRC_CTRL : VD1_BLEND_SRC_CTRL));
++		writel_relaxed(0, priv->io_base +
++			       _REG(meson_viu_afbc_reg(priv, index, AFBC_ENABLE)));
++		writel_relaxed(0, priv->io_base +
++			       _REG(meson_viu_mif_reg(priv, index ?
++						  VD2_IF0_GEN_REG : VD1_IF0_GEN_REG)));
++		meson_viu_video_afbc_select(priv, index, false);
++	} else if (meson_vpu_is_compatible(priv, VPU_COMPATIBLE_G12A)) {
+ 		writel_relaxed(0, priv->io_base + _REG(VD1_BLEND_SRC_CTRL));
+ 		writel_relaxed(0, priv->io_base + _REG(VD2_BLEND_SRC_CTRL));
+ 		writel_relaxed(0, priv->io_base +
+@@ -187,13 +200,7 @@ static void meson_crtc_disable_vd1(struct meson_crtc *meson_crtc)
+ 				    priv->io_base + _REG(VPP_MISC));
+ 	}
+ 
+-	if (priv->sc2) {
+-		writel_relaxed(0, priv->io_base +
+-			       _REG(meson_viu_afbc_reg(priv, AFBC_ENABLE)));
+-		meson_viu_vd1_afbc_select(priv, false);
+-	}
+-
+-	meson_crtc->vd1_interlace = false;
++	meson_crtc->video[index].interlace = false;
+ }
+ 
+ static void meson_crtc_atomic_disable(struct drm_crtc *crtc,
+@@ -201,6 +208,7 @@ static void meson_crtc_atomic_disable(struct drm_crtc *crtc,
+ {
+ 	struct meson_crtc *meson_crtc = to_meson_crtc(crtc);
+ 	struct meson_drm *priv = meson_crtc->priv;
++	unsigned int i;
+ 
+ 	DRM_DEBUG_DRIVER("\n");
+ 
+@@ -209,10 +217,12 @@ static void meson_crtc_atomic_disable(struct drm_crtc *crtc,
+ 	spin_lock_irq(&crtc->dev->event_lock);
+ 	priv->viu.osd1_enabled = false;
+ 	priv->viu.osd1_commit = false;
+-	priv->viu.vd1_enabled = false;
+-	priv->viu.vd1_commit = false;
+ 	meson_crtc_disable_osd1(meson_crtc);
+-	meson_crtc_disable_vd1(meson_crtc);
++	for (i = 0; i < (priv->sc2 ? 2 : 1); i++) {
++		priv->viu.video[i].enabled = false;
++		priv->viu.video[i].commit = false;
++		meson_crtc_disable_video(meson_crtc, i);
++	}
+ 	meson_crtc->vsync_forced = false;
+ 	meson_venc_disable_vsync(priv);
+ 
+@@ -235,6 +245,7 @@ static void meson_crtc_atomic_flush(struct drm_crtc *crtc,
+ 	struct drm_crtc_state *crtc_state =
+ 		drm_atomic_get_new_crtc_state(state, crtc);
+ 	unsigned long flags;
++	unsigned int i;
+ 
+ 	if (crtc_state->event)
+ 		WARN_ON(drm_crtc_vblank_get(crtc) != 0);
+@@ -247,8 +258,9 @@ static void meson_crtc_atomic_flush(struct drm_crtc *crtc,
+ 	spin_lock_irqsave(&crtc->dev->event_lock, flags);
+ 	if (drm_atomic_get_new_plane_state(state, priv->primary_plane))
+ 		priv->viu.osd1_commit = true;
+-	if (drm_atomic_get_new_plane_state(state, priv->overlay_plane))
+-		priv->viu.vd1_commit = true;
++	for (i = 0; i < (priv->sc2 ? 2 : 1); i++)
++		if (drm_atomic_get_new_plane_state(state, priv->overlay_planes[i]))
++			priv->viu.video[i].commit = true;
+ 	if (crtc_state->event) {
+ 		meson_crtc->event = crtc_state->event;
+ 		crtc_state->event = NULL;
+@@ -321,7 +333,7 @@ static void meson_crtc_enable_vd1(struct meson_drm *priv)
+ 			    priv->io_base + _REG(VPP_MISC));
+ 
+ 	writel_bits_relaxed(VIU_CTRL0_AFBC_TO_VD1,
+-			    priv->viu.vd1_afbc ? VIU_CTRL0_AFBC_TO_VD1 : 0,
++			    priv->viu.video[0].afbc ? VIU_CTRL0_AFBC_TO_VD1 : 0,
+ 			    priv->io_base + _REG(VIU_MISC_CTRL0));
+ }
+ 
+@@ -333,13 +345,255 @@ static void meson_g12a_crtc_enable_vd1(struct meson_drm *priv)
+ 		       VD_BLEND_POSTBLD_PREMULT_EN,
+ 		       priv->io_base + _REG(VD1_BLEND_SRC_CTRL));
+ 
+-	meson_viu_vd1_afbc_select(priv, priv->viu.vd1_afbc);
++	meson_viu_video_afbc_select(priv, 0, priv->viu.video[0].afbc);
++}
++
++static void meson_crtc_write_video_mif(struct meson_drm *priv,
++				       const struct meson_video_state *vd,
++				       unsigned int index)
++{
++	/* Legacy VD1/VD2 field addresses precede the SoC-specific translation. */
++	unsigned int offset = index * (VD2_IF0_GEN_REG - VD1_IF0_GEN_REG);
++
++	writel_relaxed(vd->if0_gen_reg, priv->io_base +
++		       _REG(meson_viu_mif_reg(priv, VD1_IF0_GEN_REG + offset)));
++	if (!index || priv->sc2)
++		writel_relaxed(vd->if0_gen_reg2, priv->io_base +
++			       _REG(meson_viu_mif_reg(priv, VD1_IF0_GEN_REG2 + offset)));
++	writel_relaxed(vd->fmt_ctrl, priv->io_base +
++		       _REG(meson_viu_mif_reg(priv, VIU_VD1_FMT_CTRL + offset)));
++	writel_relaxed(vd->fmt_w, priv->io_base +
++		       _REG(meson_viu_mif_reg(priv, VIU_VD1_FMT_W + offset)));
++	writel_relaxed(vd->if0_canvas0, priv->io_base +
++		       _REG(meson_viu_mif_reg(priv, VD1_IF0_CANVAS0 + offset)));
++	writel_relaxed(vd->if0_canvas0, priv->io_base +
++		       _REG(meson_viu_mif_reg(priv, VD1_IF0_CANVAS1 + offset)));
++	writel_relaxed(vd->if0_luma_x0, priv->io_base +
++		       _REG(meson_viu_mif_reg(priv, VD1_IF0_LUMA_X0 + offset)));
++	writel_relaxed(vd->if0_luma_x0, priv->io_base +
++		       _REG(meson_viu_mif_reg(priv, VD1_IF0_LUMA_X1 + offset)));
++	writel_relaxed(vd->if0_luma_y0, priv->io_base +
++		       _REG(meson_viu_mif_reg(priv, VD1_IF0_LUMA_Y0 + offset)));
++	writel_relaxed(vd->if0_luma_y0, priv->io_base +
++		       _REG(meson_viu_mif_reg(priv, VD1_IF0_LUMA_Y1 + offset)));
++	writel_relaxed(vd->if0_chroma_x0, priv->io_base +
++		       _REG(meson_viu_mif_reg(priv, VD1_IF0_CHROMA_X0 + offset)));
++	writel_relaxed(vd->if0_chroma_x0, priv->io_base +
++		       _REG(meson_viu_mif_reg(priv, VD1_IF0_CHROMA_X1 + offset)));
++	writel_relaxed(vd->if0_chroma_y0, priv->io_base +
++		       _REG(meson_viu_mif_reg(priv, VD1_IF0_CHROMA_Y0 + offset)));
++	writel_relaxed(vd->if0_chroma_y0, priv->io_base +
++		       _REG(meson_viu_mif_reg(priv, VD1_IF0_CHROMA_Y1 + offset)));
++	writel_relaxed(vd->if0_repeat_loop, priv->io_base +
++		       _REG(meson_viu_mif_reg(priv, VD1_IF0_RPT_LOOP + offset)));
++	writel_relaxed(vd->if0_luma0_rpt_pat, priv->io_base +
++		       _REG(meson_viu_mif_reg(priv, VD1_IF0_LUMA0_RPT_PAT + offset)));
++	writel_relaxed(vd->if0_luma0_rpt_pat, priv->io_base +
++		       _REG(meson_viu_mif_reg(priv, VD1_IF0_LUMA1_RPT_PAT + offset)));
++	writel_relaxed(vd->if0_chroma0_rpt_pat, priv->io_base +
++		       _REG(meson_viu_mif_reg(priv, VD1_IF0_CHROMA0_RPT_PAT + offset)));
++	writel_relaxed(vd->if0_chroma0_rpt_pat, priv->io_base +
++		       _REG(meson_viu_mif_reg(priv, VD1_IF0_CHROMA1_RPT_PAT + offset)));
++	writel_relaxed(0, priv->io_base +
++		       _REG(meson_viu_mif_reg(priv, VD1_IF0_LUMA_PSEL + offset)));
++	writel_relaxed(0, priv->io_base +
++		       _REG(meson_viu_mif_reg(priv, VD1_IF0_CHROMA_PSEL + offset)));
++	if (!index || priv->sc2)
++		writel_relaxed(vd->range_map_y, priv->io_base +
++			       _REG(meson_viu_mif_reg(priv, VD1_IF0_RANGE_MAP_Y + offset)));
++	if (!index || priv->sc2)
++		writel_relaxed(vd->range_map_cb, priv->io_base +
++			       _REG(meson_viu_mif_reg(priv, VD1_IF0_RANGE_MAP_CB + offset)));
++	if (!index || priv->sc2)
++		writel_relaxed(vd->range_map_cr, priv->io_base +
++			       _REG(meson_viu_mif_reg(priv, VD1_IF0_RANGE_MAP_CR + offset)));
++}
++
++static void meson_crtc_update_video(struct meson_crtc *meson_crtc,
++				    unsigned int index)
++{
++	struct meson_drm *priv = meson_crtc->priv;
++	struct meson_video_state *vd = &priv->viu.video[index];
++	const struct meson_vpp_video_regs *pps = &meson_vpp_video_regs[index];
++
++	if (!vd->commit)
++		return;
++	if (!vd->enabled) {
++		meson_crtc_disable_video(meson_crtc, index);
++		vd->commit = false;
++		return;
++	}
++
++	if (vd->afbc) {
++		writel_relaxed(vd->afbc_head_addr,
++			       priv->io_base +
++			       _REG(meson_viu_afbc_reg(priv, index, AFBC_HEAD_BADDR)));
++		writel_relaxed(vd->afbc_body_addr,
++			       priv->io_base +
++			       _REG(meson_viu_afbc_reg(priv, index, AFBC_BODY_BADDR)));
++		writel_relaxed(vd->afbc_en,
++			       priv->io_base +
++			       _REG(meson_viu_afbc_reg(priv, index, AFBC_ENABLE)));
++		writel_relaxed(vd->afbc_mode,
++			       priv->io_base +
++			       _REG(meson_viu_afbc_reg(priv, index, AFBC_MODE)));
++		writel_relaxed(vd->afbc_size_in,
++			       priv->io_base +
++			       _REG(meson_viu_afbc_reg(priv, index, AFBC_SIZE_IN)));
++		writel_relaxed(vd->afbc_dec_def_color,
++			       priv->io_base +
++			       _REG(meson_viu_afbc_reg(priv, index, AFBC_DEC_DEF_COLOR)));
++		writel_relaxed(vd->afbc_conv_ctrl,
++			       priv->io_base +
++			       _REG(meson_viu_afbc_reg(priv, index, AFBC_CONV_CTRL)));
++		writel_relaxed(vd->afbc_size_out,
++			       priv->io_base +
++			       _REG(meson_viu_afbc_reg(priv, index, AFBC_SIZE_OUT)));
++		writel_relaxed(vd->afbc_vd_cfmt_ctrl,
++			       priv->io_base +
++			       _REG(meson_viu_afbc_reg(priv, index, AFBC_VD_CFMT_CTRL)));
++		writel_relaxed(vd->afbc_vd_cfmt_w,
++			       priv->io_base +
++			       _REG(meson_viu_afbc_reg(priv, index, AFBC_VD_CFMT_W)));
++		writel_relaxed(vd->afbc_mif_hor_scope,
++			       priv->io_base +
++			       _REG(meson_viu_afbc_reg(priv, index, AFBC_MIF_HOR_SCOPE)));
++		writel_relaxed(vd->afbc_mif_ver_scope,
++			       priv->io_base +
++			       _REG(meson_viu_afbc_reg(priv, index, AFBC_MIF_VER_SCOPE)));
++		writel_relaxed(vd->afbc_pixel_hor_scope,
++			       priv->io_base+
++			       _REG(meson_viu_afbc_reg(priv, index, AFBC_PIXEL_HOR_SCOPE)));
++		writel_relaxed(vd->afbc_pixel_ver_scope,
++			       priv->io_base +
++			       _REG(meson_viu_afbc_reg(priv, index, AFBC_PIXEL_VER_SCOPE)));
++		writel_relaxed(vd->afbc_vd_cfmt_h,
++			       priv->io_base +
++			       _REG(meson_viu_afbc_reg(priv, index, AFBC_VD_CFMT_H)));
++	} else {
++		switch (vd->planes) {
++		case 3:
++			meson_canvas_config(priv->canvas,
++					    priv->canvas_id_vd[index][2],
++					    vd->addr2,
++					    vd->stride2,
++					    vd->height2,
++					    MESON_CANVAS_WRAP_NONE,
++					    MESON_CANVAS_BLKMODE_LINEAR,
++					    MESON_CANVAS_ENDIAN_SWAP64);
++			fallthrough;
++		case 2:
++			meson_canvas_config(priv->canvas,
++					    priv->canvas_id_vd[index][1],
++					    vd->addr1,
++					    vd->stride1,
++					    vd->height1,
++					    MESON_CANVAS_WRAP_NONE,
++					    MESON_CANVAS_BLKMODE_LINEAR,
++					    MESON_CANVAS_ENDIAN_SWAP64);
++			fallthrough;
++		case 1:
++			meson_canvas_config(priv->canvas,
++					    priv->canvas_id_vd[index][0],
++					    vd->addr0,
++					    vd->stride0,
++					    vd->height0,
++					    MESON_CANVAS_WRAP_NONE,
++					    MESON_CANVAS_BLKMODE_LINEAR,
++					    MESON_CANVAS_ENDIAN_SWAP64);
++		}
++
++		writel_relaxed(0, priv->io_base + _REG(meson_viu_afbc_reg(priv, index, AFBC_ENABLE)));
++	}
++
++	meson_crtc_write_video_mif(priv, vd, index);
++	/* Older SoCs use the second MIF for VD1's two-picture path. */
++	if (!priv->sc2)
++		meson_crtc_write_video_mif(priv, vd, 1);
++
++	writel_relaxed(VPP_VSC_BANK_LENGTH(4) | VPP_HSC_BANK_LENGTH(4) |
++		       VPP_SC_VD_EN_ENABLE | VPP_SC_TOP_EN_ENABLE |
++		       VPP_SC_HSC_EN_ENABLE | VPP_SC_VSC_EN_ENABLE,
++		       priv->io_base + _REG(pps->sc_misc));
++	if (!index) {
++		writel_relaxed(vd->vpp_pic_in_height,
++			       priv->io_base + _REG(VPP_PIC_IN_HEIGHT));
++		writel_relaxed(vd->vpp_line_in_length,
++			       priv->io_base + _REG(VPP_LINE_IN_LENGTH));
++		writel_relaxed(vd->vpp_preblend_h_size,
++			       priv->io_base + _REG(VPP_PREBLEND_H_SIZE));
++	} else {
++		/* SC2 vdx_scaler_setting owns this packed VD2 PPS input size. */
++		writel_relaxed((vd->vpp_pic_in_height << 16) |
++			       vd->vpp_line_in_length,
++			       priv->io_base + _REG(VPP_VD2_HDR_IN_SIZE));
++	}
++	writel_relaxed(vd->postblend_h_start_end,
++		       priv->io_base + _REG(pps->postblend_h_start_end));
++	writel_relaxed(vd->postblend_v_start_end,
++		       priv->io_base + _REG(pps->postblend_v_start_end));
++	if (!priv->sc2) {
++		writel_relaxed(vd->vpp_blend_vd2_h_start_end,
++			       priv->io_base + _REG(VPP_BLEND_VD2_H_START_END));
++		writel_relaxed(vd->vpp_blend_vd2_v_start_end,
++			       priv->io_base + _REG(VPP_BLEND_VD2_V_START_END));
++	}
++	writel_relaxed(vd->vpp_vsc_region12_startp,
++		       priv->io_base + _REG(pps->vsc_region12_startp));
++	writel_relaxed(vd->vpp_vsc_region34_startp,
++		       priv->io_base + _REG(pps->vsc_region34_startp));
++	writel_relaxed(vd->vpp_vsc_region4_endp,
++		       priv->io_base + _REG(pps->vsc_region4_endp));
++	writel_relaxed(vd->vpp_vsc_start_phase_step,
++		       priv->io_base + _REG(pps->vsc_start_phase_step));
++	writel_relaxed(vd->vpp_hsc_region12_startp,
++		       priv->io_base + _REG(pps->hsc_region12_startp));
++	writel_relaxed(vd->vpp_hsc_region34_startp,
++		       priv->io_base + _REG(pps->hsc_region34_startp));
++	writel_relaxed(vd->vpp_hsc_region4_endp,
++		       priv->io_base + _REG(pps->hsc_region4_endp));
++	writel_relaxed(vd->vpp_hsc_start_phase_step,
++		       priv->io_base + _REG(pps->hsc_start_phase_step));
++	writel_relaxed(vd->vpp_hsc_region1_phase_slope,
++		       priv->io_base + _REG(pps->hsc_region1_phase_slope));
++	writel_relaxed(vd->vpp_hsc_region3_phase_slope,
++		       priv->io_base + _REG(pps->hsc_region3_phase_slope));
++	writel_relaxed(vd->vpp_hsc_phase_ctrl,
++		       priv->io_base + _REG(pps->hsc_phase_ctrl));
++	meson_crtc->video[index].interlace = vd->interlace;
++	meson_crtc->video[index].vsc_ini_phase[0] = vd->vpp_vsc_ini_phase;
++	meson_crtc->video[index].vsc_ini_phase[1] = vd->vpp_vsc_ini_phase_bottom;
++	meson_crtc->video[index].vsc_phase_ctrl[0] = vd->vpp_vsc_phase_ctrl;
++	meson_crtc->video[index].vsc_phase_ctrl[1] = vd->vpp_vsc_phase_ctrl_bottom;
++	if (!vd->interlace) {
++		writel_relaxed(vd->vpp_vsc_ini_phase,
++			       priv->io_base + _REG(pps->vsc_ini_phase));
++		writel_relaxed(vd->vpp_vsc_phase_ctrl,
++			       priv->io_base + _REG(pps->vsc_phase_ctrl));
++	}
++	if (priv->sc2)
++		writel_relaxed(vd->vpp_hsc_phase_ctrl,
++			       priv->io_base + _REG(pps->hsc_phase_ctrl1));
++	writel_relaxed(0x42, priv->io_base + _REG(pps->scale_coef_idx));
++
++	if (index) {
++		/* SC2 has fixed postblend port 1, behind OSD1, with opaque alpha. */
++		writel_bits_relaxed(GENMASK(26, 18), 0x100 << 18,
++				    priv->io_base + _REG(VPP_MISC));
++		meson_viu_video_afbc_select(priv, index, vd->afbc);
++		writel_relaxed(VD_BLEND_POSTBLD_SRC_VD2 | VD_BLEND_PATH_SEL_ENABLE,
++			       priv->io_base + _REG(VD2_BLEND_SRC_CTRL));
++	} else if (meson_crtc->enable_vd1) {
++		meson_crtc->enable_vd1(priv);
++	}
++	vd->commit = false;
+ }
+ 
+ void meson_crtc_irq(struct meson_drm *priv)
+ {
+ 	struct meson_crtc *meson_crtc = to_meson_crtc(priv->crtc);
+ 	unsigned long flags;
++	unsigned int i;
+ 
+ 	drm_crtc_handle_vblank(priv->crtc);
+ 
+@@ -422,311 +676,16 @@ void meson_crtc_irq(struct meson_drm *priv)
+ 		priv->viu.osd1_commit = false;
+ 	}
+ 
+-	if (priv->viu.vd1_commit && !priv->viu.vd1_enabled) {
+-		meson_crtc_disable_vd1(meson_crtc);
+-		priv->viu.vd1_commit = false;
+-	}
+-
+-	/* Update the VD1 registers */
+-	if (priv->viu.vd1_enabled && priv->viu.vd1_commit) {
+-
+-		if (priv->viu.vd1_afbc) {
+-			writel_relaxed(priv->viu.vd1_afbc_head_addr,
+-				       priv->io_base +
+-				       _REG(meson_viu_afbc_reg(priv, AFBC_HEAD_BADDR)));
+-			writel_relaxed(priv->viu.vd1_afbc_body_addr,
+-				       priv->io_base +
+-				       _REG(meson_viu_afbc_reg(priv, AFBC_BODY_BADDR)));
+-			writel_relaxed(priv->viu.vd1_afbc_en,
+-				       priv->io_base +
+-				       _REG(meson_viu_afbc_reg(priv, AFBC_ENABLE)));
+-			writel_relaxed(priv->viu.vd1_afbc_mode,
+-				       priv->io_base +
+-				       _REG(meson_viu_afbc_reg(priv, AFBC_MODE)));
+-			writel_relaxed(priv->viu.vd1_afbc_size_in,
+-				       priv->io_base +
+-				       _REG(meson_viu_afbc_reg(priv, AFBC_SIZE_IN)));
+-			writel_relaxed(priv->viu.vd1_afbc_dec_def_color,
+-				       priv->io_base +
+-				       _REG(meson_viu_afbc_reg(priv, AFBC_DEC_DEF_COLOR)));
+-			writel_relaxed(priv->viu.vd1_afbc_conv_ctrl,
+-				       priv->io_base +
+-				       _REG(meson_viu_afbc_reg(priv, AFBC_CONV_CTRL)));
+-			writel_relaxed(priv->viu.vd1_afbc_size_out,
+-				       priv->io_base +
+-				       _REG(meson_viu_afbc_reg(priv, AFBC_SIZE_OUT)));
+-			writel_relaxed(priv->viu.vd1_afbc_vd_cfmt_ctrl,
+-				       priv->io_base +
+-				       _REG(meson_viu_afbc_reg(priv, AFBC_VD_CFMT_CTRL)));
+-			writel_relaxed(priv->viu.vd1_afbc_vd_cfmt_w,
+-				       priv->io_base +
+-				       _REG(meson_viu_afbc_reg(priv, AFBC_VD_CFMT_W)));
+-			writel_relaxed(priv->viu.vd1_afbc_mif_hor_scope,
+-				       priv->io_base +
+-				       _REG(meson_viu_afbc_reg(priv, AFBC_MIF_HOR_SCOPE)));
+-			writel_relaxed(priv->viu.vd1_afbc_mif_ver_scope,
+-				       priv->io_base +
+-				       _REG(meson_viu_afbc_reg(priv, AFBC_MIF_VER_SCOPE)));
+-			writel_relaxed(priv->viu.vd1_afbc_pixel_hor_scope,
+-				       priv->io_base+
+-				       _REG(meson_viu_afbc_reg(priv, AFBC_PIXEL_HOR_SCOPE)));
+-			writel_relaxed(priv->viu.vd1_afbc_pixel_ver_scope,
+-				       priv->io_base +
+-				       _REG(meson_viu_afbc_reg(priv, AFBC_PIXEL_VER_SCOPE)));
+-			writel_relaxed(priv->viu.vd1_afbc_vd_cfmt_h,
+-				       priv->io_base +
+-				       _REG(meson_viu_afbc_reg(priv, AFBC_VD_CFMT_H)));
+-		} else {
+-			switch (priv->viu.vd1_planes) {
+-			case 3:
+-				meson_canvas_config(priv->canvas,
+-						    priv->canvas_id_vd1_2,
+-						    priv->viu.vd1_addr2,
+-						    priv->viu.vd1_stride2,
+-						    priv->viu.vd1_height2,
+-						    MESON_CANVAS_WRAP_NONE,
+-						    MESON_CANVAS_BLKMODE_LINEAR,
+-						    MESON_CANVAS_ENDIAN_SWAP64);
+-				fallthrough;
+-			case 2:
+-				meson_canvas_config(priv->canvas,
+-						    priv->canvas_id_vd1_1,
+-						    priv->viu.vd1_addr1,
+-						    priv->viu.vd1_stride1,
+-						    priv->viu.vd1_height1,
+-						    MESON_CANVAS_WRAP_NONE,
+-						    MESON_CANVAS_BLKMODE_LINEAR,
+-						    MESON_CANVAS_ENDIAN_SWAP64);
+-				fallthrough;
+-			case 1:
+-				meson_canvas_config(priv->canvas,
+-						    priv->canvas_id_vd1_0,
+-						    priv->viu.vd1_addr0,
+-						    priv->viu.vd1_stride0,
+-						    priv->viu.vd1_height0,
+-						    MESON_CANVAS_WRAP_NONE,
+-						    MESON_CANVAS_BLKMODE_LINEAR,
+-						    MESON_CANVAS_ENDIAN_SWAP64);
+-			}
+-
+-			writel_relaxed(0, priv->io_base + _REG(meson_viu_afbc_reg(priv, AFBC_ENABLE)));
+-		}
+-
+-		writel_relaxed(priv->viu.vd1_if0_gen_reg,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD1_IF0_GEN_REG)));
+-		writel_relaxed(priv->viu.vd1_if0_gen_reg,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD2_IF0_GEN_REG)));
+-		writel_relaxed(priv->viu.vd1_if0_gen_reg2,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD1_IF0_GEN_REG2)));
+-		if (priv->sc2)
+-			writel_relaxed(priv->viu.vd1_if0_gen_reg2,
+-				       priv->io_base +
+-				       _REG(meson_viu_mif_reg(priv, VD2_IF0_GEN_REG2)));
+-		writel_relaxed(priv->viu.viu_vd1_fmt_ctrl,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VIU_VD1_FMT_CTRL)));
+-		writel_relaxed(priv->viu.viu_vd1_fmt_ctrl,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VIU_VD2_FMT_CTRL)));
+-		writel_relaxed(priv->viu.viu_vd1_fmt_w,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VIU_VD1_FMT_W)));
+-		writel_relaxed(priv->viu.viu_vd1_fmt_w,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VIU_VD2_FMT_W)));
+-		writel_relaxed(priv->viu.vd1_if0_canvas0,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD1_IF0_CANVAS0)));
+-		writel_relaxed(priv->viu.vd1_if0_canvas0,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD1_IF0_CANVAS1)));
+-		writel_relaxed(priv->viu.vd1_if0_canvas0,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD2_IF0_CANVAS0)));
+-		writel_relaxed(priv->viu.vd1_if0_canvas0,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD2_IF0_CANVAS1)));
+-		writel_relaxed(priv->viu.vd1_if0_luma_x0,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD1_IF0_LUMA_X0)));
+-		writel_relaxed(priv->viu.vd1_if0_luma_x0,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD1_IF0_LUMA_X1)));
+-		writel_relaxed(priv->viu.vd1_if0_luma_x0,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD2_IF0_LUMA_X0)));
+-		writel_relaxed(priv->viu.vd1_if0_luma_x0,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD2_IF0_LUMA_X1)));
+-		writel_relaxed(priv->viu.vd1_if0_luma_y0,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD1_IF0_LUMA_Y0)));
+-		writel_relaxed(priv->viu.vd1_if0_luma_y0,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD1_IF0_LUMA_Y1)));
+-		writel_relaxed(priv->viu.vd1_if0_luma_y0,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD2_IF0_LUMA_Y0)));
+-		writel_relaxed(priv->viu.vd1_if0_luma_y0,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD2_IF0_LUMA_Y1)));
+-		writel_relaxed(priv->viu.vd1_if0_chroma_x0,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD1_IF0_CHROMA_X0)));
+-		writel_relaxed(priv->viu.vd1_if0_chroma_x0,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD1_IF0_CHROMA_X1)));
+-		writel_relaxed(priv->viu.vd1_if0_chroma_x0,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD2_IF0_CHROMA_X0)));
+-		writel_relaxed(priv->viu.vd1_if0_chroma_x0,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD2_IF0_CHROMA_X1)));
+-		writel_relaxed(priv->viu.vd1_if0_chroma_y0,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD1_IF0_CHROMA_Y0)));
+-		writel_relaxed(priv->viu.vd1_if0_chroma_y0,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD1_IF0_CHROMA_Y1)));
+-		writel_relaxed(priv->viu.vd1_if0_chroma_y0,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD2_IF0_CHROMA_Y0)));
+-		writel_relaxed(priv->viu.vd1_if0_chroma_y0,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD2_IF0_CHROMA_Y1)));
+-		writel_relaxed(priv->viu.vd1_if0_repeat_loop,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD1_IF0_RPT_LOOP)));
+-		writel_relaxed(priv->viu.vd1_if0_repeat_loop,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD2_IF0_RPT_LOOP)));
+-		writel_relaxed(priv->viu.vd1_if0_luma0_rpt_pat,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD1_IF0_LUMA0_RPT_PAT)));
+-		writel_relaxed(priv->viu.vd1_if0_luma0_rpt_pat,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD2_IF0_LUMA0_RPT_PAT)));
+-		writel_relaxed(priv->viu.vd1_if0_luma0_rpt_pat,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD1_IF0_LUMA1_RPT_PAT)));
+-		writel_relaxed(priv->viu.vd1_if0_luma0_rpt_pat,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD2_IF0_LUMA1_RPT_PAT)));
+-		writel_relaxed(priv->viu.vd1_if0_chroma0_rpt_pat,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD1_IF0_CHROMA0_RPT_PAT)));
+-		writel_relaxed(priv->viu.vd1_if0_chroma0_rpt_pat,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD2_IF0_CHROMA0_RPT_PAT)));
+-		writel_relaxed(priv->viu.vd1_if0_chroma0_rpt_pat,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD1_IF0_CHROMA1_RPT_PAT)));
+-		writel_relaxed(priv->viu.vd1_if0_chroma0_rpt_pat,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD2_IF0_CHROMA1_RPT_PAT)));
+-		writel_relaxed(0, priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD1_IF0_LUMA_PSEL)));
+-		writel_relaxed(0, priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD1_IF0_CHROMA_PSEL)));
+-		writel_relaxed(0, priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD2_IF0_LUMA_PSEL)));
+-		writel_relaxed(0, priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD2_IF0_CHROMA_PSEL)));
+-		writel_relaxed(priv->viu.vd1_range_map_y,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD1_IF0_RANGE_MAP_Y)));
+-		writel_relaxed(priv->viu.vd1_range_map_cb,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD1_IF0_RANGE_MAP_CB)));
+-		writel_relaxed(priv->viu.vd1_range_map_cr,
+-				priv->io_base +
+-				_REG(meson_viu_mif_reg(priv, VD1_IF0_RANGE_MAP_CR)));
+-		if (priv->sc2) {
+-			writel_relaxed(priv->viu.vd1_range_map_y,
+-				       priv->io_base +
+-				       _REG(meson_viu_mif_reg(priv, VD2_IF0_RANGE_MAP_Y)));
+-			writel_relaxed(priv->viu.vd1_range_map_cb,
+-				       priv->io_base +
+-				       _REG(meson_viu_mif_reg(priv, VD2_IF0_RANGE_MAP_CB)));
+-			writel_relaxed(priv->viu.vd1_range_map_cr,
+-				       priv->io_base +
+-				       _REG(meson_viu_mif_reg(priv, VD2_IF0_RANGE_MAP_CR)));
+-		}
+-		writel_relaxed(VPP_VSC_BANK_LENGTH(4) |
+-			       VPP_HSC_BANK_LENGTH(4) |
+-			       VPP_SC_VD_EN_ENABLE |
+-			       VPP_SC_TOP_EN_ENABLE |
+-			       VPP_SC_HSC_EN_ENABLE |
+-			       VPP_SC_VSC_EN_ENABLE,
+-				priv->io_base + _REG(VPP_SC_MISC));
+-		writel_relaxed(priv->viu.vpp_pic_in_height,
+-				priv->io_base + _REG(VPP_PIC_IN_HEIGHT));
+-		writel_relaxed(priv->viu.vpp_postblend_vd1_h_start_end,
+-			priv->io_base + _REG(VPP_POSTBLEND_VD1_H_START_END));
+-		writel_relaxed(priv->viu.vpp_blend_vd2_h_start_end,
+-			priv->io_base + _REG(VPP_BLEND_VD2_H_START_END));
+-		writel_relaxed(priv->viu.vpp_postblend_vd1_v_start_end,
+-			priv->io_base + _REG(VPP_POSTBLEND_VD1_V_START_END));
+-		writel_relaxed(priv->viu.vpp_blend_vd2_v_start_end,
+-			priv->io_base + _REG(VPP_BLEND_VD2_V_START_END));
+-		writel_relaxed(priv->viu.vpp_hsc_region12_startp,
+-				priv->io_base + _REG(VPP_HSC_REGION12_STARTP));
+-		writel_relaxed(priv->viu.vpp_hsc_region34_startp,
+-				priv->io_base + _REG(VPP_HSC_REGION34_STARTP));
+-		writel_relaxed(priv->viu.vpp_hsc_region4_endp,
+-				priv->io_base + _REG(VPP_HSC_REGION4_ENDP));
+-		writel_relaxed(priv->viu.vpp_hsc_start_phase_step,
+-				priv->io_base + _REG(VPP_HSC_START_PHASE_STEP));
+-		writel_relaxed(priv->viu.vpp_hsc_region1_phase_slope,
+-			priv->io_base + _REG(VPP_HSC_REGION1_PHASE_SLOPE));
+-		writel_relaxed(priv->viu.vpp_hsc_region3_phase_slope,
+-			priv->io_base + _REG(VPP_HSC_REGION3_PHASE_SLOPE));
+-		writel_relaxed(priv->viu.vpp_line_in_length,
+-				priv->io_base + _REG(VPP_LINE_IN_LENGTH));
+-		writel_relaxed(priv->viu.vpp_preblend_h_size,
+-				priv->io_base + _REG(VPP_PREBLEND_H_SIZE));
+-		writel_relaxed(priv->viu.vpp_vsc_region12_startp,
+-				priv->io_base + _REG(VPP_VSC_REGION12_STARTP));
+-		writel_relaxed(priv->viu.vpp_vsc_region34_startp,
+-				priv->io_base + _REG(VPP_VSC_REGION34_STARTP));
+-		writel_relaxed(priv->viu.vpp_vsc_region4_endp,
+-				priv->io_base + _REG(VPP_VSC_REGION4_ENDP));
+-		writel_relaxed(priv->viu.vpp_vsc_start_phase_step,
+-				priv->io_base + _REG(VPP_VSC_START_PHASE_STEP));
+-		meson_crtc->vd1_interlace = priv->viu.vd1_interlace;
+-		meson_crtc->vd1_vsc_ini_phase[0] = priv->viu.vpp_vsc_ini_phase;
+-		meson_crtc->vd1_vsc_ini_phase[1] =
+-			priv->viu.vpp_vsc_ini_phase_bottom;
+-		meson_crtc->vd1_vsc_phase_ctrl[0] = priv->viu.vpp_vsc_phase_ctrl;
+-		meson_crtc->vd1_vsc_phase_ctrl[1] =
+-			priv->viu.vpp_vsc_phase_ctrl_bottom;
+-		if (!meson_crtc->vd1_interlace) {
+-			writel_relaxed(meson_crtc->vd1_vsc_ini_phase[0],
+-				       priv->io_base + _REG(VPP_VSC_INI_PHASE));
+-			writel_relaxed(meson_crtc->vd1_vsc_phase_ctrl[0],
+-				       priv->io_base + _REG(VPP_VSC_PHASE_CTRL));
+-		}
+-		writel_relaxed(priv->viu.vpp_hsc_phase_ctrl,
+-				priv->io_base + _REG(VPP_HSC_PHASE_CTRL));
+-		if (priv->sc2)
+-			writel_relaxed(priv->viu.vpp_hsc_phase_ctrl,
+-				       priv->io_base + _REG(VPP_HSC_PHASE_CTRL1));
+-		writel_relaxed(0x42, priv->io_base + _REG(VPP_SCALE_COEF_IDX));
+-
+-		/* Enable VD1 */
+-		if (meson_crtc->enable_vd1)
+-			meson_crtc->enable_vd1(priv);
+-
+-		priv->viu.vd1_commit = false;
+-	}
++	for (i = 0; i < (priv->sc2 ? 2 : 1); i++)
++		meson_crtc_update_video(meson_crtc, i);
+ 
+ 	/* Use only applied phases: the plane shadows may hold an unflushed flip. */
+-	if (meson_crtc->vd1_interlace) {
++	for (i = 0; i < (priv->sc2 ? 2 : 1); i++) {
++		const struct meson_vpp_video_regs *pps = &meson_vpp_video_regs[i];
+ 		bool bottom;
+ 
++		if (!meson_crtc->video[i].interlace)
++			continue;
+ 		if (priv->venc.current_mode == MESON_VENC_MODE_HDMI &&
+ 		    !priv->venc.hdmi_use_enci)
+ 			bottom = FIELD_GET(GENMASK(28, 16),
+@@ -734,15 +693,15 @@ void meson_crtc_irq(struct meson_drm *priv)
+ 		else
+ 			bottom = meson_venci_get_field(priv);
+ 
+-		/* These are CPU writes for the current field, not next-vsync RDMA. */
+-		writel_relaxed(meson_crtc->vd1_vsc_ini_phase[bottom],
+-			       priv->io_base + _REG(VPP_VSC_INI_PHASE));
+-		writel_relaxed(meson_crtc->vd1_vsc_phase_ctrl[bottom],
+-			       priv->io_base + _REG(VPP_VSC_PHASE_CTRL));
++		/* CPU writes for the current field, not next-vsync RDMA. */
++		writel_relaxed(meson_crtc->video[i].vsc_ini_phase[bottom],
++			       priv->io_base + _REG(pps->vsc_ini_phase));
++		writel_relaxed(meson_crtc->video[i].vsc_phase_ctrl[bottom],
++			       priv->io_base + _REG(pps->vsc_phase_ctrl));
+ 	}
+ 
+ 	meson_crtc->vsync_forced = meson_crtc->osd1_afbcd ||
+-				   meson_crtc->vd1_interlace;
++		meson_crtc->video[0].interlace || meson_crtc->video[1].interlace;
+ 	if (meson_crtc->event) {
+ 		drm_crtc_send_vblank_event(priv->crtc, meson_crtc->event);
+ 		drm_crtc_vblank_put(priv->crtc);
+diff --git a/drivers/gpu/drm/meson/meson_drv.c b/drivers/gpu/drm/meson/meson_drv.c
+index 22fe6adf0d72..027fe97dedf7 100644
+--- a/drivers/gpu/drm/meson/meson_drv.c
++++ b/drivers/gpu/drm/meson/meson_drv.c
+@@ -160,11 +160,13 @@ static void meson_vpu_init(struct meson_drm *priv)
+ 	if (priv->sc2) {
+ 		/* SC2 PWRCTRL memory gates, from Amlogic vpu_mem_pd_sc2. */
+ 		regmap_update_bits(priv->pwrctrl, 0x54,
+-				   GENMASK(11, 0) | GENMASK(15, 14), 0);
++				   GENMASK(11, 0) | GENMASK(15, 14) |
++				   GENMASK(23, 22), 0);
+ 		regmap_update_bits(priv->pwrctrl, 0x58,
+ 				   GENMASK(21, 14) | GENMASK(25, 24) |
+ 				   GENMASK(31, 30), 0);
+-		regmap_update_bits(priv->pwrctrl, 0x5c, GENMASK(13, 8), 0);
++		regmap_update_bits(priv->pwrctrl, 0x5c,
++				   GENMASK(13, 8) | GENMASK(17, 16), 0);
+ 		regmap_update_bits(priv->pwrctrl, 0x64, GENMASK(13, 12), 0);
+ 	}
+ 
+@@ -216,6 +218,7 @@ static int meson_drv_bind_master(struct device *dev, bool has_components)
+ 	struct drm_device *drm;
+ 	struct resource *res;
+ 	void __iomem *regs;
++	unsigned int video_canvases = 0;
+ 	int ret, i;
+ 
+ 	/* Checks if an output connector is available */
+@@ -317,21 +320,19 @@ static int meson_drv_bind_master(struct device *dev, bool has_components)
+ 	ret = meson_canvas_alloc(priv->canvas, &priv->canvas_id_osd1);
+ 	if (ret)
+ 		goto free_drm;
+-	ret = meson_canvas_alloc(priv->canvas, &priv->canvas_id_vd1_0);
+-	if (ret)
+-		goto free_canvas_osd1;
+-	ret = meson_canvas_alloc(priv->canvas, &priv->canvas_id_vd1_1);
+-	if (ret)
+-		goto free_canvas_vd1_0;
+-	ret = meson_canvas_alloc(priv->canvas, &priv->canvas_id_vd1_2);
+-	if (ret)
+-		goto free_canvas_vd1_1;
++	for (i = 0; i < (priv->sc2 ? 6 : 3); i++) {
++		ret = meson_canvas_alloc(priv->canvas,
++					 &priv->canvas_id_vd[i / 3][i % 3]);
++		if (ret)
++			goto free_canvas_vd;
++		video_canvases++;
++	}
+ 
+ 	priv->vsync_irq = platform_get_irq(pdev, 0);
+ 
+ 	ret = drm_vblank_init(drm, 1);
+ 	if (ret)
+-		goto free_canvas_vd1_2;
++		goto free_canvas_vd;
+ 
+ 	/* Assign limits per soc revision/package */
+ 	for (i = 0 ; i < ARRAY_SIZE(meson_drm_soc_attrs) ; ++i) {
+@@ -347,11 +348,11 @@ static int meson_drv_bind_master(struct device *dev, bool has_components)
+ 	 */
+ 	ret = aperture_remove_all_conflicting_devices(meson_driver.name);
+ 	if (ret)
+-		goto free_canvas_vd1_2;
++		goto free_canvas_vd;
+ 
+ 	ret = drmm_mode_config_init(drm);
+ 	if (ret)
+-		goto free_canvas_vd1_2;
++		goto free_canvas_vd;
+ 	drm->mode_config.max_width = 3840;
+ 	drm->mode_config.max_height = 2160;
+ 	drm->mode_config.funcs = &meson_mode_config_funcs;
+@@ -366,7 +367,7 @@ static int meson_drv_bind_master(struct device *dev, bool has_components)
+ 	if (priv->afbcd.ops) {
+ 		ret = priv->afbcd.ops->init(priv);
+ 		if (ret)
+-			goto free_canvas_vd1_2;
++			goto free_canvas_vd;
+ 	}
+ 
+ 	/* Encoder Initialization */
+@@ -430,13 +431,12 @@ static int meson_drv_bind_master(struct device *dev, bool has_components)
+ exit_afbcd:
+ 	if (priv->afbcd.ops)
+ 		priv->afbcd.ops->exit(priv);
+-free_canvas_vd1_2:
+-	meson_canvas_free(priv->canvas, priv->canvas_id_vd1_2);
+-free_canvas_vd1_1:
+-	meson_canvas_free(priv->canvas, priv->canvas_id_vd1_1);
+-free_canvas_vd1_0:
+-	meson_canvas_free(priv->canvas, priv->canvas_id_vd1_0);
+-free_canvas_osd1:
++free_canvas_vd:
++	while (video_canvases) {
++		video_canvases--;
++		meson_canvas_free(priv->canvas,
++			priv->canvas_id_vd[video_canvases / 3][video_canvases % 3]);
++	}
+ 	meson_canvas_free(priv->canvas, priv->canvas_id_osd1);
+ free_drm:
+ 	drm_dev_put(drm);
+@@ -461,17 +461,18 @@ static void meson_drv_unbind(struct device *dev)
+ 	struct meson_drm *priv = dev_get_drvdata(dev);
+ 	struct drm_device *drm = priv->drm;
+ 
+-	if (priv->canvas) {
+-		meson_canvas_free(priv->canvas, priv->canvas_id_osd1);
+-		meson_canvas_free(priv->canvas, priv->canvas_id_vd1_0);
+-		meson_canvas_free(priv->canvas, priv->canvas_id_vd1_1);
+-		meson_canvas_free(priv->canvas, priv->canvas_id_vd1_2);
+-	}
++	unsigned int i;
+ 
+ 	drm_dev_unregister(drm);
+ 	drm_kms_helper_poll_fini(drm);
+ 	drm_atomic_helper_shutdown(drm);
+ 	free_irq(priv->vsync_irq, drm);
++	if (priv->canvas) {
++		meson_canvas_free(priv->canvas, priv->canvas_id_osd1);
++		for (i = 0; i < (priv->sc2 ? 6 : 3); i++)
++			meson_canvas_free(priv->canvas,
++					  priv->canvas_id_vd[i / 3][i % 3]);
++	}
+ 	drm_dev_put(drm);
+ 
+ 	meson_encoder_dsi_remove(priv);
+diff --git a/drivers/gpu/drm/meson/meson_drv.h b/drivers/gpu/drm/meson/meson_drv.h
+index 489141b63344..9c86e5528062 100644
+--- a/drivers/gpu/drm/meson/meson_drv.h
++++ b/drivers/gpu/drm/meson/meson_drv.h
+@@ -42,6 +42,76 @@ struct meson_drm_soc_limits {
+ 	unsigned long long max_hdmi_phy_freq;
+ };
+ 
++/* Each video fetcher owns its backing buffers and its PPS register shadow. */
++struct meson_video_state {
++	bool enabled;
++	bool interlace;
++	bool commit;
++	bool afbc;
++	unsigned int planes;
++	uint32_t if0_gen_reg;
++	uint32_t if0_luma_x0;
++	uint32_t if0_luma_y0;
++	uint32_t if0_chroma_x0;
++	uint32_t if0_chroma_y0;
++	uint32_t if0_repeat_loop;
++	uint32_t if0_luma0_rpt_pat;
++	uint32_t if0_chroma0_rpt_pat;
++	uint32_t range_map_y;
++	uint32_t range_map_cb;
++	uint32_t range_map_cr;
++	uint32_t fmt_w;
++	uint32_t if0_canvas0;
++	uint32_t if0_gen_reg2;
++	uint32_t fmt_ctrl;
++	uint32_t addr0;
++	uint32_t addr1;
++	uint32_t addr2;
++	uint32_t stride0;
++	uint32_t stride1;
++	uint32_t stride2;
++	uint32_t height0;
++	uint32_t height1;
++	uint32_t height2;
++	uint32_t afbc_mode;
++	uint32_t afbc_en;
++	uint32_t afbc_head_addr;
++	uint32_t afbc_body_addr;
++	uint32_t afbc_conv_ctrl;
++	uint32_t afbc_dec_def_color;
++	uint32_t afbc_vd_cfmt_ctrl;
++	uint32_t afbc_vd_cfmt_w;
++	uint32_t afbc_vd_cfmt_h;
++	uint32_t afbc_mif_hor_scope;
++	uint32_t afbc_mif_ver_scope;
++	uint32_t afbc_size_out;
++	uint32_t afbc_pixel_hor_scope;
++	uint32_t afbc_pixel_ver_scope;
++	uint32_t afbc_size_in;
++	uint32_t vpp_pic_in_height;
++	uint32_t postblend_h_start_end;
++	uint32_t postblend_v_start_end;
++	uint32_t vpp_hsc_region12_startp;
++	uint32_t vpp_hsc_region34_startp;
++	uint32_t vpp_hsc_region4_endp;
++	uint32_t vpp_hsc_start_phase_step;
++	uint32_t vpp_hsc_region1_phase_slope;
++	uint32_t vpp_hsc_region3_phase_slope;
++	uint32_t vpp_line_in_length;
++	uint32_t vpp_preblend_h_size;
++	uint32_t vpp_vsc_region12_startp;
++	uint32_t vpp_vsc_region34_startp;
++	uint32_t vpp_vsc_region4_endp;
++	uint32_t vpp_vsc_start_phase_step;
++	uint32_t vpp_vsc_ini_phase;
++	uint32_t vpp_vsc_ini_phase_bottom;
++	uint32_t vpp_vsc_phase_ctrl;
++	uint32_t vpp_vsc_phase_ctrl_bottom;
++	uint32_t vpp_hsc_phase_ctrl;
++	uint32_t vpp_blend_vd2_h_start_end;
++	uint32_t vpp_blend_vd2_v_start_end;
++};
++
+ struct meson_drm {
+ 	struct device *dev;
+ 	enum vpu_compatible compat;
+@@ -55,14 +125,12 @@ struct meson_drm {
+ 
+ 	struct meson_canvas *canvas;
+ 	u8 canvas_id_osd1;
+-	u8 canvas_id_vd1_0;
+-	u8 canvas_id_vd1_1;
+-	u8 canvas_id_vd1_2;
++	u8 canvas_id_vd[2][3];
+ 
+ 	struct drm_device *drm;
+ 	struct drm_crtc *crtc;
+ 	struct drm_plane *primary_plane;
+-	struct drm_plane *overlay_plane;
++	struct drm_plane *overlay_planes[2];
+ 	void *encoders[MESON_ENC_LAST];
+ 
+ 	const struct meson_drm_soc_limits *limits;
+@@ -97,72 +165,7 @@ struct meson_drm {
+ 		uint32_t osb_blend0_size;
+ 		uint32_t osb_blend1_size;
+ 
+-		bool vd1_enabled;
+-		bool vd1_interlace;
+-		bool vd1_commit;
+-		bool vd1_afbc;
+-		unsigned int vd1_planes;
+-		uint32_t vd1_if0_gen_reg;
+-		uint32_t vd1_if0_luma_x0;
+-		uint32_t vd1_if0_luma_y0;
+-		uint32_t vd1_if0_chroma_x0;
+-		uint32_t vd1_if0_chroma_y0;
+-		uint32_t vd1_if0_repeat_loop;
+-		uint32_t vd1_if0_luma0_rpt_pat;
+-		uint32_t vd1_if0_chroma0_rpt_pat;
+-		uint32_t vd1_range_map_y;
+-		uint32_t vd1_range_map_cb;
+-		uint32_t vd1_range_map_cr;
+-		uint32_t viu_vd1_fmt_w;
+-		uint32_t vd1_if0_canvas0;
+-		uint32_t vd1_if0_gen_reg2;
+-		uint32_t viu_vd1_fmt_ctrl;
+-		uint32_t vd1_addr0;
+-		uint32_t vd1_addr1;
+-		uint32_t vd1_addr2;
+-		uint32_t vd1_stride0;
+-		uint32_t vd1_stride1;
+-		uint32_t vd1_stride2;
+-		uint32_t vd1_height0;
+-		uint32_t vd1_height1;
+-		uint32_t vd1_height2;
+-		uint32_t vd1_afbc_mode;
+-		uint32_t vd1_afbc_en;
+-		uint32_t vd1_afbc_head_addr;
+-		uint32_t vd1_afbc_body_addr;
+-		uint32_t vd1_afbc_conv_ctrl;
+-		uint32_t vd1_afbc_dec_def_color;
+-		uint32_t vd1_afbc_vd_cfmt_ctrl;
+-		uint32_t vd1_afbc_vd_cfmt_w;
+-		uint32_t vd1_afbc_vd_cfmt_h;
+-		uint32_t vd1_afbc_mif_hor_scope;
+-		uint32_t vd1_afbc_mif_ver_scope;
+-		uint32_t vd1_afbc_size_out;
+-		uint32_t vd1_afbc_pixel_hor_scope;
+-		uint32_t vd1_afbc_pixel_ver_scope;
+-		uint32_t vd1_afbc_size_in;
+-		uint32_t vpp_pic_in_height;
+-		uint32_t vpp_postblend_vd1_h_start_end;
+-		uint32_t vpp_postblend_vd1_v_start_end;
+-		uint32_t vpp_hsc_region12_startp;
+-		uint32_t vpp_hsc_region34_startp;
+-		uint32_t vpp_hsc_region4_endp;
+-		uint32_t vpp_hsc_start_phase_step;
+-		uint32_t vpp_hsc_region1_phase_slope;
+-		uint32_t vpp_hsc_region3_phase_slope;
+-		uint32_t vpp_line_in_length;
+-		uint32_t vpp_preblend_h_size;
+-		uint32_t vpp_vsc_region12_startp;
+-		uint32_t vpp_vsc_region34_startp;
+-		uint32_t vpp_vsc_region4_endp;
+-		uint32_t vpp_vsc_start_phase_step;
+-		uint32_t vpp_vsc_ini_phase;
+-		uint32_t vpp_vsc_ini_phase_bottom;
+-		uint32_t vpp_vsc_phase_ctrl;
+-		uint32_t vpp_vsc_phase_ctrl_bottom;
+-		uint32_t vpp_hsc_phase_ctrl;
+-		uint32_t vpp_blend_vd2_h_start_end;
+-		uint32_t vpp_blend_vd2_v_start_end;
++		struct meson_video_state video[2];
+ 	} viu;
+ 
+ 	struct {
+diff --git a/drivers/gpu/drm/meson/meson_overlay.c b/drivers/gpu/drm/meson/meson_overlay.c
+index c82edfc3d3a1..5301407136e1 100644
+--- a/drivers/gpu/drm/meson/meson_overlay.c
++++ b/drivers/gpu/drm/meson/meson_overlay.c
+@@ -160,6 +160,7 @@
+ struct meson_overlay {
+ 	struct drm_plane base;
+ 	struct meson_drm *priv;
++	unsigned int index;
+ };
+ #define to_meson_overlay(x) container_of(x, struct meson_overlay, base)
+ 
+@@ -232,6 +233,8 @@ static void meson_overlay_setup_scaler_params(struct meson_drm *priv,
+ 					      struct drm_plane *plane,
+ 					      bool interlace_mode)
+ {
++	struct meson_overlay *meson_overlay = to_meson_overlay(plane);
++	struct meson_video_state *vd = &priv->viu.video[meson_overlay->index];
+ 	struct drm_crtc_state *crtc_state = priv->crtc->state;
+ 	int video_top, video_left, video_width, video_height;
+ 	struct drm_plane_state *state = plane->state;
+@@ -362,7 +365,7 @@ static void meson_overlay_setup_scaler_params(struct meson_drm *priv,
+ 	temp = hd_start_lines + (temp_width * ratio_x >> 18);
+ 	hd_end_lines = (temp <= (w_in - 1)) ? temp : (w_in - 1);
+ 
+-	priv->viu.vpp_line_in_length = hd_end_lines - hd_start_lines + 1;
++	vd->vpp_line_in_length = hd_end_lines - hd_start_lines + 1;
+ 	hsc_startp = max_t(int, start, max_t(int, 0, video_left));
+ 	hsc_endp = min_t(int, end, min_t(int, crtc_width - 1,
+ 					 video_left + video_width - 1));
+@@ -394,91 +397,91 @@ static void meson_overlay_setup_scaler_params(struct meson_drm *priv,
+ 					 &vphase_repeat_skip_bottom,
+ 					 interlace_mode, true);
+ 
+-	priv->viu.vpp_vsc_ini_phase = vphase << 8;
+-	priv->viu.vpp_vsc_phase_ctrl = (1 << 13) | (4 << 8) |
++	vd->vpp_vsc_ini_phase = vphase << 8;
++	vd->vpp_vsc_phase_ctrl = (1 << 13) | (4 << 8) |
+ 				       vphase_repeat_skip;
+-	priv->viu.vpp_vsc_ini_phase_bottom = vphase_bottom << 8;
+-	priv->viu.vpp_vsc_phase_ctrl_bottom = (1 << 13) | (4 << 8) |
++	vd->vpp_vsc_ini_phase_bottom = vphase_bottom << 8;
++	vd->vpp_vsc_phase_ctrl_bottom = (1 << 13) | (4 << 8) |
+ 					      vphase_repeat_skip_bottom;
+ 
+-	priv->viu.vd1_if0_luma_x0 = VD_X_START(hd_start_lines) |
++	vd->if0_luma_x0 = VD_X_START(hd_start_lines) |
+ 				    VD_X_END(hd_end_lines);
+-	priv->viu.vd1_if0_chroma_x0 = VD_X_START(hd_start_lines >> 1) |
++	vd->if0_chroma_x0 = VD_X_START(hd_start_lines >> 1) |
+ 				      VD_X_END(hd_end_lines >> 1);
+ 
+-	priv->viu.viu_vd1_fmt_w =
++	vd->fmt_w =
+ 			VD_H_WIDTH(hd_end_lines - hd_start_lines + 1) |
+ 			VD_V_WIDTH(hd_end_lines/2 - hd_start_lines/2 + 1);
+ 
+-	priv->viu.vd1_afbc_vd_cfmt_w =
++	vd->afbc_vd_cfmt_w =
+ 			AFBC_VD_H_WIDTH(afbc_right - afbc_left) |
+ 			AFBC_VD_V_WIDTH(afbc_right / 2 - afbc_left / 2);
+ 
+-	priv->viu.vd1_afbc_vd_cfmt_h =
++	vd->afbc_vd_cfmt_h =
+ 			AFBC_VD_HEIGHT((afbc_bottom - afbc_top) / 2);
+ 
+-	priv->viu.vd1_afbc_mif_hor_scope = AFBC_MIF_BLK_BGN_H(afbc_left / 32) |
++	vd->afbc_mif_hor_scope = AFBC_MIF_BLK_BGN_H(afbc_left / 32) |
+ 				AFBC_MIF_BLK_END_H((afbc_right / 32) - 1);
+ 
+-	priv->viu.vd1_afbc_mif_ver_scope = AFBC_MIF_BLK_BGN_V(afbc_top / 4) |
++	vd->afbc_mif_ver_scope = AFBC_MIF_BLK_BGN_V(afbc_top / 4) |
+ 				AFBC_MIF_BLK_END_V((afbc_bottom / 4) - 1);
+ 
+-	priv->viu.vd1_afbc_size_out =
++	vd->afbc_size_out =
+ 			AFBC_HSIZE_OUT(afbc_right - afbc_left) |
+ 			AFBC_VSIZE_OUT(afbc_bottom - afbc_top);
+ 
+-	priv->viu.vd1_afbc_pixel_hor_scope =
++	vd->afbc_pixel_hor_scope =
+ 			AFBC_DEC_PIXEL_BGN_H(hd_start_lines - afbc_left) |
+ 			AFBC_DEC_PIXEL_END_H(hd_end_lines - afbc_left);
+ 
+-	priv->viu.vd1_afbc_pixel_ver_scope =
++	vd->afbc_pixel_ver_scope =
+ 			AFBC_DEC_PIXEL_BGN_V(vd_start_lines - afbc_top) |
+ 			AFBC_DEC_PIXEL_END_V(vd_end_lines - afbc_top);
+ 
+-	priv->viu.vd1_afbc_size_in =
++	vd->afbc_size_in =
+ 				AFBC_HSIZE_IN(round_up(state->fb->width, 32)) |
+ 				AFBC_VSIZE_IN(afbc_bottom_src - afbc_top_src);
+ 
+-	priv->viu.vd1_if0_luma_y0 = VD_Y_START(vd_start_lines) |
++	vd->if0_luma_y0 = VD_Y_START(vd_start_lines) |
+ 				    VD_Y_END(vd_end_lines);
+ 
+-	priv->viu.vd1_if0_chroma_y0 = VD_Y_START(vd_start_lines >> 1) |
++	vd->if0_chroma_y0 = VD_Y_START(vd_start_lines >> 1) |
+ 				      VD_Y_END(vd_end_lines >> 1);
+ 
+-	priv->viu.vpp_pic_in_height = vd_end_lines - vd_start_lines + 1;
++	vd->vpp_pic_in_height = vd_end_lines - vd_start_lines + 1;
+ 
+-	priv->viu.vpp_postblend_vd1_h_start_end = VD_H_START(hsc_startp) |
++	vd->postblend_h_start_end = VD_H_START(hsc_startp) |
+ 						  VD_H_END(hsc_endp);
+-	priv->viu.vpp_blend_vd2_h_start_end = VD_H_START(hd_start_lines) |
++	vd->vpp_blend_vd2_h_start_end = VD_H_START(hd_start_lines) |
+ 					      VD_H_END(hd_end_lines);
+-	priv->viu.vpp_hsc_region12_startp = VD_REGION13_END(0) |
++	vd->vpp_hsc_region12_startp = VD_REGION13_END(0) |
+ 					    VD_REGION24_START(hsc_startp);
+-	priv->viu.vpp_hsc_region34_startp =
++	vd->vpp_hsc_region34_startp =
+ 				VD_REGION13_END(hsc_startp) |
+ 				VD_REGION24_START(hsc_endp - hsc_startp);
+-	priv->viu.vpp_hsc_region4_endp = hsc_endp - hsc_startp;
+-	priv->viu.vpp_hsc_start_phase_step = ratio_x << 6;
+-	priv->viu.vpp_hsc_region1_phase_slope = 0;
+-	priv->viu.vpp_hsc_region3_phase_slope = 0;
++	vd->vpp_hsc_region4_endp = hsc_endp - hsc_startp;
++	vd->vpp_hsc_start_phase_step = ratio_x << 6;
++	vd->vpp_hsc_region1_phase_slope = 0;
++	vd->vpp_hsc_region3_phase_slope = 0;
+ 	/* SC2 widened the repeat count downwards to bit 20, also in 4-tap mode. */
+-	priv->viu.vpp_hsc_phase_ctrl = (1 << (priv->sc2 ? 20 : 21)) |
++	vd->vpp_hsc_phase_ctrl = (1 << (priv->sc2 ? 20 : 21)) |
+ 				       (4 << 16);
+ 
+-	priv->viu.vpp_line_in_length = hd_end_lines - hd_start_lines + 1;
+-	priv->viu.vpp_preblend_h_size = hd_end_lines - hd_start_lines + 1;
++	vd->vpp_line_in_length = hd_end_lines - hd_start_lines + 1;
++	vd->vpp_preblend_h_size = hd_end_lines - hd_start_lines + 1;
+ 
+-	priv->viu.vpp_postblend_vd1_v_start_end = VD_V_START(vsc_startp) |
++	vd->postblend_v_start_end = VD_V_START(vsc_startp) |
+ 						  VD_V_END(vsc_endp);
+-	priv->viu.vpp_blend_vd2_v_start_end =
++	vd->vpp_blend_vd2_v_start_end =
+ 				VD2_V_START((vd_end_lines + 1) >> 1) |
+ 				VD2_V_END(vd_end_lines);
+ 
+-	priv->viu.vpp_vsc_region12_startp = 0;
+-	priv->viu.vpp_vsc_region34_startp =
++	vd->vpp_vsc_region12_startp = 0;
++	vd->vpp_vsc_region34_startp =
+ 				VD_REGION13_END(vsc_endp - vsc_startp) |
+ 				VD_REGION24_START(vsc_endp - vsc_startp);
+-	priv->viu.vpp_vsc_region4_endp = vsc_endp - vsc_startp;
+-	priv->viu.vpp_vsc_start_phase_step = ratio_y << 6;
++	vd->vpp_vsc_region4_endp = vsc_endp - vsc_startp;
++	vd->vpp_vsc_start_phase_step = ratio_y << 6;
+ }
+ 
+ static void meson_overlay_atomic_update(struct drm_plane *plane,
+@@ -489,6 +492,7 @@ static void meson_overlay_atomic_update(struct drm_plane *plane,
+ 									   plane);
+ 	struct drm_framebuffer *fb = new_state->fb;
+ 	struct meson_drm *priv = meson_overlay->priv;
++	struct meson_video_state *vd = &priv->viu.video[meson_overlay->index];
+ 	struct drm_gem_dma_object *gem;
+ 	unsigned long flags;
+ 	bool interlace_mode;
+@@ -498,36 +502,36 @@ static void meson_overlay_atomic_update(struct drm_plane *plane,
+ 	interlace_mode = new_state->crtc->mode.flags & DRM_MODE_FLAG_INTERLACE;
+ 
+ 	spin_lock_irqsave(&priv->drm->event_lock, flags);
+-	priv->viu.vd1_interlace = interlace_mode;
++	vd->interlace = interlace_mode;
+ 
+ 	if ((fb->modifier & DRM_FORMAT_MOD_AMLOGIC_FBC(0, 0)) ==
+ 			    DRM_FORMAT_MOD_AMLOGIC_FBC(0, 0)) {
+-		priv->viu.vd1_afbc = true;
++		vd->afbc = true;
+ 
+-		priv->viu.vd1_afbc_mode = AFBC_MIF_URGENT(3) |
++		vd->afbc_mode = AFBC_MIF_URGENT(3) |
+ 					  AFBC_HOLD_LINE_NUM(8) |
+ 					  AFBC_BURST_LEN(2);
+ 
+ 		if ((fb->modifier >> __fourcc_mod_amlogic_options_shift) &
+ 		    AMLOGIC_FBC_OPTION_MEM_SAVING)
+-			priv->viu.vd1_afbc_mode |= AFBC_BLK_MEM_MODE;
++			vd->afbc_mode |= AFBC_BLK_MEM_MODE;
+ 
+ 		if ((fb->modifier & __fourcc_mod_amlogic_layout_mask) ==
+ 				AMLOGIC_FBC_LAYOUT_SCATTER)
+-			priv->viu.vd1_afbc_mode |= AFBC_SCATTER_MODE;
++			vd->afbc_mode |= AFBC_SCATTER_MODE;
+ 
+-		priv->viu.vd1_afbc_en = 0x1600 | AFBC_DEC_ENABLE;
++		vd->afbc_en = 0x1600 | AFBC_DEC_ENABLE;
+ 		if (priv->sc2)
+-			priv->viu.vd1_afbc_en |= BIT(19); /* DOS compression */
++			vd->afbc_en |= BIT(19); /* DOS compression */
+ 
+-		priv->viu.vd1_afbc_conv_ctrl = AFBC_CONV_LBUF_LEN(256);
++		vd->afbc_conv_ctrl = AFBC_CONV_LBUF_LEN(256);
+ 		if (priv->sc2)
+-			priv->viu.vd1_afbc_conv_ctrl |= 2 << 12; /* YUV420 */
++			vd->afbc_conv_ctrl |= 2 << 12; /* YUV420 */
+ 
+-		priv->viu.vd1_afbc_dec_def_color = AFBC_DEF_COLOR_Y(1023);
++		vd->afbc_dec_def_color = AFBC_DEF_COLOR_Y(1023);
+ 
+ 		/* 420: horizontal / 2, vertical / 4 */
+-		priv->viu.vd1_afbc_vd_cfmt_ctrl = AFBC_HORZ_RPT_PIXEL0 |
++		vd->afbc_vd_cfmt_ctrl = AFBC_HORZ_RPT_PIXEL0 |
+ 						  AFBC_HORZ_Y_C_RATIO(1) |
+ 						  AFBC_HORZ_FMT_EN |
+ 						  AFBC_VERT_RPT_LINE0 |
+@@ -538,26 +542,26 @@ static void meson_overlay_atomic_update(struct drm_plane *plane,
+ 		switch (fb->format->format) {
+ 		/* AFBC Only formats */
+ 		case DRM_FORMAT_YUV420_10BIT:
+-			priv->viu.vd1_afbc_mode |=
++			vd->afbc_mode |=
+ 				AFBC_COMPBITS_YUV(AFBC_COMPBITS_10BIT);
+-			priv->viu.vd1_afbc_dec_def_color |=
++			vd->afbc_dec_def_color |=
+ 					AFBC_DEF_COLOR_U(512) |
+ 					AFBC_DEF_COLOR_V(512);
+ 			break;
+ 		case DRM_FORMAT_YUV420_8BIT:
+-			priv->viu.vd1_afbc_dec_def_color |=
++			vd->afbc_dec_def_color |=
+ 					AFBC_DEF_COLOR_U(128) |
+ 					AFBC_DEF_COLOR_V(128);
+ 			break;
+ 		}
+ 
+-		priv->viu.vd1_if0_gen_reg = 0;
+-		priv->viu.vd1_if0_canvas0 = 0;
+-		priv->viu.viu_vd1_fmt_ctrl = 0;
++		vd->if0_gen_reg = 0;
++		vd->if0_canvas0 = 0;
++		vd->fmt_ctrl = 0;
+ 	} else {
+-		priv->viu.vd1_afbc = false;
++		vd->afbc = false;
+ 
+-		priv->viu.vd1_if0_gen_reg = VD_URGENT_CHROMA |
++		vd->if0_gen_reg = VD_URGENT_CHROMA |
+ 					    VD_URGENT_LUMA |
+ 					    VD_HOLD_LINES(9) |
+ 					    VD_CHRO_RPT_LASTL_CTRL |
+@@ -567,28 +571,28 @@ static void meson_overlay_atomic_update(struct drm_plane *plane,
+ 	/* Setup scaler params */
+ 	meson_overlay_setup_scaler_params(priv, plane, interlace_mode);
+ 
+-	priv->viu.vd1_if0_repeat_loop = 0;
++	vd->if0_repeat_loop = 0;
+ 	/* Output fields are selected by VPP phase, not by skipping MIF rows. */
+-	priv->viu.vd1_if0_luma0_rpt_pat = 0;
+-	priv->viu.vd1_if0_chroma0_rpt_pat = 0;
+-	priv->viu.vd1_range_map_y = 0;
+-	priv->viu.vd1_range_map_cb = 0;
+-	priv->viu.vd1_range_map_cr = 0;
++	vd->if0_luma0_rpt_pat = 0;
++	vd->if0_chroma0_rpt_pat = 0;
++	vd->range_map_y = 0;
++	vd->range_map_cb = 0;
++	vd->range_map_cr = 0;
+ 
+ 	/* Default values for RGB888/YUV444 */
+-	priv->viu.vd1_if0_gen_reg2 = 0;
+-	priv->viu.viu_vd1_fmt_ctrl = 0;
++	vd->if0_gen_reg2 = 0;
++	vd->fmt_ctrl = 0;
+ 
+ 	/* None will match for AFBC Only formats */
+ 	switch (fb->format->format) {
+ 	/* TOFIX DRM_FORMAT_RGB888 should be supported */
+ 	case DRM_FORMAT_YUYV:
+-		priv->viu.vd1_if0_gen_reg |= VD_BYTES_PER_PIXEL(1);
+-		priv->viu.vd1_if0_canvas0 =
+-					CANVAS_ADDR2(priv->canvas_id_vd1_0) |
+-					CANVAS_ADDR1(priv->canvas_id_vd1_0) |
+-					CANVAS_ADDR0(priv->canvas_id_vd1_0);
+-		priv->viu.viu_vd1_fmt_ctrl = VD_HORZ_Y_C_RATIO(1) | /* /2 */
++		vd->if0_gen_reg |= VD_BYTES_PER_PIXEL(1);
++		vd->if0_canvas0 =
++					CANVAS_ADDR2(priv->canvas_id_vd[meson_overlay->index][0]) |
++					CANVAS_ADDR1(priv->canvas_id_vd[meson_overlay->index][0]) |
++					CANVAS_ADDR0(priv->canvas_id_vd[meson_overlay->index][0]);
++		vd->fmt_ctrl = VD_HORZ_Y_C_RATIO(1) | /* /2 */
+ 					     VD_HORZ_FMT_EN |
+ 					     VD_VERT_RPT_LINE0 |
+ 					     VD_VERT_INITIAL_PHASE(12) |
+@@ -597,16 +601,16 @@ static void meson_overlay_atomic_update(struct drm_plane *plane,
+ 		break;
+ 	case DRM_FORMAT_NV12:
+ 	case DRM_FORMAT_NV21:
+-		priv->viu.vd1_if0_gen_reg |= VD_SEPARATE_EN;
+-		priv->viu.vd1_if0_canvas0 =
+-					CANVAS_ADDR2(priv->canvas_id_vd1_1) |
+-					CANVAS_ADDR1(priv->canvas_id_vd1_1) |
+-					CANVAS_ADDR0(priv->canvas_id_vd1_0);
++		vd->if0_gen_reg |= VD_SEPARATE_EN;
++		vd->if0_canvas0 =
++					CANVAS_ADDR2(priv->canvas_id_vd[meson_overlay->index][1]) |
++					CANVAS_ADDR1(priv->canvas_id_vd[meson_overlay->index][1]) |
++					CANVAS_ADDR0(priv->canvas_id_vd[meson_overlay->index][0]);
+ 		if (fb->format->format == DRM_FORMAT_NV12)
+-			priv->viu.vd1_if0_gen_reg2 = VD_COLOR_MAP(1);
++			vd->if0_gen_reg2 = VD_COLOR_MAP(1);
+ 		else
+-			priv->viu.vd1_if0_gen_reg2 = VD_COLOR_MAP(2);
+-		priv->viu.viu_vd1_fmt_ctrl = VD_HORZ_Y_C_RATIO(1) | /* /2 */
++			vd->if0_gen_reg2 = VD_COLOR_MAP(2);
++		vd->fmt_ctrl = VD_HORZ_Y_C_RATIO(1) | /* /2 */
+ 					     VD_HORZ_FMT_EN |
+ 					     VD_VERT_RPT_LINE0 |
+ 					     VD_VERT_INITIAL_PHASE(12) |
+@@ -618,14 +622,14 @@ static void meson_overlay_atomic_update(struct drm_plane *plane,
+ 	case DRM_FORMAT_YUV420:
+ 	case DRM_FORMAT_YUV411:
+ 	case DRM_FORMAT_YUV410:
+-		priv->viu.vd1_if0_gen_reg |= VD_SEPARATE_EN;
+-		priv->viu.vd1_if0_canvas0 =
+-					CANVAS_ADDR2(priv->canvas_id_vd1_2) |
+-					CANVAS_ADDR1(priv->canvas_id_vd1_1) |
+-					CANVAS_ADDR0(priv->canvas_id_vd1_0);
++		vd->if0_gen_reg |= VD_SEPARATE_EN;
++		vd->if0_canvas0 =
++					CANVAS_ADDR2(priv->canvas_id_vd[meson_overlay->index][2]) |
++					CANVAS_ADDR1(priv->canvas_id_vd[meson_overlay->index][1]) |
++					CANVAS_ADDR0(priv->canvas_id_vd[meson_overlay->index][0]);
+ 		switch (fb->format->format) {
+ 		case DRM_FORMAT_YUV422:
+-			priv->viu.viu_vd1_fmt_ctrl =
++			vd->fmt_ctrl =
+ 					VD_HORZ_Y_C_RATIO(1) | /* /2 */
+ 					VD_HORZ_FMT_EN |
+ 					VD_VERT_RPT_LINE0 |
+@@ -634,7 +638,7 @@ static void meson_overlay_atomic_update(struct drm_plane *plane,
+ 					VD_VERT_FMT_EN;
+ 			break;
+ 		case DRM_FORMAT_YUV420:
+-			priv->viu.viu_vd1_fmt_ctrl =
++			vd->fmt_ctrl =
+ 					VD_HORZ_Y_C_RATIO(1) | /* /2 */
+ 					VD_HORZ_FMT_EN |
+ 					VD_VERT_RPT_LINE0 |
+@@ -643,7 +647,7 @@ static void meson_overlay_atomic_update(struct drm_plane *plane,
+ 					VD_VERT_FMT_EN;
+ 			break;
+ 		case DRM_FORMAT_YUV411:
+-			priv->viu.viu_vd1_fmt_ctrl =
++			vd->fmt_ctrl =
+ 					VD_HORZ_Y_C_RATIO(2) | /* /4 */
+ 					VD_HORZ_FMT_EN |
+ 					VD_VERT_RPT_LINE0 |
+@@ -652,7 +656,7 @@ static void meson_overlay_atomic_update(struct drm_plane *plane,
+ 					VD_VERT_FMT_EN;
+ 			break;
+ 		case DRM_FORMAT_YUV410:
+-			priv->viu.viu_vd1_fmt_ctrl =
++			vd->fmt_ctrl =
+ 					VD_HORZ_Y_C_RATIO(2) | /* /4 */
+ 					VD_HORZ_FMT_EN |
+ 					VD_VERT_RPT_LINE0 |
+@@ -665,76 +669,76 @@ static void meson_overlay_atomic_update(struct drm_plane *plane,
+ 	}
+ 
+ 	/* Update Canvas with buffer address */
+-	priv->viu.vd1_planes = fb->format->num_planes;
++	vd->planes = fb->format->num_planes;
+ 
+-	switch (priv->viu.vd1_planes) {
++	switch (vd->planes) {
+ 	case 3:
+ 		gem = drm_fb_dma_get_gem_obj(fb, 2);
+-		priv->viu.vd1_addr2 = gem->dma_addr + fb->offsets[2];
+-		priv->viu.vd1_stride2 = fb->pitches[2];
+-		priv->viu.vd1_height2 =
++		vd->addr2 = gem->dma_addr + fb->offsets[2];
++		vd->stride2 = fb->pitches[2];
++		vd->height2 =
+ 			drm_format_info_plane_height(fb->format,
+ 						fb->height, 2);
+ 		DRM_DEBUG("plane 2 addr 0x%x stride %d height %d\n",
+-			 priv->viu.vd1_addr2,
+-			 priv->viu.vd1_stride2,
+-			 priv->viu.vd1_height2);
++			 vd->addr2,
++			 vd->stride2,
++			 vd->height2);
+ 		fallthrough;
+ 	case 2:
+ 		gem = drm_fb_dma_get_gem_obj(fb, 1);
+-		priv->viu.vd1_addr1 = gem->dma_addr + fb->offsets[1];
+-		priv->viu.vd1_stride1 = fb->pitches[1];
+-		priv->viu.vd1_height1 =
++		vd->addr1 = gem->dma_addr + fb->offsets[1];
++		vd->stride1 = fb->pitches[1];
++		vd->height1 =
+ 			drm_format_info_plane_height(fb->format,
+ 						fb->height, 1);
+ 		DRM_DEBUG("plane 1 addr 0x%x stride %d height %d\n",
+-			 priv->viu.vd1_addr1,
+-			 priv->viu.vd1_stride1,
+-			 priv->viu.vd1_height1);
++			 vd->addr1,
++			 vd->stride1,
++			 vd->height1);
+ 		fallthrough;
+ 	case 1:
+ 		gem = drm_fb_dma_get_gem_obj(fb, 0);
+-		priv->viu.vd1_addr0 = gem->dma_addr + fb->offsets[0];
+-		priv->viu.vd1_stride0 = fb->pitches[0];
+-		priv->viu.vd1_height0 =
++		vd->addr0 = gem->dma_addr + fb->offsets[0];
++		vd->stride0 = fb->pitches[0];
++		vd->height0 =
+ 			drm_format_info_plane_height(fb->format,
+ 						     fb->height, 0);
+ 		DRM_DEBUG("plane 0 addr 0x%x stride %d height %d\n",
+-			 priv->viu.vd1_addr0,
+-			 priv->viu.vd1_stride0,
+-			 priv->viu.vd1_height0);
++			 vd->addr0,
++			 vd->stride0,
++			 vd->height0);
+ 	}
+ 
+-	if (priv->viu.vd1_afbc) {
+-		if (priv->viu.vd1_afbc_mode & AFBC_SCATTER_MODE) {
++	if (vd->afbc) {
++		if (vd->afbc_mode & AFBC_SCATTER_MODE) {
+ 			/*
+ 			 * In Scatter mode, the header contains the physical
+ 			 * body content layout, thus the body content
+ 			 * size isn't needed.
+ 			 */
+-			priv->viu.vd1_afbc_head_addr = priv->viu.vd1_addr0 >> 4;
+-			priv->viu.vd1_afbc_body_addr = 0;
++			vd->afbc_head_addr = vd->addr0 >> 4;
++			vd->afbc_body_addr = 0;
+ 		} else {
+ 			/* Default mode is 4k per superblock */
+ 			unsigned long block_size = 4096;
+ 			unsigned long body_size;
+ 
+ 			/* 8bit mem saving mode is 3072bytes per superblock */
+-			if (priv->viu.vd1_afbc_mode & AFBC_BLK_MEM_MODE)
++			if (vd->afbc_mode & AFBC_BLK_MEM_MODE)
+ 				block_size = 3072;
+ 
+-			body_size = (ALIGN(priv->viu.vd1_stride0, 64) / 64) *
+-				    (ALIGN(priv->viu.vd1_height0, 32) / 32) *
++			body_size = (ALIGN(vd->stride0, 64) / 64) *
++				    (ALIGN(vd->height0, 32) / 32) *
+ 				    block_size;
+ 
+-			priv->viu.vd1_afbc_body_addr = priv->viu.vd1_addr0 >> 4;
++			vd->afbc_body_addr = vd->addr0 >> 4;
+ 			/* Header is after body content */
+-			priv->viu.vd1_afbc_head_addr = (priv->viu.vd1_addr0 +
++			vd->afbc_head_addr = (vd->addr0 +
+ 							body_size) >> 4;
+ 		}
+ 	}
+ 
+-	priv->viu.vd1_enabled = true;
++	vd->enabled = true;
+ 
+ 	spin_unlock_irqrestore(&priv->drm->event_lock, flags);
+ 
+@@ -746,12 +750,13 @@ static void meson_overlay_atomic_disable(struct drm_plane *plane,
+ {
+ 	struct meson_overlay *meson_overlay = to_meson_overlay(plane);
+ 	struct meson_drm *priv = meson_overlay->priv;
++	struct meson_video_state *vd = &priv->viu.video[meson_overlay->index];
+ 	unsigned long flags;
+ 
+ 	DRM_DEBUG_DRIVER("\n");
+ 
+ 	spin_lock_irqsave(&priv->drm->event_lock, flags);
+-	priv->viu.vd1_enabled = false;
++	vd->enabled = false;
+ 	spin_unlock_irqrestore(&priv->drm->event_lock, flags);
+ }
+ 
+@@ -842,12 +847,19 @@ static const uint64_t format_modifiers[] = {
+ 	DRM_FORMAT_MOD_INVALID,
+ };
+ 
+-int meson_overlay_create(struct meson_drm *priv)
++/* VD2 shares the sourced SC2 4:2:0 MIF and DOS-FBC paths. */
++static const uint32_t sc2_vd2_formats[] = {
++	DRM_FORMAT_NV12,
++	DRM_FORMAT_NV21,
++	DRM_FORMAT_YUV420_8BIT,
++	DRM_FORMAT_YUV420_10BIT,
++};
++
++static int meson_overlay_create_one(struct meson_drm *priv, unsigned int index)
+ {
+ 	struct meson_overlay *meson_overlay;
+ 	struct drm_plane *plane;
+-
+-	DRM_DEBUG_DRIVER("\n");
++	int ret;
+ 
+ 	meson_overlay = devm_kzalloc(priv->drm->dev, sizeof(*meson_overlay),
+ 				   GFP_KERNEL);
+@@ -855,23 +867,36 @@ int meson_overlay_create(struct meson_drm *priv)
+ 		return -ENOMEM;
+ 
+ 	meson_overlay->priv = priv;
++	meson_overlay->index = index;
+ 	plane = &meson_overlay->base;
+ 
+-	drm_universal_plane_init(priv->drm, plane, 0xFF,
+-				 &meson_overlay_funcs,
+-				 supported_drm_formats,
+-				 ARRAY_SIZE(supported_drm_formats),
+-				 format_modifiers,
+-				 DRM_PLANE_TYPE_OVERLAY, "meson_overlay_plane");
++	ret = drm_universal_plane_init(priv->drm, plane, 1,
++				       &meson_overlay_funcs,
++				       index ? sc2_vd2_formats : supported_drm_formats,
++				       index ? ARRAY_SIZE(sc2_vd2_formats) :
++					       ARRAY_SIZE(supported_drm_formats),
++				       format_modifiers,
++				       DRM_PLANE_TYPE_OVERLAY,
++				       "meson_video_vd%u", index + 1);
++	if (ret)
++		return ret;
+ 
+ 	drm_plane_helper_add(plane, &meson_overlay_helper_funcs);
+ 
+-	/* For now, VD Overlay plane is always on the back */
+-	drm_plane_create_zpos_immutable_property(plane, 0);
++	/* Fixed postblend ports: VD1 behind VD2, both behind OSD1. */
++	drm_plane_create_zpos_immutable_property(plane, index);
++	priv->overlay_planes[index] = plane;
+ 
+-	priv->overlay_plane = plane;
++	return 0;
++}
+ 
+-	DRM_DEBUG_DRIVER("\n");
++int meson_overlay_create(struct meson_drm *priv)
++{
++	int ret;
+ 
+-	return 0;
++	ret = meson_overlay_create_one(priv, 0);
++	if (ret || !priv->sc2)
++		return ret;
++
++	return meson_overlay_create_one(priv, 1);
+ }
+diff --git a/drivers/gpu/drm/meson/meson_plane.c b/drivers/gpu/drm/meson/meson_plane.c
+index 21e64538275b..8cbb3d81b84c 100644
+--- a/drivers/gpu/drm/meson/meson_plane.c
++++ b/drivers/gpu/drm/meson/meson_plane.c
+@@ -592,7 +592,7 @@ int meson_plane_create(struct meson_drm *priv)
+ 	drm_plane_helper_add(plane, &meson_plane_helper_funcs);
+ 
+ 	/* For now, OSD Primary plane is always on the front */
+-	drm_plane_create_zpos_immutable_property(plane, 1);
++	drm_plane_create_zpos_immutable_property(plane, priv->sc2 ? 2 : 1);
+ 
+ 	priv->primary_plane = plane;
+ 
+diff --git a/drivers/gpu/drm/meson/meson_registers.h b/drivers/gpu/drm/meson/meson_registers.h
+index 1654e7a3125b..ea50f2696113 100644
+--- a/drivers/gpu/drm/meson/meson_registers.h
++++ b/drivers/gpu/drm/meson/meson_registers.h
+@@ -349,6 +349,26 @@
+ #define SC2_VIU_VD2_FMT_CTRL 0x489d
+ #define SC2_VIU_VD2_FMT_W 0x489e
+ #define SC2_AFBC_ENABLE 0x4840
++#define SC2_VD2_AFBC_ENABLE 0x48c0
++
++/* SC2 VD2 PPS, from Amlogic video_sink pps_reg_array[1]. */
++#define VD2_SCALE_COEF_IDX 0x3943
++#define VD2_SCALE_COEF 0x3944
++#define VD2_VSC_REGION12_STARTP 0x3945
++#define VD2_VSC_REGION34_STARTP 0x3946
++#define VD2_VSC_REGION4_ENDP 0x3947
++#define VD2_VSC_START_PHASE_STEP 0x3948
++#define VD2_VSC_PHASE_CTRL 0x394d
++#define VD2_VSC_INI_PHASE 0x394e
++#define VD2_HSC_REGION12_STARTP 0x394f
++#define VD2_HSC_REGION34_STARTP 0x3950
++#define VD2_HSC_REGION4_ENDP 0x3951
++#define VD2_HSC_START_PHASE_STEP 0x3952
++#define VD2_HSC_REGION1_PHASE_SLOPE 0x3954
++#define VD2_HSC_REGION3_PHASE_SLOPE 0x3955
++#define VD2_HSC_PHASE_CTRL 0x3957
++#define VD2_SC_MISC 0x3958
++#define VD2_HSC_PHASE_CTRL1 0x395a
+ 
+ /* VIU Matrix Registers */
+ #define VIU_OSD1_MATRIX_CTRL 0x1a90
+@@ -661,6 +681,7 @@
+ #define VD1_HDR2_CTRL 0x3800
+ #define VD1_HDR2_CTRL_TOP_EN                   BIT(13)
+ #define VD1_HDR2_CTRL_REG_ONLY_MAT             BIT(16)
++#define VD2_HDR2_CTRL 0x3850
+ 
+ /* osd1 HDR */
+ #define OSD1_HDR2_CTRL 0x38a0
+@@ -1925,6 +1946,7 @@
+ #define		VD_BLEND_POSTBLD_SRC_OSD1       (3 << 8)
+ #define		VD_BLEND_POSTBLD_SRC_OSD2       (4 << 8)
+ #define		VD_BLEND_POSTBLD_PREMULT_EN     BIT(16)
++#define		VD_BLEND_PATH_SEL_ENABLE       BIT(20)
+ #define OSD1_BLEND_SRC_CTRL 0x1dfd
+ #define OSD2_BLEND_SRC_CTRL 0x1dfe
+ #define		OSD_BLEND_POSTBLD_SRC_VD1       (1 << 8)
+diff --git a/drivers/gpu/drm/meson/meson_viu.c b/drivers/gpu/drm/meson/meson_viu.c
+index e7454abb590f..9265366e1ba9 100644
+--- a/drivers/gpu/drm/meson/meson_viu.c
++++ b/drivers/gpu/drm/meson/meson_viu.c
+@@ -411,11 +411,17 @@ void meson_viu_gxm_disable_osd1_afbc(struct meson_drm *priv)
+ 			    priv->io_base + _REG(VIU_MISC_CTRL1));
+ }
+ 
+-void meson_viu_vd1_afbc_select(struct meson_drm *priv, bool afbc)
++void meson_viu_video_afbc_select(struct meson_drm *priv,
++				unsigned int index, bool afbc)
+ {
+ 	u32 mask = VD1_AXI_SEL_AFBC | AFBC_VD1_SEL;
+ 
+-	if (priv->sc2) {
++	if (priv->sc2 && index) {
++		/* video_sink vdx_path_select: AFBC1 or VD2 MIF, never DI/OSD4. */
++		mask |= VD1_AFBC0_MEM_SEL;
++		writel_bits_relaxed(GENMASK(22, 0), afbc ? mask : 0,
++				    priv->io_base + _REG(VD2_AFBCD1_MISC_CTRL));
++	} else if (priv->sc2) {
+ 		/* TL1+ also selects the AFBC memory path with bit 22. */
+ 		mask |= VD1_AFBC0_MEM_SEL;
+ 		writel_bits_relaxed(mask, afbc ? mask : 0,
+@@ -449,10 +455,14 @@ void meson_viu_init(struct meson_drm *priv)
+ 				priv->io_base + _REG(OSD1_HDR2_CTRL));
+ 
+ 		/* SC2 U-Boot leaves an RGB-to-YUV matrix on the YUV video path. */
+-		if (priv->sc2)
++		if (priv->sc2) {
+ 			writel_bits_relaxed(VD1_HDR2_CTRL_REG_ONLY_MAT |
+ 					    VD1_HDR2_CTRL_TOP_EN, 0,
+ 					    priv->io_base + _REG(VD1_HDR2_CTRL));
++			writel_bits_relaxed(VD1_HDR2_CTRL_REG_ONLY_MAT |
++					    VD1_HDR2_CTRL_TOP_EN, 0,
++					    priv->io_base + _REG(VD2_HDR2_CTRL));
++		}
+ 	}
+ 
+ 	/* Initialize OSD1 fifo control register */
+@@ -484,9 +494,17 @@ void meson_viu_init(struct meson_drm *priv)
+ 	writel_bits_relaxed(VIU_CTRL0_VD1_AFBC_MASK, 0,
+ 			    priv->io_base + _REG(VIU_MISC_CTRL0));
+ 	writel_relaxed(0, priv->io_base +
+-		       _REG(meson_viu_afbc_reg(priv, AFBC_ENABLE)));
+-	if (priv->sc2)
+-		meson_viu_vd1_afbc_select(priv, false);
++		       _REG(meson_viu_afbc_reg(priv, 0, AFBC_ENABLE)));
++	if (priv->sc2) {
++		meson_viu_video_afbc_select(priv, 0, false);
++		meson_viu_video_afbc_select(priv, 1, false);
++		writel_relaxed(0, priv->io_base +
++			       _REG(meson_viu_afbc_reg(priv, 1, AFBC_ENABLE)));
++		writel_relaxed(0, priv->io_base +
++			       _REG(meson_viu_mif_reg(priv, VD1_IF0_GEN_REG)));
++		writel_relaxed(0, priv->io_base +
++			       _REG(meson_viu_mif_reg(priv, VD2_IF0_GEN_REG)));
++	}
+ 
+ 	writel_relaxed(0x00FF00C0,
+ 		       priv->io_base + _REG(priv->sc2 ?
+diff --git a/drivers/gpu/drm/meson/meson_viu.h b/drivers/gpu/drm/meson/meson_viu.h
+index 47375bac8a7f..2305ea2a19f5 100644
+--- a/drivers/gpu/drm/meson/meson_viu.h
++++ b/drivers/gpu/drm/meson/meson_viu.h
+@@ -68,13 +68,18 @@ static inline unsigned int meson_viu_mif_reg(struct meson_drm *priv,
+ }
+ 
+ static inline unsigned int meson_viu_afbc_reg(struct meson_drm *priv,
++					   unsigned int index,
+ 					   unsigned int reg)
+ {
+-	/* AFBC_ENABLE through AFBC_VD_CFMT_H have identical field order. */
+-	return priv->sc2 ? SC2_AFBC_ENABLE + reg - AFBC_ENABLE : reg;
++	/* Both SC2 decoders have the same field order, not a shared bank. */
++	if (priv->sc2)
++		return (index ? SC2_VD2_AFBC_ENABLE : SC2_AFBC_ENABLE) +
++			reg - AFBC_ENABLE;
++	return reg;
+ }
+ 
+-void meson_viu_vd1_afbc_select(struct meson_drm *priv, bool afbc);
++void meson_viu_video_afbc_select(struct meson_drm *priv,
++				unsigned int index, bool afbc);
+ 
+ /* OSDx_BLKx_CFG */
+ #define OSD_MALI_SRC_EN		BIT(30)
+diff --git a/drivers/gpu/drm/meson/meson_vpp.c b/drivers/gpu/drm/meson/meson_vpp.c
+index 5df1957c8e41..dcaafd0bd91c 100644
+--- a/drivers/gpu/drm/meson/meson_vpp.c
++++ b/drivers/gpu/drm/meson/meson_vpp.c
+@@ -12,6 +12,52 @@
+ #include "meson_registers.h"
+ #include "meson_vpp.h"
+ 
++/* Amlogic video_reg.c pps_reg_array and vpp_blend_reg_array (SC2). */
++const struct meson_vpp_video_regs meson_vpp_video_regs[2] = {
++	{
++		.scale_coef_idx = VPP_SCALE_COEF_IDX,
++		.scale_coef = VPP_SCALE_COEF,
++		.vsc_region12_startp = VPP_VSC_REGION12_STARTP,
++		.vsc_region34_startp = VPP_VSC_REGION34_STARTP,
++		.vsc_region4_endp = VPP_VSC_REGION4_ENDP,
++		.vsc_start_phase_step = VPP_VSC_START_PHASE_STEP,
++		.vsc_phase_ctrl = VPP_VSC_PHASE_CTRL,
++		.vsc_ini_phase = VPP_VSC_INI_PHASE,
++		.hsc_region12_startp = VPP_HSC_REGION12_STARTP,
++		.hsc_region34_startp = VPP_HSC_REGION34_STARTP,
++		.hsc_region4_endp = VPP_HSC_REGION4_ENDP,
++		.hsc_start_phase_step = VPP_HSC_START_PHASE_STEP,
++		.hsc_region1_phase_slope = VPP_HSC_REGION1_PHASE_SLOPE,
++		.hsc_region3_phase_slope = VPP_HSC_REGION3_PHASE_SLOPE,
++		.hsc_phase_ctrl = VPP_HSC_PHASE_CTRL,
++		.sc_misc = VPP_SC_MISC,
++		.hsc_phase_ctrl1 = VPP_HSC_PHASE_CTRL1,
++		.postblend_h_start_end = VPP_POSTBLEND_VD1_H_START_END,
++		.postblend_v_start_end = VPP_POSTBLEND_VD1_V_START_END,
++	},
++	{
++		.scale_coef_idx = VD2_SCALE_COEF_IDX,
++		.scale_coef = VD2_SCALE_COEF,
++		.vsc_region12_startp = VD2_VSC_REGION12_STARTP,
++		.vsc_region34_startp = VD2_VSC_REGION34_STARTP,
++		.vsc_region4_endp = VD2_VSC_REGION4_ENDP,
++		.vsc_start_phase_step = VD2_VSC_START_PHASE_STEP,
++		.vsc_phase_ctrl = VD2_VSC_PHASE_CTRL,
++		.vsc_ini_phase = VD2_VSC_INI_PHASE,
++		.hsc_region12_startp = VD2_HSC_REGION12_STARTP,
++		.hsc_region34_startp = VD2_HSC_REGION34_STARTP,
++		.hsc_region4_endp = VD2_HSC_REGION4_ENDP,
++		.hsc_start_phase_step = VD2_HSC_START_PHASE_STEP,
++		.hsc_region1_phase_slope = VD2_HSC_REGION1_PHASE_SLOPE,
++		.hsc_region3_phase_slope = VD2_HSC_REGION3_PHASE_SLOPE,
++		.hsc_phase_ctrl = VD2_HSC_PHASE_CTRL,
++		.sc_misc = VD2_SC_MISC,
++		.hsc_phase_ctrl1 = VD2_HSC_PHASE_CTRL1,
++		.postblend_h_start_end = VPP_BLEND_VD2_H_START_END,
++		.postblend_v_start_end = VPP_BLEND_VD2_V_START_END,
++	},
++};
++
+ /**
+  * DOC: Video Post Processing
+  *
+@@ -76,16 +122,18 @@ static const uint32_t vpp_filter_coefs_bicubic[] = {
+ };
+ 
+ static void meson_vpp_write_vd_scaling_filter_coefs(struct meson_drm *priv,
++						    unsigned int index,
+ 						    const unsigned int *coefs,
+ 						    bool is_horizontal)
+ {
++	const struct meson_vpp_video_regs *pps = &meson_vpp_video_regs[index];
+ 	int i;
+ 
+ 	writel_relaxed(is_horizontal ? VPP_SCALE_HORIZONTAL_COEF : 0,
+-			priv->io_base + _REG(VPP_SCALE_COEF_IDX));
++			priv->io_base + _REG(pps->scale_coef_idx));
+ 	for (i = 0; i < 33; i++)
+ 		writel_relaxed(coefs[i],
+-				priv->io_base + _REG(VPP_SCALE_COEF));
++				priv->io_base + _REG(pps->scale_coef));
+ }
+ 
+ void meson_vpp_init(struct meson_drm *priv)
+@@ -158,8 +206,15 @@ void meson_vpp_init(struct meson_drm *priv)
+ 				vpp_filter_coefs_4point_bspline, true);
+ 
+ 	/* Write the VD proper filter coefficients. */
+-	meson_vpp_write_vd_scaling_filter_coefs(priv, vpp_filter_coefs_bicubic,
++	meson_vpp_write_vd_scaling_filter_coefs(priv, 0, vpp_filter_coefs_bicubic,
+ 						false);
+-	meson_vpp_write_vd_scaling_filter_coefs(priv, vpp_filter_coefs_bicubic,
++	meson_vpp_write_vd_scaling_filter_coefs(priv, 0, vpp_filter_coefs_bicubic,
+ 						true);
++	if (priv->sc2) {
++		writel_relaxed(0, priv->io_base + _REG(VD2_SC_MISC));
++		meson_vpp_write_vd_scaling_filter_coefs(priv, 1,
++						vpp_filter_coefs_bicubic, false);
++		meson_vpp_write_vd_scaling_filter_coefs(priv, 1,
++						vpp_filter_coefs_bicubic, true);
++	}
+ }
+diff --git a/drivers/gpu/drm/meson/meson_vpp.h b/drivers/gpu/drm/meson/meson_vpp.h
+index b790042a1650..732ecc56b586 100644
+--- a/drivers/gpu/drm/meson/meson_vpp.h
++++ b/drivers/gpu/drm/meson/meson_vpp.h
+@@ -19,6 +19,30 @@ struct meson_drm;
+ /* Mux VIU/VPP to ENCP */
+ #define MESON_VIU_VPP_MUX_ENCP	0xA
+ 
++struct meson_vpp_video_regs {
++	unsigned int scale_coef_idx;
++	unsigned int scale_coef;
++	unsigned int vsc_region12_startp;
++	unsigned int vsc_region34_startp;
++	unsigned int vsc_region4_endp;
++	unsigned int vsc_start_phase_step;
++	unsigned int vsc_phase_ctrl;
++	unsigned int vsc_ini_phase;
++	unsigned int hsc_region12_startp;
++	unsigned int hsc_region34_startp;
++	unsigned int hsc_region4_endp;
++	unsigned int hsc_start_phase_step;
++	unsigned int hsc_region1_phase_slope;
++	unsigned int hsc_region3_phase_slope;
++	unsigned int hsc_phase_ctrl;
++	unsigned int sc_misc;
++	unsigned int hsc_phase_ctrl1;
++	unsigned int postblend_h_start_end;
++	unsigned int postblend_v_start_end;
++};
++
++extern const struct meson_vpp_video_regs meson_vpp_video_regs[2];
++
+ void meson_vpp_setup_mux(struct meson_drm *priv, unsigned int mux);
+ 
+ void meson_vpp_setup_interlace_vscaler_osd1(struct meson_drm *priv,
+-- 
+2.47.3
+

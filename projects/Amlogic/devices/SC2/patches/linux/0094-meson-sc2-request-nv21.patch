@@ -1,0 +1,248 @@
+From ab7317ae2a78458d9f6731c10a819d431c19418e Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Fri, 13 Nov 2026 04:28:47 +0800
+Subject: [PATCH] media: meson-sc2: Add linear NV21 Request capture
+
+The SC2 V4L HEVC and AV1 reference writers select VU double-write order
+by clearing SAO_CTRL1 bit 8 after loading the little-endian byte lanes.
+Carry the negotiated CAPTURE fourcc into each output job and program
+that writer selection for NV21, without changing compressed references.
+
+Expose NV21 after the existing formats, preserve NV12 defaults and HEVC
+AMF0 index 1, and validate linear versus full-depth compressed output.
+Keep IPP compressed-reference state independent of CAPTURE chroma order.
+Migrate the shared stateful job initializer without expanding its FBC
+formats or weakening DMA pinning, reference ownership or drain checks.
+
+Document the one-memory-plane layout and padded chroma offset. This
+source candidate requires matching PRIME userspace and subsequent real
+HEVC/AV1 pixel and display acceptance; no hardware pass is claimed.
+
+Change-Id: I6c3ca0a8531c4e40294efe77144d8aeceb7ce6f0
+---
+ .../media/v4l/pixfmt-reserved.rst             | 13 +++++++----
+ .../platform/amlogic/meson-sc2-vdec/Kconfig   |  2 +-
+ .../amlogic/meson-sc2-vdec/meson_sc2_av1.h    |  7 ++++--
+ .../amlogic/meson-sc2-vdec/meson_sc2_hw.c     | 15 ++++++++----
+ .../amlogic/meson-sc2-vdec/meson_sc2_hw.h     |  2 ++
+ .../meson-sc2-vdec/meson_sc2_stateful.c       |  1 +
+ .../amlogic/meson-sc2-vdec/meson_sc2_vdec.c   | 23 +++++++++++++++----
+ 7 files changed, 47 insertions(+), 16 deletions(-)
+
+diff --git a/Documentation/userspace-api/media/v4l/pixfmt-reserved.rst b/Documentation/userspace-api/media/v4l/pixfmt-reserved.rst
+index 76ed21e39215..845b8c2478dc 100644
+--- a/Documentation/userspace-api/media/v4l/pixfmt-reserved.rst
++++ b/Documentation/userspace-api/media/v4l/pixfmt-reserved.rst
+@@ -311,10 +311,15 @@ PRIME formatter. ``AMF8`` is the stateful VP9/AVS2 eight-bit counterpart. These
+ are not NV12, P010, Raspberry Pi NC30, AM21C, or portable compressed files.
+ Applications must negotiate the exact fourcc for the parsed depth; ten-bit
+ input paired with eight-bit CAPTURE is rejected rather than truncated.
+-HEVC Main8 and AV1 Request capture remain NV12, unchanged by the stateful node.
+-
+-CAPTURE uses the multi-planar API with one memory plane, zero ``bytesperline``
+-(there is no CPU-linear row pitch), and width/height rounded up to 64 pixels.
++HEVC Main8 and AV1 Request capture use linear NV12 or NV21. Both have one
++memory plane, equal Y/chroma pitches, and 64-pixel padded dimensions. The
++interleaved UV (NV12) or VU (NV21) region starts at ``bytesperline`` times
++the padded CAPTURE height, not the visible height. The default remains NV12;
++the linear chroma order does not change the private compressed references.
++
++``AMF0``/``AMF8`` CAPTURE uses the multi-planar API with one memory plane,
++zero ``bytesperline`` (there is no CPU-linear row pitch), and width/height
++rounded up to 64 pixels.
+ The coded rectangle is returned by ``V4L2_SEL_TGT_COMPOSE``. For the returned
+ padded dimensions ``W`` and ``H``, the allocation layout is:
+ 
+diff --git a/drivers/media/platform/amlogic/meson-sc2-vdec/Kconfig b/drivers/media/platform/amlogic/meson-sc2-vdec/Kconfig
+index ab4a417a1596..0b875bfdc807 100644
+--- a/drivers/media/platform/amlogic/meson-sc2-vdec/Kconfig
++++ b/drivers/media/platform/amlogic/meson-sc2-vdec/Kconfig
+@@ -15,7 +15,7 @@ config VIDEO_MESON_SC2_HEVC
+ 	  HEVC OUTPUT contains frame-based native slice controls and raw NAL
+ 	  units without start codes. AV1 OUTPUT tile offsets address coded tile
+ 	  bytes; sequence/frame headers are rebuilt from native AV1 controls.
+-	  Main8 CAPTURE is contiguous NV12. HEVC Main10 CAPTURE uses the local
++	  Main8 CAPTURE is contiguous NV12 or NV21. HEVC Main10 CAPTURE uses the local
+ 	  proposed AMF0 Amlogic scatter-FBC ABI with exported vb2-owned header/body
+ 	  storage, not an eight-bit preview. AV1 supports fixed output size
+ 	  <=1920x1088, superresolution, 64x64/128x128 superblocks and <=256 tiles.
+diff --git a/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_av1.h b/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_av1.h
+index 56cecccea18d..0706d7b162b6 100644
+--- a/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_av1.h
++++ b/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_av1.h
+@@ -676,7 +676,7 @@ static int sc2_av1_validate(struct meson_sc2_hevc_context *ctx,
+     bool intra = f->frame_type == V4L2_AV1_KEY_FRAME ||
+                  f->frame_type == V4L2_AV1_INTRA_ONLY_FRAME;
+ 
+-    /* Main8 NV12 only. DW8 is not full-depth Main10. The stock workspace
++    /* Main8 NV12/NV21 only. DW8 is not full-depth Main10. The stock workspace
+      * capacities are the <=1920x1088 layout, not an invented 4K layout. */
+     if (s->seq_profile || s->bit_depth != 8 || width < 64 || height < 64 ||
+         width > 1920 || height > 1088 || (height & 1) ||
+@@ -701,6 +701,8 @@ static int sc2_av1_validate(struct meson_sc2_hevc_context *ctx,
+     if (!owner || (owner->context && owner->context != ctx) ||
+         owner->surface.width != f->upscaled_width || owner->surface.height != height ||
+         owner->surface.depth != 8 || owner->surface.mv_size < SZ_1M ||
++        (out->output_format != V4L2_PIX_FMT_NV12 &&
++         out->output_format != V4L2_PIX_FMT_NV21) ||
+         !out->output_buffer || out->output_stride != ALIGN(f->upscaled_width, 64) ||
+         out->output_uv_offset != out->output_stride * ALIGN(height, 64) ||
+         out->output_size < out->output_uv_offset * 3 / 2 ||
+@@ -860,7 +862,8 @@ static void sc2_av1_program(struct meson_sc2_hevc_context *ctx,
+     sc2_write(hw, HEVC_SAO_C_WPTR,
+               lower_32_bits(hw->output_dma) + out->output_uv_offset);
+     value = sc2_read(hw, HEVC_SAO_CTRL1) & ~(0x3000 | 0xff0 | 3 | (3 << 14));
+-    sc2_write(hw, HEVC_SAO_CTRL1, value | 0xff0 | BIT(8) | (2 << 14));
++    sc2_write(hw, HEVC_SAO_CTRL1, value |
++              (out->output_format == V4L2_PIX_FMT_NV21 ? 0xef0 : 0xff0) | (2 << 14));
+     value = sc2_read(hw, HEVCD_IPP_AXIIF_CONFIG) & ~(0x30 | 0xf | BIT(12) | (3 << 8));
+     sc2_write(hw, HEVCD_IPP_AXIIF_CONFIG, value | 0xf | (2 << 8));
+     av1_seq_filters(st, hw, p);
+diff --git a/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_hw.c b/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_hw.c
+index 9c7ebdfad609..5edc10ee319a 100644
+--- a/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_hw.c
++++ b/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_hw.c
+@@ -24,6 +24,7 @@
+ #include <linux/soc/amlogic/meson-sc2-dos.h>
+ #include <linux/string.h>
+ #include <linux/wait.h>
++#include <linux/videodev2.h>
+ 
+ #include "meson_sc2_hw.h"
+ #include "hevc_request_syntax.h"
+@@ -1174,8 +1175,11 @@ static int sc2_program_slice(struct meson_sc2_hevc_context *ctx,
+ 		sc2_write(hw, HEVC_DBLK_STS1 + 16, BIT(28));
+ 	}
+ 	value = sc2_read(hw, HEVC_SAO_CTRL1) & ~(0x3000 | 0xff0 | 3 | (3 << 14));
+-	sc2_write(hw, HEVC_SAO_CTRL1, value | 0xff0 | (2 << 14));
+-	value = sc2_read(hw, HEVCD_IPP_AXIIF_CONFIG) & ~(0x30 | 0xf | (3 << 8));
++	/* SAO chroma byte-lane bit 8 selects UV (NV12) versus VU (NV21). */
++	sc2_write(hw, HEVC_SAO_CTRL1, value |
++		  (job->output_format == V4L2_PIX_FMT_NV21 ? 0xef0 : 0xff0) | (2 << 14));
++	/* References stay compressed; do not apply CAPTURE's VU swap to IPP. */
++	value = sc2_read(hw, HEVCD_IPP_AXIIF_CONFIG) & ~(0x30 | 0xf | BIT(12) | (3 << 8));
+ 	sc2_write(hw, HEVCD_IPP_AXIIF_CONFIG, value | 0xf | (2 << 8));
+ 	filter = disabled << 2;
+ 	if (!disabled)
+@@ -1235,11 +1239,14 @@ static int sc2_validate_job(struct meson_sc2_hevc_context *ctx,
+ 	    job->output_buffer->size < job->output_size)
+ 		return -EINVAL;
+ 	if (sps->bit_depth_luma_minus8 == 2) {
+-		if (!job->destination->capture_owned ||
++		if (job->output_format != V4L2_PIX_FMT_AMLOGIC_FBC10 ||
++		    !job->destination->capture_owned ||
+ 		    job->output_size != meson_sc2_hevc_fbc_size(width, height) ||
+ 		    !ctx->dw8 || ctx->dw8_size < uv + uv / 2)
+ 			return -EINVAL;
+-	} else if (job->destination->capture_owned || job->output_size < uv + uv / 2) {
++	} else if ((job->output_format != V4L2_PIX_FMT_NV12 &&
++		    job->output_format != V4L2_PIX_FMT_NV21) ||
++		   job->destination->capture_owned || job->output_size < uv + uv / 2) {
+ 		return -EINVAL;
+ 	}
+ 	owner = sc2_owner(ctx->hw, job->destination);
+diff --git a/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_hw.h b/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_hw.h
+index 72b0719390f1..6135999f86da 100644
+--- a/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_hw.h
++++ b/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_hw.h
+@@ -43,6 +43,8 @@ struct meson_sc2_hevc_job {
+ 	dma_addr_t output_dma;
+ 	size_t output_size;
+ 	u32 output_stride;
++	/* Negotiated V4L2 CAPTURE fourcc, separate from FBC reference depth. */
++	u32 output_format;
+ 	/* Caller-owned allocation; hardware pins it until DMA is quiescent. */
+ 	struct dma_buf *output_buffer;
+ 	u32 output_uv_offset;
+diff --git a/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_stateful.c b/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_stateful.c
+index 067ef4c30f25..16e09675a263 100644
+--- a/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_stateful.c
++++ b/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_stateful.c
+@@ -816,6 +816,7 @@ static int sc2_stateful_decode(struct sc2_stateful_ctx *ctx,
+ 		output.destination = &dst->surface;
+ 		output.output_dma = vb2_dma_contig_plane_dma_addr(&dst->m2m.vb.vb2_buf, 0);
+ 		output.output_size = ctx->capture_fmt.plane_fmt[0].sizeimage;
++		output.output_format = ctx->capture_fmt.pixelformat;
+ 		output.output_buffer = dst->export;
+ 	}
+ 	if (sc2_stateful_avs2(ctx)) {
+diff --git a/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_vdec.c b/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_vdec.c
+index 8bded3119427..a81af5d469a6 100644
+--- a/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_vdec.c
++++ b/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_vdec.c
+@@ -95,7 +95,9 @@ static void sc2_capture_format(struct sc2_ctx *ctx,
+ 	bool fbc = pix->pixelformat == V4L2_PIX_FMT_AMLOGIC_FBC10 &&
+ 		   ctx->source_fmt.pixelformat == V4L2_PIX_FMT_HEVC_SLICE;
+ 
+-	pix->pixelformat = fbc ? V4L2_PIX_FMT_AMLOGIC_FBC10 : V4L2_PIX_FMT_NV12;
++	pix->pixelformat = fbc ? V4L2_PIX_FMT_AMLOGIC_FBC10 :
++		pix->pixelformat == V4L2_PIX_FMT_NV21 ? V4L2_PIX_FMT_NV21 :
++		V4L2_PIX_FMT_NV12;
+ 	pix->width = ALIGN(ctx->source_fmt.width, 64);
+ 	pix->height = ALIGN(ctx->source_fmt.height, 64);
+ 	pix->field = V4L2_FIELD_NONE;
+@@ -178,16 +180,22 @@ static int sc2_set_fmt(struct file *file, void *priv, struct v4l2_format *f)
+ static int sc2_enum_fmt(struct file *file, void *priv, struct v4l2_fmtdesc *f)
+ {
+ 	struct sc2_ctx *ctx = sc2_file_ctx(file);
+-	unsigned int last = V4L2_TYPE_IS_OUTPUT(f->type) ||
+-		ctx->source_fmt.pixelformat == V4L2_PIX_FMT_HEVC_SLICE;
++	bool output = V4L2_TYPE_IS_OUTPUT(f->type);
++	bool hevc = ctx->source_fmt.pixelformat == V4L2_PIX_FMT_HEVC_SLICE;
++	unsigned int last = !output && hevc ? 2 : 1;
+ 
+ 	if (f->index > last)
+ 		return -EINVAL;
+-	if (V4L2_TYPE_IS_OUTPUT(f->type)) {
++	if (output) {
+ 		f->pixelformat = f->index ? V4L2_PIX_FMT_AV1_FRAME : V4L2_PIX_FMT_HEVC_SLICE;
+ 		f->flags = V4L2_FMT_FLAG_COMPRESSED;
+ 	} else {
+-		f->pixelformat = f->index ? V4L2_PIX_FMT_AMLOGIC_FBC10 : V4L2_PIX_FMT_NV12;
++		if (!f->index)
++			f->pixelformat = V4L2_PIX_FMT_NV12;
++		else if (f->index == 1 && hevc)
++			f->pixelformat = V4L2_PIX_FMT_AMLOGIC_FBC10;
++		else
++			f->pixelformat = V4L2_PIX_FMT_NV21;
+ 	}
+ 	return 0;
+ }
+@@ -198,6 +206,7 @@ static int sc2_enum_framesizes(struct file *file, void *priv,
+ 	if (f->index || (f->pixel_format != V4L2_PIX_FMT_HEVC_SLICE &&
+ 			f->pixel_format != V4L2_PIX_FMT_AV1_FRAME &&
+ 			f->pixel_format != V4L2_PIX_FMT_NV12 &&
++			f->pixel_format != V4L2_PIX_FMT_NV21 &&
+ 			f->pixel_format != V4L2_PIX_FMT_AMLOGIC_FBC10))
+ 		return -EINVAL;
+ 	f->type = V4L2_FRMSIZE_TYPE_STEPWISE;
+@@ -205,11 +214,13 @@ static int sc2_enum_framesizes(struct file *file, void *priv,
+ 	f->stepwise.max_width = f->pixel_format == V4L2_PIX_FMT_AV1_FRAME ?
+ 		1920 : SC2_MAX_WIDTH;
+ 	f->stepwise.step_width = f->pixel_format == V4L2_PIX_FMT_NV12 ||
++		f->pixel_format == V4L2_PIX_FMT_NV21 ||
+ 		f->pixel_format == V4L2_PIX_FMT_AMLOGIC_FBC10 ? 64 : 2;
+ 	f->stepwise.min_height = 64;
+ 	f->stepwise.max_height = f->pixel_format == V4L2_PIX_FMT_AV1_FRAME ?
+ 		1088 : SC2_MAX_HEIGHT;
+ 	f->stepwise.step_height = f->pixel_format == V4L2_PIX_FMT_NV12 ||
++		f->pixel_format == V4L2_PIX_FMT_NV21 ||
+ 		f->pixel_format == V4L2_PIX_FMT_AMLOGIC_FBC10 ? 64 : 2;
+ 	return 0;
+ }
+@@ -726,6 +737,7 @@ static int sc2_prepare_job(struct sc2_ctx *ctx, struct vb2_v4l2_buffer *src,
+ 	job->output_dma = vb2_dma_contig_plane_dma_addr(&dst->m2m.vb.vb2_buf, 0);
+ 	job->output_size = ctx->capture_fmt.plane_fmt[0].sizeimage;
+ 	job->output_stride = ctx->capture_fmt.width;
++	job->output_format = ctx->capture_fmt.pixelformat;
+ 	job->output_uv_offset = job->output_stride * ctx->capture_fmt.height;
+ 	job->output_buffer = dst->output_buffer;
+ 	return 0;
+@@ -774,6 +786,7 @@ static int sc2_decode_av1(struct sc2_ctx *ctx, struct vb2_v4l2_buffer *src,
+ 	job.output.output_dma = vb2_dma_contig_plane_dma_addr(&dst->m2m.vb.vb2_buf, 0);
+ 	job.output.output_size = ctx->capture_fmt.plane_fmt[0].sizeimage;
+ 	job.output.output_stride = ctx->capture_fmt.plane_fmt[0].bytesperline;
++	job.output.output_format = ctx->capture_fmt.pixelformat;
+ 	job.output.output_uv_offset = job.output.output_stride * ctx->capture_fmt.height;
+ 	job.output.output_buffer = dst->output_buffer;
+ 	job.timestamp = src->vb2_buf.timestamp;

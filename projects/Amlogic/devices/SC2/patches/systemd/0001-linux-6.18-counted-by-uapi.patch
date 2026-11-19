@@ -1,0 +1,25 @@
+Subject: [PATCH] basic: match counted_by annotation in Linux 6.18 UAPI
+
+The SC2 target uses Linux 6.18.57 headers. systemd 255's vendored
+src/basic/linux/stddef.h shadows the sysroot header and predates the
+__counted_by annotation used by vhost_features_array.
+
+Copy the userspace annotation definition from Linux 6.18.57's
+include/uapi/linux/stddef.h. It has no effect on userspace layout and
+matches the exported kernel contract; keep vmspawn and vhost declarations
+intact instead of disabling consumers or defining compiler-wide macros.
+
+---
+diff --git a/src/basic/linux/stddef.h b/src/basic/linux/stddef.h
+--- a/src/basic/linux/stddef.h
++++ b/src/basic/linux/stddef.h
+@@ -43,4 +43,9 @@
+ 		struct { } __empty_ ## NAME; \
+ 		TYPE NAME[]; \
+ 	}
++
++#ifndef __counted_by
++#define __counted_by(m)
++#endif
++
+ #endif

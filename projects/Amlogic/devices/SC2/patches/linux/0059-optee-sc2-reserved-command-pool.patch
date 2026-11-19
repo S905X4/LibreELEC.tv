@@ -1,0 +1,51 @@
+From cff7ed8862e5474c71db71f93b346ac691f55a10 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Thu, 22 Oct 2026 02:51:36 +0800
+Subject: [PATCH] tee: optee: use negotiated reserved command pool for SC2
+
+The matched firmware rejects command pages in part of normal-world RAM.
+Prefer its negotiated reserved pool without disabling external dynamic
+SHM registration or changing generic firmware allocation.
+
+Change-Id: I2eecd385fe86168f11cf96e96cd71c246d74ae80
+---
+ .../bindings/arm/firmware/linaro,optee-tz.yaml           | 5 +++++
+ drivers/tee/optee/smc_abi.c                              | 9 ++++++++-
+ 2 files changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/Documentation/devicetree/bindings/arm/firmware/linaro,optee-tz.yaml b/Documentation/devicetree/bindings/arm/firmware/linaro,optee-tz.yaml
+index e3a97ac70e6675b3c965c7408e01223f9b92f917..b090e7f0631308ea8cce6662472ad46025cb7a35 100644
+--- a/Documentation/devicetree/bindings/arm/firmware/linaro,optee-tz.yaml
++++ b/Documentation/devicetree/bindings/arm/firmware/linaro,optee-tz.yaml
+@@ -24,6 +24,11 @@ description: |
+   clients must not issue GET_THREAD_COUNT and must use the existing
+   unknown-thread-count operation instead.
+ 
++  This firmware rejects command buffers in some otherwise usable
++  normal-world RAM. Driver allocations must use the reserved shared-memory
++  pool returned by GET_SHM_CONFIG. This does not override the advertised
++  dynamic shared-memory capability for external buffer registration.
++
+ properties:
+   $nodename:
+     const: optee
+diff --git a/drivers/tee/optee/smc_abi.c b/drivers/tee/optee/smc_abi.c
+index b16356059e63950a934f1ea266e3940fab43eb11..c789d0b37469e1c6373e24dca6a9812988b3ed7e 100644
+--- a/drivers/tee/optee/smc_abi.c
++++ b/drivers/tee/optee/smc_abi.c
+@@ -1768,7 +1768,14 @@ static int optee_probe(struct platform_device *pdev)
+ 	/*
+ 	 * Try to use dynamic shared memory if possible
+ 	 */
+-	if (sec_caps & OPTEE_SMC_SEC_CAP_DYNAMIC_SHM) {
++	/*
++	 * SC2 firmware rejects argument pages in part of normal-world RAM.
++	 * Use its negotiated reserved pool for driver allocations, including
++	 * registration commands. Keep DYNAMIC_SHM for external registrations.
++	 */
++	if ((sec_caps & OPTEE_SMC_SEC_CAP_DYNAMIC_SHM) &&
++	    !of_device_is_compatible(pdev->dev.of_node,
++				     "amlogic,meson-sc2-optee-tz")) {
+ 		/*
+ 		 * If we have OPTEE_SMC_SEC_CAP_RPC_ARG we can ask
+ 		 * optee_get_msg_arg() to pre-register (by having

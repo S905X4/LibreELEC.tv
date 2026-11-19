@@ -1,0 +1,30 @@
+From: hiper25 <whydonit@gmail.com>
+Subject: [PATCH] DVD Demux: retain parser frame rate during fast TS discovery
+
+The fast MPEG-TS path does not call avformat_find_stream_info. ParsePacket
+copies the parser's dimensions but drops its declared frame rate, leaving
+r_frame_rate unset even when the sequence header supplies it. An AVS+
+interlaced frame then reaches the native DI filter with duration zero and
+frame rate zero, so the filter correctly refuses to invent its timing.
+
+Carry a valid parser-declared rate into an absent or invalid stream rate.
+Keep existing demuxer timing authoritative; do not guess a default rate,
+change compressed packets or bypass the filter's duration requirement.
+
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+@@ -2336,6 +2336,14 @@ void CDVDDemuxFFmpeg::ParsePacket(AVPacket* pkt)
+           parser->second->m_codecCtx->extradata = nullptr;
+           parser->second->m_codecCtx->extradata_size = 0;
+ 
++          // Fast transport-stream discovery skips avformat_find_stream_info.
++          // Keep a declared rate from the parser when the demuxer has none;
++          // the first interlaced picture needs it before cadence estimation.
++          const AVRational frameRate = parser->second->m_codecCtx->framerate;
++          if ((st->r_frame_rate.num <= 0 || st->r_frame_rate.den <= 0) &&
++              frameRate.num > 0 && frameRate.den > 0)
++            st->r_frame_rate = frameRate;
++
+           if (parser->second->m_parserCtx->width != 0)
+           {
+             st->codecpar->width = parser->second->m_parserCtx->width;

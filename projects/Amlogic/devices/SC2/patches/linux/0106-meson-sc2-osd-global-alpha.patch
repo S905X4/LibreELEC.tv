@@ -1,0 +1,65 @@
+From fd81032487345cd841142adf11134d54716adefe Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Fri, 13 Nov 2026 19:24:41 +0800
+Subject: [PATCH] drm/meson: Expose SC2 OSD global alpha through atomic state
+
+Translate the standard primary-plane alpha range into the SC2 OSD
+nine-bit global-alpha field instead of always programming full opacity.
+Keep default opaque behavior and other SoCs unchanged, and reuse the
+existing shadow/atomic commit path for both linear and AFBC surfaces.
+
+The SC2 BSP programs bits20:12 with 0x100 as full opacity. Compile the
+actual plane object against the configured release kernel; hardware
+blend reception remains a separate acceptance condition.
+
+Change-Id: I048fd093bfed30985cf0af67b681bca96c9a216e
+---
+ drivers/gpu/drm/meson/meson_plane.c | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/meson/meson_plane.c b/drivers/gpu/drm/meson/meson_plane.c
+index 8cbb3d81b84c..e947281af857 100644
+--- a/drivers/gpu/drm/meson/meson_plane.c
++++ b/drivers/gpu/drm/meson/meson_plane.c
+@@ -150,9 +150,14 @@ static void meson_plane_atomic_update(struct drm_plane *plane,
+ 	int hf_bank_len;
+ 	int vf_bank_len;
+ 	u8 canvas_id_osd1;
++	u32 global_alpha = 0x100;
+ 	bool sc2_interlace = priv->sc2 &&
+ 		(new_state->crtc->mode.flags & DRM_MODE_FLAG_INTERLACE);
+ 
++	if (priv->sc2)
++		global_alpha = DIV_ROUND_CLOSEST(new_state->alpha * 0x100,
++					       DRM_BLEND_ALPHA_OPAQUE);
++
+ 	/*
+ 	 * Update Coordinates
+ 	 * Update Formats
+@@ -169,9 +174,9 @@ static void meson_plane_atomic_update(struct drm_plane *plane,
+ 	else
+ 		priv->viu.osd1_afbcd = false;
+ 
+-	/* Enable OSD and BLK0, set max global alpha */
++	/* SC2 exposes the OSD's nine-bit global alpha through atomic state. */
+ 	priv->viu.osd1_ctrl_stat = OSD_ENABLE |
+-				   (0x100 << OSD_GLOBAL_ALPHA_SHIFT) |
++				   (global_alpha << OSD_GLOBAL_ALPHA_SHIFT) |
+ 				   OSD_BLK0_ENABLE;
+ 
+ 	priv->viu.osd1_ctrl_stat2 = readl(priv->io_base +
+@@ -590,6 +595,11 @@ int meson_plane_create(struct meson_drm *priv)
+ 	}
+ 
+ 	drm_plane_helper_add(plane, &meson_plane_helper_funcs);
++	if (priv->sc2) {
++		ret = drm_plane_create_alpha_property(plane);
++		if (ret)
++			return ret;
++	}
+ 
+ 	/* For now, OSD Primary plane is always on the front */
+ 	drm_plane_create_zpos_immutable_property(plane, priv->sc2 ? 2 : 1);
+-- 
+2.47.3
+

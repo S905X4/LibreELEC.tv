@@ -1,0 +1,138 @@
+From a1a69af7359f1abae580303356c78f60ef0586c5 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Sun, 15 Nov 2026 00:39:04 +0800
+Subject: [PATCH] media: meson: keep SC2 CPU-only input queues out of CMA
+
+SC2 already copies compressed OUTPUT bytes into its coherent VIFIFO.
+Allocating every input slot from CMA needlessly competes with CAPTURE and
+4K GUI surfaces and exhausts the pool during native H264 playback.
+
+Use standard vmalloc storage for SC2 OUTPUT, retain counts and capacity,
+and leave CAPTURE, VIFIFO and other SoCs unchanged. Access a DMA-contig
+cookie only on the actual parser-DMA path. Bracket imported source CPU
+access while the queue mutex excludes dequeue and teardown.
+
+The RAM candidate passes full UHD pixels through MMAP and imported
+exported-source buffers, including owner-close and PREPARE cancellation.
+The unchanged failing Kodi clip now displays with the same4K GUI and EOF;
+no CMA/buffer/resolution reduction or clock change is used.
+
+Change-Id: I2b08a6c6ebf68387de1ccca367c3b589105cf113
+---
+ drivers/staging/media/meson/vdec/Kconfig    |  1 +
+ drivers/staging/media/meson/vdec/esparser.c | 32 +++++++++++++++++++--
+ drivers/staging/media/meson/vdec/vdec.c     |  8 +++++-
+ 3 files changed, 38 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/staging/media/meson/vdec/Kconfig b/drivers/staging/media/meson/vdec/Kconfig
+index 6dce6efa4fff..d8d728f41924 100644
+--- a/drivers/staging/media/meson/vdec/Kconfig
++++ b/drivers/staging/media/meson/vdec/Kconfig
+@@ -8,6 +8,7 @@ config VIDEO_MESON_VDEC
+ 	select MESON_SM if ARM64_4K_PAGES
+ 	select MESON_SC2_DOS
+ 	select VIDEOBUF2_DMA_CONTIG
++	select VIDEOBUF2_VMALLOC
+ 	select V4L2_MEM2MEM_DEV
+ 	select MESON_CANVAS
+ 	help
+diff --git a/drivers/staging/media/meson/vdec/esparser.c b/drivers/staging/media/meson/vdec/esparser.c
+index 9c736bddf095..36d2b09686b5 100644
+--- a/drivers/staging/media/meson/vdec/esparser.c
++++ b/drivers/staging/media/meson/vdec/esparser.c
+@@ -13,6 +13,7 @@
+ #include <linux/module.h>
+ #include <linux/reset.h>
+ #include <linux/interrupt.h>
++#include <linux/dma-buf.h>
+ #include <media/videobuf2-dma-contig.h>
+ #include <media/v4l2-mem2mem.h>
+ 
+@@ -336,7 +337,7 @@ esparser_queue(struct amvdec_session *sess, struct vb2_v4l2_buffer *vbuf)
+ 	struct amvdec_core *core = sess->core;
+ 	struct amvdec_codec_ops *codec_ops = sess->fmt_out->codec_ops;
+ 	u32 payload_size = vb2_get_plane_payload(vb, 0);
+-	dma_addr_t phy = vb2_dma_contig_plane_dma_addr(vb, 0);
++	dma_addr_t phy;
+ 	u32 num_dst_bufs = 0;
+ 	u32 offset;
+ 	u32 pad_size;
+@@ -436,6 +437,7 @@ esparser_queue(struct amvdec_session *sess, struct vb2_v4l2_buffer *vbuf)
+ 		return ret;
+ 	}
+ 	pad_size = esparser_pad_start_code(core, vb, payload_size);
++	phy = vb2_dma_contig_plane_dma_addr(vb, 0);
+ 	ret = esparser_write_data(core, phy, payload_size + pad_size);
+ 
+ 	if (ret <= 0) {
+@@ -489,10 +491,36 @@ void esparser_queue_all_src(struct work_struct *work)
+ 		return;
+ 	}
+ 	v4l2_m2m_for_each_src_buf_safe(sess->m2m_ctx, buf, n) {
++		struct dma_buf *input = NULL;
++		int ret, sync_ret;
++
+ 		if (sess->should_stop)
+ 			break;
+ 
+-		if (esparser_queue(sess, &buf->vb) < 0)
++		if (sess->core->platform->revision == VDEC_REVISION_SC2)
++			input = buf->vb.vb2_buf.planes[0].dbuf;
++		if (input) {
++			/* Some codec framing helpers also update the submitted bytes. */
++			ret = dma_buf_begin_cpu_access(input, DMA_BIDIRECTIONAL);
++			if (ret) {
++				dev_err(sess->core->dev, "input CPU access failed: %d\n", ret);
++				amvdec_abort(sess);
++				break;
++			}
++		}
++		ret = esparser_queue(sess, &buf->vb);
++		/* The session/queue mutex still excludes DQBUF and teardown, even
++		 * when esparser_queue has marked this source buffer DONE.
++		 */
++		if (input) {
++			sync_ret = dma_buf_end_cpu_access(input, DMA_BIDIRECTIONAL);
++			if (sync_ret) {
++				dev_err(sess->core->dev, "input CPU release failed: %d\n", sync_ret);
++				amvdec_abort(sess);
++				break;
++			}
++		}
++		if (ret < 0)
+ 			break;
+ 	}
+ 	mutex_unlock(&sess->lock);
+diff --git a/drivers/staging/media/meson/vdec/vdec.c b/drivers/staging/media/meson/vdec/vdec.c
+index 7f101bcd9468..24154d5e6c06 100644
+--- a/drivers/staging/media/meson/vdec/vdec.c
++++ b/drivers/staging/media/meson/vdec/vdec.c
+@@ -19,6 +19,7 @@
+ #include <media/v4l2-mem2mem.h>
+ #include <media/v4l2-dev.h>
+ #include <media/videobuf2-dma-contig.h>
++#include <media/videobuf2-vmalloc.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/firmware/meson/meson_sm.h>
+ #include "dos_regs.h"
+@@ -1263,7 +1264,11 @@ static int m2m_queue_init(void *priv, struct vb2_queue *src_vq,
+ 	src_vq->io_modes = VB2_MMAP | VB2_DMABUF;
+ 	src_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
+ 	src_vq->ops = &vdec_vb2_ops;
+-	src_vq->mem_ops = &vb2_dma_contig_memops;
++	/* SC2 copies compressed bytes into its coherent VIFIFO; only CAPTURE
++	 * and that hardware ring require physically contiguous DMA storage.
++	 */
++	src_vq->mem_ops = sess->core->platform->revision == VDEC_REVISION_SC2 ?
++		&vb2_vmalloc_memops : &vb2_dma_contig_memops;
+ 	src_vq->drv_priv = sess;
+ 	src_vq->buf_struct_size = sizeof(struct dummy_buf);
+ 	src_vq->min_queued_buffers = 1;
+@@ -1651,3 +1656,4 @@ module_platform_driver(meson_vdec_driver);
+ MODULE_DESCRIPTION("Meson video decoder driver for GXBB/GXL/GXM/G12/SM1/SC2");
+ MODULE_AUTHOR("Maxime Jourdan <mjourdan@baylibre.com>");
+ MODULE_LICENSE("GPL");
++MODULE_IMPORT_NS("DMA_BUF");
+-- 
+2.47.3
+

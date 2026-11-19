@@ -1,0 +1,143 @@
+From 962eed19fcc6013b98ca8da9ded52ac175fea103 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Sat, 14 Nov 2026 09:35:57 +0800
+Subject: [PATCH] media: meson-sc2-di: normalize linear field MIF descriptors
+
+Compact field canvases and fixed large bursts corrupt input-dependent
+widths and crops. Canvas byte reversal also displaces partial-word
+pixel masks. Keep full-frame canvases, select fields with the hardware
+repeat patterns and crop scopes, and bound bursts to source pitch.
+
+Use the reader and writer little-endian controls for linear NV12/NV21
+instead of relying on canvas byte swaps. Select old EI below 80 pixels
+for each job, so contexts cannot inherit another width policy.
+
+The unchanged nine-case width/crop/context sequence now returns 18
+complete fields with all visible pixels and timestamps exact. The
+original nonneutral chroma-tail failure remains; this change does not
+claim to fix that defect or add 422 support. DMA drain and quarantine
+are unchanged. Full-image production validation remains required.
+
+Change-Id: I3ee75279d0b60b7cf2c184eb4b3ed807d9eeef74
+---
+ .../platform/amlogic/meson-sc2-di/sc2-di.c    | 52 +++++++++++--------
+ 1 file changed, 31 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/media/platform/amlogic/meson-sc2-di/sc2-di.c b/drivers/media/platform/amlogic/meson-sc2-di/sc2-di.c
+index cf43b5603bf6..4badc73f47c9 100644
+--- a/drivers/media/platform/amlogic/meson-sc2-di/sc2-di.c
++++ b/drivers/media/platform/amlogic/meson-sc2-di/sc2-di.c
+@@ -27,6 +27,7 @@
+ #define DI_NAME "meson-sc2-di"
+ #define DI_POST_CTRL 0x1701
+ #define DI_POST_SIZE 0x1702
++#define DI_EI_CTRL3 0x1719
+ #define DI_INTR_CTRL 0x1730
+ #define DI_TOP_POST_CTRL 0x17c6
+ #define DI_POST_GL_CTRL 0x17c9
+@@ -148,7 +149,7 @@ static int di_canvas(struct sc2_di *di, unsigned int id, dma_addr_t addr,
+ {
+ 	return meson_canvas_config(di->canvas, di->canvas_id[id], addr,
+ 		stride, height, MESON_CANVAS_WRAP_NONE,
+-		MESON_CANVAS_BLKMODE_LINEAR, MESON_CANVAS_ENDIAN_SWAP64);
++		MESON_CANVAS_BLKMODE_LINEAR, 0);
+ }
+ 
+ static int di_program(struct sc2_di_ctx *ctx,
+@@ -158,21 +159,21 @@ static int di_program(struct sc2_di_ctx *ctx,
+ 	struct sc2_di *di = ctx->di;
+ 	const struct v4l2_rect *r = &ctx->crop;
+ 	unsigned int bottom = (src->field == V4L2_FIELD_INTERLACED_BT) ^ ctx->field;
+-	unsigned int p;
++	unsigned int p, burst_len = 2;
+ 	int ret;
+ 
+-	/* Separate canvases describe every other line: compact field view.
+-	 * No pixel copying, T7-only linear MIF addresses, or decoder canvases.
++	/* Decoder-backed frames retain their full canvas and field selection.
++	 * Crop scopes and repeat patterns select source rows without CPU copies.
+ 	 */
+ 	for (p = 0; p < 2; p++) {
+ 		u32 pitch = ctx->fmt[0].plane_fmt[p].bytesperline;
+-		u32 top = r->top >> p;
+-		u32 height = r->height >> (p + 1);
++		u32 height = ctx->fmt[0].height >> p;
+ 		dma_addr_t addr = vb2_dma_contig_plane_dma_addr(&src->vb2_buf, p) +
+-			src->vb2_buf.planes[p].data_offset +
+-			(top + bottom) * pitch + r->left;
++			src->vb2_buf.planes[p].data_offset;
+ 
+-		ret = di_canvas(di, p, addr, pitch * 2, height);
++		if (!IS_ALIGNED(pitch, 64))
++			burst_len = 1;
++		ret = di_canvas(di, p, addr, pitch, height);
+ 		if (ret)
+ 			return ret;
+ 		addr = vb2_dma_contig_plane_dma_addr(&dst->vb2_buf, p) +
+@@ -184,34 +185,44 @@ static int di_program(struct sc2_di_ctx *ctx,
+ 	}
+ 
+ 	di_write(di, DI_POST_GL_CTRL, 0x40200001);
+-	di_write(di, IF0_BASE + IF_GEN3, (3 << 4) | (2 << 1));
++	/* The newer EI filter requires at least 80 output pixels. */
++	di_write(di, DI_EI_CTRL3, (r->width >= 80 ? BIT(31) : 0) | 0x13);
++	di_write(di, IF0_BASE + IF_GEN3, (3 << 4) | (burst_len << 1));
+ 	/* SC2 set_di_mif_v3: chroma map 1=VU, 2=UV. */
+ 	di_write(di, IF0_BASE + IF_GEN2,
+ 		 ctx->fmt[0].pixelformat == V4L2_PIX_FMT_NV21M ? 1 : 2);
+ 	di_write(di, IF0_BASE + IF_CANVAS, di->canvas_id[0] |
+ 		 (di->canvas_id[1] << 8) | (di->canvas_id[1] << 16));
+-	di_write(di, IF0_BASE + IF_X, (r->width - 1) << 16);
+-	di_write(di, IF0_BASE + IF_Y, (r->height / 2 - 1) << 16);
+-	di_write(di, IF0_BASE + IF_CX, (r->width / 2 - 1) << 16);
+-	di_write(di, IF0_BASE + IF_CY, (r->height / 4 - 1) << 16);
+-	di_write(di, IF0_BASE + IF_RPT, 0);
+-	di_write(di, IF0_BASE + IF_YPAT, 0);
+-	di_write(di, IF0_BASE + IF_CPAT, 0);
++	di_write(di, IF0_BASE + IF_X,
++		 ((r->left + r->width - 1) << 16) | r->left);
++	di_write(di, IF0_BASE + IF_Y,
++		 ((r->top + r->height - 1) << 16) | (r->top + bottom));
++	di_write(di, IF0_BASE + IF_CX,
++		 ((r->left / 2 + r->width / 2 - 1) << 16) | (r->left / 2));
++	di_write(di, IF0_BASE + IF_CY,
++		 ((r->top / 2 + r->height / 2 - 1) << 16) |
++		 (r->top / 2 + bottom));
++	di_write(di, IF0_BASE + IF_RPT, 0x1111);
++	di_write(di, IF0_BASE + IF_YPAT, 0x80);
++	di_write(di, IF0_BASE + IF_CPAT, 0x80);
+ 	di_write(di, IF0_BASE + IF_DUMMY, 0x00808000);
+ 	di_write(di, IF0_BASE + IF_FIFO, 0x120);
+-	/* Compact interlaced 420 field: vertical 2:1 chroma interpolation. */
++	/* Ordinary IF0 field mode: phase0, step8; no decoder phase override. */
+ 	di_write(di, IF0_BASE + IF_FMT,
+ 		 BIT(21) | BIT(20) | BIT(17) | (8 << 1) | BIT(0));
+ 	di_write(di, IF0_BASE + IF_FMT_W, (r->width << 16) | (r->width / 2));
+ 	di_write(di, IF0_BASE + IF_GEN,
+-		 BIT(29) | BIT(25) | (8 << 19) | BIT(18) | BIT(6) | BIT(1) | BIT(0));
++		 BIT(29) | BIT(25) | (8 << 19) | BIT(18) | BIT(6) |
++		 BIT(4) | BIT(1) | BIT(0));
+ 	di_write(di, DIWR_X, r->width - 1);
+ 	di_write(di, DIWR_Y, r->height - 1);
+ 	di_write(di, DIWR_CANVAS, di->canvas_id[2] | (di->canvas_id[3] << 8));
+ 	/* SC2 set_wrmif_simple_v3: bit17=0 writes VU, bit17=1 writes UV.
+ 	 * Input and output order are independent hardware MIF selections.
+ 	 */
+-	di_write(di, DIWR_CTRL, BIT(0) | BIT(3) | (3 << 4) | (2 << 22) |
++	/* The writer, not the destination canvas, orders linear output bytes. */
++	di_write(di, DIWR_CTRL, BIT(0) | BIT(2) | BIT(3) | (3 << 4) |
++		 (2 << 22) |
+ 		 (2 << 26) |
+ 		 (ctx->fmt[1].pixelformat == V4L2_PIX_FMT_NV12M ? BIT(17) : 0));
+ 	di_write(di, DI_POST_GL_THD, 8 << 16);
+@@ -746,7 +757,6 @@ static int di_runtime_resume(struct device *dev)
+ 	di_write(di, 0x1704, 0x00ff0100);
+ 	di_write(di, 0x1705, 0x5a0a0f2d);
+ 	di_write(di, 0x1706, 0x050a0a5d);
+-	di_write(di, 0x1719, 0x80000013);
+ 	di_update(di, 0x2028, GENMASK(31, 30), GENMASK(31, 30));
+ 	di_write(di, DI_INTR_CTRL, 0xcfffffff);
+ 	enable_irq(di->irq);
+-- 
+2.47.3
+

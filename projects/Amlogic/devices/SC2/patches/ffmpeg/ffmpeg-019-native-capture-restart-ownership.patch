@@ -1,0 +1,98 @@
+Subject: [PATCH] v4l2m2m: serialize capture startup with frame returns
+
+A frame can be released by the renderer after stuff_all_buffers() has
+scanned AVAILABLE buffers but before set_streamon() publishes streamon.
+The release callback leaves that buffer AVAILABLE because it still sees
+the stopped queue; no subsequent action queues it. A native restart waits
+for every retained CAPTURE buffer before rebuilding its firmware pool, so
+one such return can prevent all further decoding until the queues are
+cancelled again.
+
+Hold the existing context mutex across the availability scan, STREAMON
+and streamon publication, as STREAMOFF already does. Initialize the
+context before taking its mutex, keep downstream-held frames untouched,
+and return queueing failures rather than starting an incompletely queued
+CAPTURE context. No buffer counts, decode errors or drain rules change.
+
+--- a/libavcodec/v4l2_context.c
++++ b/libavcodec/v4l2_context.c
+@@ -964,20 +964,12 @@
+     atomic_store(&ctx->q_count, 0);
+ }
+ 
+-static int stuff_all_buffers(AVCodecContext * avctx, V4L2Context* ctx)
++/* Caller holds ctx->lock through STREAMON and publication of streamon. */
++static int stuff_all_buffers(V4L2Context *ctx)
+ {
+     int i;
+-    int rv;
+-
+-    if (!ctx->bufrefs) {
+-        rv = ff_v4l2_context_init(ctx);
+-        if (rv) {
+-            av_log(avctx, AV_LOG_ERROR, "can't request capture buffers\n");
+-            return rv;
+-        }
+-    }
++    int rv = 0;
+ 
+-    ff_mutex_lock(&ctx->lock);
+     for (i = 0; i < ctx->num_buffers; ++i) {
+         struct V4L2Buffer * const buf = (struct V4L2Buffer *)ctx->bufrefs[i]->data;
+         if (buf->status == V4L2BUF_AVAILABLE) {
+@@ -986,7 +978,6 @@
+                 break;
+         }
+     }
+-    ff_mutex_unlock(&ctx->lock);
+     return rv;
+ }
+ 
+@@ -994,15 +985,34 @@
+ {
+     int type = ctx->type;
+     int ret = 0;
++    int has_bufs;
++
++    if (!V4L2_TYPE_IS_OUTPUT(ctx->type) && !ctx->bufrefs) {
++        ret = ff_v4l2_context_init(ctx);
++        if (ret < 0) {
++            av_log(avctx, AV_LOG_ERROR, "can't request capture buffers\n");
++            return ret;
++        }
++    }
++
++    has_bufs = ctx_buffers_alloced(ctx);
++    if (has_bufs)
++        ff_mutex_lock(&ctx->lock);
+ 
+-    if (!V4L2_TYPE_IS_OUTPUT(ctx->type))
+-        stuff_all_buffers(avctx, ctx);
++    /* A concurrent frame release must either precede the availability scan
++     * or observe streamon and enqueue itself. Do not leave a gap between them.
++     */
++    if (!V4L2_TYPE_IS_OUTPUT(ctx->type)) {
++        ret = stuff_all_buffers(ctx);
++        if (ret < 0)
++            goto unlock;
++    }
+ 
+     if (ioctl(ctx_to_m2mctx(ctx)->fd, VIDIOC_STREAMON, &type) < 0) {
+         ret = AVERROR(errno);
+         av_log(avctx, AV_LOG_ERROR, "%s set status ON failed: err=%s\n", ctx->name,
+                av_err2str(ret));
+-        return ret;
++        goto unlock;
+     }
+ 
+     ctx->first_buf = 1;
+@@ -1009,6 +1019,9 @@
+     ctx->streamon = 1;
+     ctx->flag_last = 0;
+     av_log(avctx, AV_LOG_DEBUG, "%s set status ON OK\n", ctx->name);
++unlock:
++    if (has_bufs)
++        ff_mutex_unlock(&ctx->lock);
+     return ret;
+ }
+ 

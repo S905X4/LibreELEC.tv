@@ -1,0 +1,39 @@
+From b860cc7425e661080deef50899fc09964acdbd97 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Sat, 14 Nov 2026 00:42:31 +0800
+Subject: [PATCH] drm: meson: match SC2 no-primary bottom-field repeat count
+
+The normal primary-owned 2:1 interlace scaler decrements bottom repeat
+when its phase wraps at 0x10000. The no-primary shared scaler instead
+hard-coded one repeat, changing VSC_CTRL0 from 0x03802124 to 0x03812124
+when AFBC siblings survive OSD1 removal. Actual 1080i50 reception then
+collapses those two rectangles even though all PPS dimensions are valid.
+
+Use the same zero bottom-repeat count as the primary's existing 2:1
+calculation. Preserve progressive output, phase 0x80008000, geometry,
+source routing, AFBC ownership and every other field parameter.
+A receiver discriminator clearing only bit16 restores both rectangles.
+
+Change-Id: I9a1f9df85e12e0c05a152c04bb5d9cc116a727e2
+---
+ drivers/gpu/drm/meson/meson_crtc.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/meson/meson_crtc.c b/drivers/gpu/drm/meson/meson_crtc.c
+index 86e26f2b5c81..d6ee87ef55d4 100644
+--- a/drivers/gpu/drm/meson/meson_crtc.c
++++ b/drivers/gpu/drm/meson/meson_crtc.c
+@@ -183,8 +183,9 @@ static void meson_crtc_sc2_output_scaler(struct meson_drm *priv, bool enabled)
+ 	/* Without a primary FB, the composition domain is the full mode. */
+ 	writel_relaxed(interlace ? 2 << 24 : 0, priv->io_base + _REG(base));
+ 	writel_relaxed(interlace ? 0x80008000 : 0, priv->io_base + _REG(base + 1));
++	/* A 2:1 phase wraps once, so OSD1's bottom repeat count is zero. */
+ 	writel_relaxed(interlace ? BIT(25) | BIT(24) | BIT(23) |
+-			(1 << 16) | (4 << 11) | (1 << 8) | (4 << 3) | 4 : 0,
++			(4 << 11) | (1 << 8) | (4 << 3) | 4 : 0,
+ 			priv->io_base + _REG(base + 2));
+ 	writel_relaxed(0, priv->io_base + _REG(base + 3));
+ 	writel_relaxed(0, priv->io_base + _REG(base + 4));
+-- 
+2.47.3
+

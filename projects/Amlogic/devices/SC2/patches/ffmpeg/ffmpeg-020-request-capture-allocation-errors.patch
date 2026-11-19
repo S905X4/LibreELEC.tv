@@ -1,0 +1,24 @@
+Subject: [PATCH] avcodec: keep CREATE_BUFS failures negative
+
+create_dst_bufs() saves -errno, but negates it a second time when returning.
+Its caller treats that positive value as an allocated buffer count. A
+failed allocation can therefore publish uncreated qents and walk beyond
+the requested qent array, instead of returning an allocation failure.
+
+Return the saved negative error so the existing failure path releases the
+uncreated qents without indexing or publishing them. Compare it with
+-EINTR so interrupted calls actually retry. Preserve partial-success
+handling; do not change pool size or codec DPB demand.
+
+--- a/libavcodec/v4l2_req_media.c
++++ b/libavcodec/v4l2_req_media.c
+@@ -1160,7 +1160,7 @@ static int create_dst_bufs(struct mediabufs_ctl *const mbc, unsigned int n, struct qent_dst * const qes[])
+         const int err = -errno;
+-        if (err != EINTR) {
++        if (err != -EINTR) {
+             request_err(mbc->dc, "%s: Failed to create V4L2 buffer\n", __func__);
+-            return -err;
++            return err;
+         }
+     }
+ 

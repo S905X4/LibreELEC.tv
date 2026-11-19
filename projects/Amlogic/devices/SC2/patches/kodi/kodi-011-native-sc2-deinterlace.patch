@@ -1,0 +1,259 @@
+Subject: [PATCH] DRM PRIME: route interlaced native SC2 surfaces through field-rate EI
+
+Keep progressive Request HEVC/AV1 unchanged. The SC2-only hardware filter
+produces two progressive DRM PRIME outputs and carries their actual PTS.
+Destroy the filter graph at seek to abort DMA and drop queued fields;
+exported downstream buffers keep their independent lifetime. No MA/MC claim.
+Carry completed field durations through an explicit VideoPicture flag honored
+by the player, including streams without PTS/DTS. Progressive timing is unchanged.
+
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h
+@@ -33,6 +33,9 @@
+ 
+ protected:
+   void Drain();
++  void ResetDeinterlace();
++  int EnsureDeinterlace();
++  int ReceiveFrame();
+   void SetPictureParams(VideoPicture* pVideoPicture);
+   void UpdateProcessInfo(struct AVCodecContext* avctx, const enum AVPixelFormat fmt);
+   static enum AVPixelFormat GetFormat(struct AVCodecContext* avctx, const enum AVPixelFormat* fmt);
+@@ -44,5 +47,11 @@
+   double m_DAR = 1.0;
+   AVCodecContext* m_pCodecContext = nullptr;
+   AVFrame* m_pFrame = nullptr;
++  struct AVFilterGraph* m_deinterlaceGraph = nullptr;
++  struct AVFilterContext* m_deinterlaceSource = nullptr;
++  struct AVFilterContext* m_deinterlaceSink = nullptr;
++  bool m_deinterlaceDraining = false;
++  int m_deinterlaceWidth = 0;
++  int m_deinterlaceHeight = 0;
+   std::shared_ptr<IVideoBufferPool> m_videoBufferPool;
+ };
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
+@@ -28,6 +28,10 @@
+ extern "C"
+ {
+ #include <libavcodec/avcodec.h>
++#include <libavfilter/avfilter.h>
++#include <libavfilter/buffersink.h>
++#include <libavfilter/buffersrc.h>
++#include <libavutil/mathematics.h>
+ #include <libavutil/error.h>
+ #include <libavutil/imgutils.h>
+ #include <libavutil/opt.h>
+@@ -95,6 +99,7 @@
+ 
+ CDVDVideoCodecDRMPRIME::~CDVDVideoCodecDRMPRIME()
+ {
++  ResetDeinterlace();
+   av_frame_free(&m_pFrame);
+   avcodec_free_context(&m_pCodecContext);
+ }
+@@ -450,6 +455,8 @@
+ 
+ void CDVDVideoCodecDRMPRIME::Reset()
+ {
++  // STREAMOFF the DI graph before flushing decoder ownership on a seek.
++  ResetDeinterlace();
+   if (!m_pCodecContext)
+     return;
+ 
+@@ -585,6 +592,13 @@
+   pVideoPicture->iFlags |= m_pFrame->interlaced_frame ? DVP_FLAG_INTERLACED : 0;
+   pVideoPicture->iFlags |= m_pFrame->top_field_first ? DVP_FLAG_TOP_FIELD_FIRST : 0;
+   pVideoPicture->iFlags |= m_pFrame->data[0] ? 0 : DVP_FLAG_DROPPED;
++  // Completed DI fields, not source frames, determine presentation cadence.
++  if (m_deinterlaceGraph && m_pFrame->duration > 0)
++  {
++    pVideoPicture->iFlags |= DVP_FLAG_FIELD_DURATION;
++    pVideoPicture->iDuration =
++        static_cast<double>(m_pFrame->duration) * DVD_TIME_BASE / AV_TIME_BASE;
++  }
+ 
+   if (m_codecControlFlags & DVD_CODEC_CTRL_DROP)
+   {
+@@ -598,12 +612,149 @@
+   pVideoPicture->dts = DVD_NOPTS_VALUE;
+ }
+ 
++void CDVDVideoCodecDRMPRIME::ResetDeinterlace()
++{
++  avfilter_graph_free(&m_deinterlaceGraph);
++  m_deinterlaceSource = nullptr;
++  m_deinterlaceSink = nullptr;
++  m_deinterlaceDraining = false;
++  m_deinterlaceWidth = m_deinterlaceHeight = 0;
++  m_processInfo.SetVideoDeintMethod("none");
++}
++
++int CDVDVideoCodecDRMPRIME::EnsureDeinterlace()
++{
++  if (m_deinterlaceGraph && m_deinterlaceWidth == m_pFrame->width &&
++      m_deinterlaceHeight == m_pFrame->height)
++    return 0;
++
++  ResetDeinterlace();
++  const AVFilter* deinterlace = avfilter_get_by_name("sc2_deinterlace");
++  if (!deinterlace)
++    return AVERROR(ENOSYS);
++
++  m_deinterlaceGraph = avfilter_graph_alloc();
++  if (!m_deinterlaceGraph)
++    return AVERROR(ENOMEM);
++
++  m_deinterlaceSource = avfilter_graph_alloc_filter(
++      m_deinterlaceGraph, avfilter_get_by_name("buffer"), "sc2-input");
++  AVFilterContext* hardware =
++      avfilter_graph_alloc_filter(m_deinterlaceGraph, deinterlace, "sc2-hardware-ei");
++  m_deinterlaceSink = avfilter_graph_alloc_filter(
++      m_deinterlaceGraph, avfilter_get_by_name("buffersink"), "sc2-output");
++  if (!m_deinterlaceSource || !hardware || !m_deinterlaceSink)
++  {
++    ResetDeinterlace();
++    return AVERROR(ENOMEM);
++  }
++
++  AVBufferSrcParameters* params = av_buffersrc_parameters_alloc();
++  if (!params)
++  {
++    ResetDeinterlace();
++    return AVERROR(ENOMEM);
++  }
++  params->format = AV_PIX_FMT_DRM_PRIME;
++  params->time_base = AVRational{1, AV_TIME_BASE};
++  params->width = m_pFrame->width;
++  params->height = m_pFrame->height;
++  params->sample_aspect_ratio = m_pFrame->sample_aspect_ratio;
++  params->frame_rate = m_pCodecContext->framerate;
++  if (params->frame_rate.num <= 0 && m_hints.fpsrate > 0 && m_hints.fpsscale > 0)
++    params->frame_rate = AVRational{m_hints.fpsrate, m_hints.fpsscale};
++  params->hw_frames_ctx = m_pFrame->hw_frames_ctx;
++  int ret = av_buffersrc_parameters_set(m_deinterlaceSource, params);
++  av_free(params);
++  if (ret >= 0)
++    ret = avfilter_init_str(m_deinterlaceSource, nullptr);
++  if (ret >= 0)
++    ret = avfilter_init_str(hardware, nullptr);
++  if (ret >= 0)
++    ret = avfilter_init_str(m_deinterlaceSink, nullptr);
++  if (ret >= 0)
++    ret = avfilter_link(m_deinterlaceSource, 0, hardware, 0);
++  if (ret >= 0)
++    ret = avfilter_link(hardware, 0, m_deinterlaceSink, 0);
++  if (ret >= 0)
++    ret = avfilter_graph_config(m_deinterlaceGraph, nullptr);
++  if (ret < 0)
++  {
++    ResetDeinterlace();
++    return ret;
++  }
++
++  m_deinterlaceWidth = m_pFrame->width;
++  m_deinterlaceHeight = m_pFrame->height;
++  return 0;
++}
++
++int CDVDVideoCodecDRMPRIME::ReceiveFrame()
++{
++  av_frame_unref(m_pFrame);
++  for (;;)
++  {
++    if (m_deinterlaceGraph)
++    {
++      const int ret = av_buffersink_get_frame(m_deinterlaceSink, m_pFrame);
++      if (ret >= 0)
++      {
++        const AVRational timeBase = av_buffersink_get_time_base(m_deinterlaceSink);
++        if (m_pFrame->pts != AV_NOPTS_VALUE)
++          m_pFrame->pts = av_rescale_q(m_pFrame->pts, timeBase, AVRational{1, AV_TIME_BASE});
++        m_pFrame->best_effort_timestamp = m_pFrame->pts;
++        m_pFrame->duration = av_rescale_q(m_pFrame->duration, timeBase,
++                                        AVRational{1, AV_TIME_BASE});
++        // This label is set only after a completed hardware field reaches the sink.
++        m_processInfo.SetVideoDeintMethod("SC2 hardware EI full-rate (not MA/MC)");
++        return 0;
++      }
++      if (ret != AVERROR(EAGAIN))
++        return ret;
++    }
++
++    int ret = avcodec_receive_frame(m_pCodecContext, m_pFrame);
++    if (ret == AVERROR_EOF && m_deinterlaceGraph && !m_deinterlaceDraining)
++    {
++      ret = av_buffersrc_add_frame_flags(m_deinterlaceSource, nullptr, 0);
++      if (ret < 0)
++        return ret;
++      m_deinterlaceDraining = true;
++      continue;
++    }
++    if (ret < 0)
++      return ret;
++
++    if (m_pFrame->format != AV_PIX_FMT_DRM_PRIME || !m_pFrame->interlaced_frame)
++    {
++      ResetDeinterlace();
++      // A progressive frame bypasses DI and retains the existing timing path.
++      return 0;
++    }
++    ret = EnsureDeinterlace();
++    if (ret < 0)
++    {
++      CLog::Log(LOGERROR, "DRM PRIME native SC2 hardware deinterlace unavailable: {}", ret);
++      av_frame_unref(m_pFrame);
++      return ret; // Never substitute software pixels or pretend DI completed.
++    }
++
++    if (m_pFrame->best_effort_timestamp != AV_NOPTS_VALUE)
++      m_pFrame->pts = m_pFrame->best_effort_timestamp;
++    ret = av_buffersrc_add_frame_flags(m_deinterlaceSource, m_pFrame,
++                                      AV_BUFFERSRC_FLAG_KEEP_REF);
++    av_frame_unref(m_pFrame);
++    if (ret < 0)
++      return ret;
++  }
++}
++
+ CDVDVideoCodec::VCReturn CDVDVideoCodecDRMPRIME::GetPicture(VideoPicture* pVideoPicture)
+ {
+   if (m_codecControlFlags & DVD_CODEC_CTRL_DRAIN)
+     Drain();
+ 
+-  int ret = avcodec_receive_frame(m_pCodecContext, m_pFrame);
++  int ret = ReceiveFrame();
+   if (ret == AVERROR(EAGAIN))
+     return VC_BUFFER;
+   else if (ret == AVERROR_EOF)
+@@ -612,6 +763,7 @@
+     {
+       CLog::Log(LOGDEBUG, "CDVDVideoCodecDRMPRIME::{} - flush buffers", __FUNCTION__);
++      ResetDeinterlace();
+       avcodec_flush_buffers(m_pCodecContext);
+       SetCodecControl(m_codecControlFlags & ~DVD_CODEC_CTRL_DRAIN);
+     }
+     return VC_EOF;
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h
+@@ -90,6 +90,7 @@
+ #define DVP_FLAG_REPEAT_TOP_FIELD   0x00000002  //< Set to indicate that the top field should be repeated
+ #define DVP_FLAG_INTERLACED         0x00000008  //< Set to indicate that this frame is interlaced
+ #define DVP_FLAG_DROPPED            0x00000010  //< indicate that this picture has been dropped in decoder stage, will have no data
++#define DVP_FLAG_FIELD_DURATION     0x00000020  //< iDuration is the completed hardware field duration
+ 
+ #define DVD_CODEC_CTRL_SKIPDEINT    0x01000000  //< request to skip a deinterlacing cycle, if possible
+ #define DVD_CODEC_CTRL_NO_POSTPROC  0x02000000  //< see GetCodecStats
+--- a/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp
++++ b/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp
+@@ -675,7 +675,9 @@
+   {
+     bool hasTimestamp = true;
+ 
+-    m_picture.iDuration = frametime;
++    if (!(m_picture.iFlags & DVP_FLAG_FIELD_DURATION) ||
++        m_picture.iDuration <= 0.0)
++      m_picture.iDuration = frametime;
+ 
+     // validate picture timing,
+     // if both dts/pts invalid, use pts calculated from picture.iDuration

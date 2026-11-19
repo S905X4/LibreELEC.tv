@@ -1,0 +1,66 @@
+From 37230ce9035f3564cde969cfb2c4b99e25b770ac Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Fri, 13 Nov 2026 02:50:51 +0800
+Subject: [PATCH] drm/meson: Use the SC2 PHY power-off baseline
+
+SC2 currently selects the G12A PHY data, whose disable/init value keeps
+CTRL0 at the G12A-specific 0x000b4242 bandgap setting. The SC2 BSP instead
+powers CTRL0 fully off before its clock/FIFO reset and applies SC2 drive
+parameters only after the resets.
+
+Give SC2 its own constant platform data and explicitly clear CTRL0 before
+its reset sequence, including reinitialization paths without a preceding
+DRM disable. Keep G12A and all existing bus-format, PLL and drive-strength
+recipes unchanged. This addresses a concrete source mismatch; physical
+mode-switch acceptance is recorded separately.
+
+Change-Id: I07e7753398ff643227099712001d99b0a526faa1
+---
+ drivers/gpu/drm/meson/meson_dw_hdmi.c | 17 ++++++++++++++---
+ 1 file changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/meson/meson_dw_hdmi.c b/drivers/gpu/drm/meson/meson_dw_hdmi.c
+index bff4e6a0a3d4..19f52d647464 100644
+--- a/drivers/gpu/drm/meson/meson_dw_hdmi.c
++++ b/drivers/gpu/drm/meson/meson_dw_hdmi.c
+@@ -455,8 +455,10 @@ static int dw_hdmi_phy_init(struct dw_hdmi *hdmi, void *data,
+ 	msleep(20);
+ 	dw_hdmi->data->top_write(dw_hdmi, HDMITX_TOP_TMDS_CLK_PTTN_CNTL, 0x2);
+ 
+-	/* Setup PHY parameters */
+-	if (!priv->sc2)
++	/* SC2 requires CTRL0 powered off before its clock/FIFO reset sequence. */
++	if (priv->sc2)
++		meson_hdmi_phy_write(priv, HHI_HDMI_PHY_CNTL0, 0);
++	else
+ 		meson_hdmi_phy_setup_mode(dw_hdmi, mode, mode_is_420);
+ 
+ 	/* Disable clock, fifo, fifo_wr */
+@@ -662,6 +664,15 @@ static const struct meson_dw_hdmi_data meson_dw_hdmi_g12a_data = {
+ 	.cntl1_init = PHY_CNTL1_INIT,
+ };
+ 
++static const struct meson_dw_hdmi_data meson_dw_hdmi_sc2_data = {
++	.top_read = dw_hdmi_g12a_top_read,
++	.top_write = dw_hdmi_g12a_top_write,
++	.dwc_read = dw_hdmi_dwc_read,
++	.dwc_write = dw_hdmi_dwc_write,
++	.cntl0_init = 0,
++	.cntl1_init = PHY_CNTL1_INIT,
++};
++
+ static void meson_dw_hdmi_init(struct meson_dw_hdmi *meson_dw_hdmi)
+ {
+ 	struct meson_drm *priv = meson_dw_hdmi->priv;
+@@ -949,7 +960,7 @@ static const struct of_device_id meson_dw_hdmi_of_table[] = {
+ 	{ .compatible = "amlogic,meson-g12a-dw-hdmi",
+ 	  .data = &meson_dw_hdmi_g12a_data },
+ 	{ .compatible = "amlogic,meson-sc2-dw-hdmi",
+-	  .data = &meson_dw_hdmi_g12a_data },
++	  .data = &meson_dw_hdmi_sc2_data },
+ 	{ }
+ };
+ MODULE_DEVICE_TABLE(of, meson_dw_hdmi_of_table);
+-- 
+2.47.3
+

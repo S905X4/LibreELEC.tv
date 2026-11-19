@@ -14,3 +14,8 @@ PKG_TOOLCHAIN="autotools"
 if [ "${TARGET_ARCH}" = x86_64 -o "${TARGET_ARCH}" = "aarch64" ]; then
   PKG_CONFIGURE_OPTS_TARGET="--enable-mpers=no"
 fi
+
+# Linux 6.18 io_uring layouts postdate strace 6.16's decoder definitions.
+if [ "${LINUX}" = "amlogic-sc2" ]; then
+  PKG_CONFIGURE_OPTS_TARGET+=" --enable-bundled=yes"
+fi

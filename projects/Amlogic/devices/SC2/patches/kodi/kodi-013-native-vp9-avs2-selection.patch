@@ -1,0 +1,155 @@
+Subject: [PATCH] drmprime: prefer exposed native SC2 VP9 and AVS2 decoders
+
+Only prefer vp9_v4l2m2m/avs2_v4l2m2m when the native meson-sc2-vdec
+node actually advertises the matching compressed OUTPUT fourcc and AMF8
+or AMF0 CAPTURE. Honour software-forcing and the DRM PRIME hardware setting.
+Pin the capability-probed node with the FFmpeg video_device option, so a
+different decoder cannot win FFmpeg's independent device scan.
+
+Other codecs, other SoCs, and the existing HEVC/AV1 Request selection and
+hardware device construction retain their existing paths. DRM PRIME plane
+fds, offsets and FBC modifiers come from FFmpeg, not fabricated linear YUV.
+Requires SC2 ffmpeg-012-native-vp9-avs2-fbc.patch.
+
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
+@@ -7,6 +7,13 @@
+  */
+ 
+ #include "DVDVideoCodecDRMPRIME.h"
++
++#include <cstring>
++#include <dirent.h>
++#include <fcntl.h>
++#include <linux/videodev2.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
+ 
+ #include "ServiceBroker.h"
+ #include "cores/VideoPlayer/Buffers/VideoBufferDMA.h"
+@@ -183,12 +190,90 @@
+   return nullptr;
+ }
+ 
+-static const AVCodec* FindDecoder(CDVDStreamInfo& hints)
++static bool HasV4L2Format(int fd, v4l2_buf_type type, uint32_t fourcc)
++{
++  v4l2_fmtdesc format{};
++  format.type = type;
++  for (; ioctl(fd, VIDIOC_ENUM_FMT, &format) == 0; ++format.index)
++  {
++    if (format.pixelformat == fourcc)
++      return true;
++  }
++  return false;
++}
++
++static const AVCodec* FindSC2StatefulDecoder(CDVDStreamInfo& hints, std::string& videoDevice)
++{
++  const char* name = nullptr;
++  uint32_t codedFormat = 0;
++  switch (hints.codec)
++  {
++    case AV_CODEC_ID_VP9:
++      name = "vp9_v4l2m2m";
++      codedFormat = V4L2_PIX_FMT_VP9;
++      break;
++    case AV_CODEC_ID_AVS2:
++      name = "avs2_v4l2m2m";
++      codedFormat = v4l2_fourcc('A', 'V', 'S', '2');
++      break;
++    default:
++      return nullptr;
++  }
++
++  const AVCodec* codec = avcodec_find_decoder_by_name(name);
++  if (!codec || codec->id != hints.codec || !FindHWConfig(codec))
++    return nullptr;
++
++  DIR* devices = opendir("/dev");
++  if (!devices)
++    return nullptr;
++
++  const AVCodec* selected = nullptr;
++  for (dirent* entry = readdir(devices); entry; entry = readdir(devices))
++  {
++    if (std::strncmp(entry->d_name, "video", 5) != 0)
++      continue;
++
++    const std::string path = std::string("/dev/") + entry->d_name;
++    const int fd = open(path.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
++    if (fd < 0)
++      continue;
++
++    v4l2_capability capability{};
++    const bool queried = ioctl(fd, VIDIOC_QUERYCAP, &capability) == 0;
++    const uint32_t caps = capability.capabilities & V4L2_CAP_DEVICE_CAPS ?
++                              capability.device_caps : capability.capabilities;
++    // Only prefer the new native SC2 node, never a Request or another SoC's decoder.
++    const bool supported = queried &&
++        std::strcmp(reinterpret_cast<const char*>(capability.driver), "meson-sc2-vdec") == 0 &&
++        (caps & V4L2_CAP_VIDEO_M2M_MPLANE) && (caps & V4L2_CAP_STREAMING) &&
++        HasV4L2Format(fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, codedFormat) &&
++        (HasV4L2Format(fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
++                       v4l2_fourcc('A', 'M', 'F', '8')) ||
++         HasV4L2Format(fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
++                       v4l2_fourcc('A', 'M', 'F', '0')));
++    close(fd);
++    if (supported)
++    {
++      videoDevice = path;
++      selected = codec;
++      break;
++    }
++  }
++  closedir(devices);
++  return selected;
++}
++
++static const AVCodec* FindDecoder(CDVDStreamInfo& hints, std::string& videoDevice)
+ {
+   const AVCodec* codec = nullptr;
+   void* i = 0;
+ 
+   if (!(hints.codecOptions & CODEC_FORCE_SOFTWARE))
++  {
++    if (const AVCodec* stateful = FindSC2StatefulDecoder(hints, videoDevice))
++      return stateful;
++
+     while ((codec = av_codec_iterate(&i)))
+     {
+       if (!av_codec_is_decoder(codec))
+@@ -200,6 +285,7 @@
+       if (config)
+         return codec;
+     }
++  }
+ 
+   codec = avcodec_find_decoder(hints.codec);
+   if (codec && (codec->capabilities & AV_CODEC_CAP_DR1) == AV_CODEC_CAP_DR1)
+@@ -281,7 +367,8 @@
+ 
+ bool CDVDVideoCodecDRMPRIME::Open(CDVDStreamInfo& hints, CDVDCodecOptions& options)
+ {
+-  const AVCodec* pCodec = FindDecoder(hints);
++  std::string videoDevice;
++  const AVCodec* pCodec = FindDecoder(hints, videoDevice);
+   if (!pCodec)
+   {
+     CLog::Log(LOGDEBUG, "CDVDVideoCodecDRMPRIME::{} - unable to find decoder for codec {}",
+@@ -364,6 +451,15 @@
+ 
+   for (auto&& option : options.m_keys)
+     av_opt_set(m_pCodecContext, option.m_name.c_str(), option.m_value.c_str(), 0);
++
++  if (!videoDevice.empty() &&
++      av_opt_set(m_pCodecContext->priv_data, "video_device", videoDevice.c_str(), 0) < 0)
++  {
++    CLog::Log(LOGERROR, "CDVDVideoCodecDRMPRIME::{} - cannot select native decoder device {}",
++              __FUNCTION__, videoDevice);
++    avcodec_free_context(&m_pCodecContext);
++    return false;
++  }
+ 
+   if (avcodec_open2(m_pCodecContext, pCodec, nullptr) < 0)
+   {

@@ -1,0 +1,19 @@
+Subject: [PATCH] service: drop settings window names removed from Kodi 21
+
+Use the current player/media/interface settings windows already present in
+this list. Querying the removed video/music/picture/weather settings names
+makes Window Translator emit errors on every indicator refresh.
+
+--- a/service.py
++++ b/service.py
+@@ -135,8 +135,8 @@
+ 
+ 	def __createStates(self):
+ 		settingsWindows = ['settings', 'systeminfo', 'systemsettings', 'servicesettings', 'pvrsettings', \
+-		'playersettings', 'mediasettings', 'interfacesettings', 'profiles', 'skinsettings', 'videossettings', \
+-		'musicsettings', 'appearancesettings', 'picturessettings', 'weathersettings', 'gamesettings', \
++		'playersettings', 'mediasettings', 'interfacesettings', 'profiles', 'skinsettings', \
++		'appearancesettings', 'gamesettings', \
+ 		'service-CoreELEC-Settings-mainWindow.xml', 'service-CoreELEC-Settings-wizard.xml', \
+ 		'service-CoreELEC-Settings-getPasskey.xml', \
+ 		'service-LibreELEC-Settings-mainWindow.xml', 'service-LibreELEC-Settings-wizard.xml', \

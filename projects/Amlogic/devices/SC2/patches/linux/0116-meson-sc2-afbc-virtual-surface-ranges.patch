@@ -1,0 +1,58 @@
+From d2b89f4cf7473cca3d7683f92d6ec2d77e163e0c Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Fri, 13 Nov 2026 23:58:17 +0800
+Subject: [PATCH] drm: meson: separate full-size SC2 AFBC virtual output ranges
+
+The three SC2 AFBC surfaces used 16-MiB-separated internal output bases.
+A 3840x2160 ARGB surface occupies 33,177,600 bytes before height padding,
+so its address range overlaps the next active surface. Actual UHD60
+three-AFBC scanout is nearly black and reports the detiling error bit;
+disabling the primary immediately restores its siblings.
+
+Keep the established OSD1 base and use 32-MiB spacing for SC2 siblings.
+The maximum 3840x2176x4 padded output is 33,423,360 bytes, below one slot.
+Use the already computed plane shadow address for both the VIU request
+and decoder output, avoiding duplicated base arithmetic. Other SoCs and
+all actual framebuffer storage, formats and dimensions remain unchanged.
+
+The overlap and bounded address calculation motivate this candidate;
+canonical build and actual UHD receiver verification follow separately.
+
+Change-Id: I8cfaf9fa9ef5b8118c2d53516db6f41b0b84a9de
+---
+ drivers/gpu/drm/meson/meson_osd_afbcd.c | 2 +-
+ drivers/gpu/drm/meson/meson_plane.c     | 4 ++--
+ 2 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/meson/meson_osd_afbcd.c b/drivers/gpu/drm/meson/meson_osd_afbcd.c
+index a31f7c331878..72928dafdfd0 100644
+--- a/drivers/gpu/drm/meson/meson_osd_afbcd.c
++++ b/drivers/gpu/drm/meson/meson_osd_afbcd.c
+@@ -383,7 +383,7 @@ static int meson_g12a_afbcd_setup_surface(struct meson_drm *priv,
+ 	meson_rdma_writel_sync(priv, 0, VPU_MAFBC_BOUNDING_BOX_Y_START_S0 + offset);
+ 	meson_rdma_writel_sync(priv, osd->height - 1,
+ 			       VPU_MAFBC_BOUNDING_BOX_Y_END_S0 + offset);
+-	meson_rdma_writel_sync(priv, MESON_G12A_AFBCD_OUT_ADDR * (index + 1),
++	meson_rdma_writel_sync(priv, osd->blk1_cfg4,
+ 			       VPU_MAFBC_OUTPUT_BUF_ADDR_LOW_S0 + offset);
+ 	meson_rdma_writel_sync(priv, 0,
+ 			       VPU_MAFBC_OUTPUT_BUF_ADDR_HIGH_S0 + offset);
+diff --git a/drivers/gpu/drm/meson/meson_plane.c b/drivers/gpu/drm/meson/meson_plane.c
+index 8afde5fbff39..662e7c289208 100644
+--- a/drivers/gpu/drm/meson/meson_plane.c
++++ b/drivers/gpu/drm/meson/meson_plane.c
+@@ -272,9 +272,9 @@ static void meson_plane_atomic_update(struct drm_plane *plane,
+ 
+ 	if (osd->afbcd) {
+ 		if (meson_vpu_is_compatible(priv, VPU_COMPATIBLE_G12A)) {
+-			/* This is the internal decoding memory address */
++			/* SC2's 3840x2176x4 output needs a 32-MiB virtual slot. */
+ 			osd->blk1_cfg4 = MESON_G12A_AFBCD_OUT_ADDR *
+-					(meson_plane->index + 1);
++				(1 + meson_plane->index * (priv->sc2 ? 2 : 1));
+ 			osd->blk0_cfg[0] |= OSD_ENDIANNESS_BE;
+ 			osd->ctrl_stat2 |= OSD_PENDING_STAT_CLEAN;
+ 			osd->ctrl_stat |= VIU_OSD1_CFG_SYN_EN;
+-- 
+2.47.3
+

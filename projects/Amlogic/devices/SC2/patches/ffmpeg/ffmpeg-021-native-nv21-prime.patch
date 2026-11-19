@@ -1,0 +1,55 @@
+From: hiper25 <whydonit@gmail.com>
+Subject: [PATCH] avcodec,avutil: carry linear NV21 Request capture in DRM PRIME
+
+Accept NV21 only for eight-bit HEVC, preserve its AV_PIX_FMT_NV21 frame
+metadata and emit DRM_FORMAT_NV21 with the actual linear pitch and padded
+chroma offset. Add the equivalent shared Request mapping used by AV1.
+
+Keep NV12 preference, compressed AMF0 handling, object ownership and
+existing codec depth restrictions. This consumes actual NV21 producers;
+it does not reinterpret NV12 bytes or convert pixels on the CPU.
+
+--- a/libavcodec/v4l2_request_hevc.c
++++ b/libavcodec/v4l2_request_hevc.c
+@@ -124,7 +124,8 @@
+ 
+     if (h->ps.sps->bit_depth == 8) {
+         if (fmtdesc->pixelformat == V4L2_PIX_FMT_NV12_COL128 ||
+-            fmtdesc->pixelformat == V4L2_PIX_FMT_NV12) {
++            fmtdesc->pixelformat == V4L2_PIX_FMT_NV12 ||
++            fmtdesc->pixelformat == V4L2_PIX_FMT_NV21) {
+             return 1;
+         }
+     }
+--- a/libavcodec/v4l2_req_hevc_vx.c
++++ b/libavcodec/v4l2_req_hevc_vx.c
+@@ -110,6 +110,8 @@
+         return AV_PIX_FMT_YUV420P;
+     case V4L2_PIX_FMT_NV12:
+         return AV_PIX_FMT_NV12;
++    case V4L2_PIX_FMT_NV21:
++        return AV_PIX_FMT_NV21;
+     case V4L2_PIX_FMT_AMLOGIC_FBC10:
+         /* Logical sample depth only; the DRM modifier owns the memory layout. */
+         return AV_PIX_FMT_YUV420P10LE;
+@@ -823,6 +825,10 @@
+         layer->format = DRM_FORMAT_NV12;
+         desc->objects[0].format_modifier = DRM_FORMAT_MOD_LINEAR;
+         break;
++    case V4L2_PIX_FMT_NV21:
++        layer->format = DRM_FORMAT_NV21;
++        desc->objects[0].format_modifier = DRM_FORMAT_MOD_LINEAR;
++        break;
+ #if CONFIG_SAND
+     case V4L2_PIX_FMT_NV12_COL128:
+         layer->format = DRM_FORMAT_NV12;
+--- a/libavutil/hwcontext_v4l2request.c
++++ b/libavutil/hwcontext_v4l2request.c
+@@ -62,6 +62,7 @@
+     uint32_t bit_depth;
+ } v4l2request_capture_pixelformats[] = {
+     { V4L2_PIX_FMT_NV12, AV_PIX_FMT_NV12, DRM_FORMAT_NV12, DRM_FORMAT_MOD_LINEAR, 8 },
++    { V4L2_PIX_FMT_NV21, AV_PIX_FMT_NV21, DRM_FORMAT_NV21, DRM_FORMAT_MOD_LINEAR, 8 },
+ #if defined(V4L2_PIX_FMT_NV12_32L32)
+     { V4L2_PIX_FMT_NV12_32L32, AV_PIX_FMT_YUV420P, DRM_FORMAT_NV12, DRM_FORMAT_MOD_ALLWINNER_TILED, 8 },
+ #endif

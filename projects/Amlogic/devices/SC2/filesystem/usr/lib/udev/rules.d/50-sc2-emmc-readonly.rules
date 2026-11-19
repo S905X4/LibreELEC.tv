@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: GPL-2.0
+# Protect eMMC by default; only sc2.emmc=1 permits user-area writes.
+# Hardware boot/GP areas remain read-only, and type-SD cards do not match.
+ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", KERNEL=="mmcblk[0-9]*", ATTRS{type}=="MMC", IMPORT{cmdline}="sc2.emmc"
+ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", KERNEL=="mmcblk[0-9]*", ATTRS{type}=="MMC", ENV{sc2.emmc}!="1", ATTR{force_ro}="1"
+ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", KERNEL=="mmcblk[0-9]*boot[01]|mmcblk[0-9]*gp[0-9]", ATTRS{type}=="MMC", ATTR{force_ro}="1"
+ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", KERNEL=="mmcblk[0-9]*", KERNEL!="*boot[01]|*gp[0-9]", ATTRS{type}=="MMC", ENV{sc2.emmc}=="1", ATTR{force_ro}="0"

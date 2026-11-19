@@ -1,0 +1,54 @@
+From 6333b0a1f95d079d30eb8583a0ed8e7ad87376e8 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Sat, 14 Nov 2026 00:18:01 +0800
+Subject: [PATCH] drm: meson: retain SC2 shared PPS geometry without an OSD1 FB
+
+The common OSD PPS remains downstream of every blended source, even
+when OSD1 itself is disabled. The no-primary progressive branch cleared
+its input and output dimensions and bypassed the path. With AFBC-only
+siblings this collapses their visible rectangles into horizontal lines;
+linear siblings did not expose that failure.
+
+Keep the shared path enabled with mode-sized identity geometry whenever
+any OSD remains active. Preserve the existing primary-owned scaler and
+interlaced two-to-one field configuration; clear it only with no OSDs.
+
+In an exact UHD receiver discriminator, writing only valid identity PPS
+geometry restores both AFBC siblings while OSD1 fetch remains disabled.
+Restoring the old zero registers does not immediately undo the internal
+latched state, so subsequent route/gate variants are not independent
+positive evidence and are not incorporated.
+
+Change-Id: I2fb18d9d3534704529ab048dd1ed27f663f8c9c4
+---
+ drivers/gpu/drm/meson/meson_crtc.c | 11 ++++++-----
+ 1 file changed, 6 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/meson/meson_crtc.c b/drivers/gpu/drm/meson/meson_crtc.c
+index 469b0e89e550..86e26f2b5c81 100644
+--- a/drivers/gpu/drm/meson/meson_crtc.c
++++ b/drivers/gpu/drm/meson/meson_crtc.c
+@@ -189,14 +189,15 @@ static void meson_crtc_sc2_output_scaler(struct meson_drm *priv, bool enabled)
+ 	writel_relaxed(0, priv->io_base + _REG(base + 3));
+ 	writel_relaxed(0, priv->io_base + _REG(base + 4));
+ 	writel_relaxed(0, priv->io_base + _REG(base + 5));
+-	writel_relaxed(interlace ? BIT(3) | BIT(2) : 0,
++	/* The AFBC siblings still need valid shared PPS frame boundaries. */
++	writel_relaxed(enabled ? BIT(3) | BIT(2) : 0,
+ 			priv->io_base + _REG(base + 8));
+-	writel_relaxed(interlace ? (mode->hdisplay - 1) << 16 |
++	writel_relaxed(enabled ? (mode->hdisplay - 1) << 16 |
+ 			(mode->vdisplay - 1) : 0, priv->io_base + _REG(base + 9));
+-	writel_relaxed(interlace ? mode->hdisplay - 1 : 0,
++	writel_relaxed(enabled ? mode->hdisplay - 1 : 0,
+ 			priv->io_base + _REG(base + 10));
+-	writel_relaxed(interlace ? mode->vdisplay / 2 - 1 : 0,
+-			priv->io_base + _REG(base + 11));
++	writel_relaxed(enabled ? (interlace ? mode->vdisplay / 2 :
++			mode->vdisplay) - 1 : 0, priv->io_base + _REG(base + 11));
+ }
+ 
+ static void meson_crtc_sc2_osd_blend(struct meson_drm *priv)
+-- 
+2.47.3
+

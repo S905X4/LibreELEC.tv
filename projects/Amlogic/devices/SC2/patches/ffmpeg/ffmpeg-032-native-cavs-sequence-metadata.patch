@@ -1,0 +1,104 @@
+Subject: [PATCH] avcodec: discover CAVS sequence metadata without decoding
+
+The CAVS parser currently only separates frames. For AVS1-P16 input,
+stream discovery then asks the JiZhun-only software decoder to fill width,
+height and sample layout, leaving genuine Broadcasting streams at 0x0.
+
+Read the shared bounded sequence header in the parser. Report the actual
+8-bit 4:2:0 geometry, profile, level and frame rate for JiZhun/Broadcasting;
+leave unsupported or truncated declarations unknown. Never rewrite payloads
+or pretend to decode the P16 macroblock layer. Preserve existing frame
+boundaries and timestamps.
+
+Verified against the exact deployed AArch64 library under QEMU: the original
+FATE AVS+ 1080i TS fails metadata discovery before this change and succeeds
+afterward with every packet hash and original PTS/DTS retained. Fragmented
+input and truncated/unsupported declarations exercise the real parser API.
+This is host-only stream-discovery proof, not native hardware acceptance.
+
+--- a/libavcodec/cavs_parser.c
++++ b/libavcodec/cavs_parser.c
+@@ -27,6 +27,9 @@
+ 
+ #include "parser.h"
+ #include "cavs.h"
++#include "decode.h"
++#include "mpeg12data.h"
++#include "startcode.h"
+ 
+ 
+ /**
+@@ -73,6 +76,64 @@
+     return END_NOT_FOUND;
+ }
+ 
++/* JiZhun and Broadcasting share this fixed sequence header. Discover the
++ * declared sample layout without requiring either software macroblock layer. */
++static void cavs_sequence_metadata(AVCodecParserContext *s, AVCodecContext *avctx,
++                                   const uint8_t *buf, int size)
++{
++    GetBitContext gb;
++    int profile, level, width, height, chroma, precision, rate;
++
++    if (size < 14 || init_get_bits8(&gb, buf, size) < 0)
++        return;
++    profile = get_bits(&gb, 8);
++    level = get_bits(&gb, 8);
++    skip_bits1(&gb); // progressive_sequence does not declare field order
++    width = get_bits(&gb, 14);
++    height = get_bits(&gb, 14);
++    chroma = get_bits(&gb, 2);
++    precision = get_bits(&gb, 3);
++    skip_bits(&gb, 4); // aspect_ratio
++    rate = get_bits(&gb, 4);
++    if ((profile != 0x20 && profile != 0x48) || chroma != 1 || precision != 1 ||
++        !width || !height || !rate || rate > 13)
++        return;
++    if (ff_set_dimensions(avctx, width, height) < 0)
++        return;
++    s->width = width;
++    s->height = height;
++    s->coded_width = FFALIGN(width, 16);
++    s->coded_height = FFALIGN(height, 16);
++    s->format = avctx->pix_fmt = AV_PIX_FMT_YUV420P;
++    avctx->profile = profile;
++    avctx->level = level;
++    avctx->framerate = ff_mpeg12_frame_rate_tab[rate];
++}
++
++static void cavs_extract_metadata(AVCodecParserContext *s, AVCodecContext *avctx,
++                                  const uint8_t *buf, int size)
++{
++    const uint8_t *end = buf + size;
++    uint32_t code = -1;
++
++    while (buf < end) {
++        buf = avpriv_find_start_code(buf, end, &code);
++        if (code == CAVS_START_CODE) {
++            const uint8_t *header = buf;
++            uint32_t next = -1;
++            const uint8_t *boundary = avpriv_find_start_code(buf, end, &next);
++
++            if ((next & 0xffffff00) == 0x100)
++                boundary -= 4;
++            cavs_sequence_metadata(s, avctx, header, boundary - header);
++            return;
++        }
++        if (code == PIC_I_START_CODE || code == PIC_PB_START_CODE ||
++            (code >= 0x100 && code <= SLICE_MAX_START_CODE))
++            return;
++    }
++}
++
+ static int cavsvideo_parse(AVCodecParserContext *s,
+                            AVCodecContext *avctx,
+                            const uint8_t **poutbuf, int *poutbuf_size,
+@@ -92,6 +153,8 @@
+             return buf_size;
+         }
+     }
++    if (buf_size > 0)
++        cavs_extract_metadata(s, avctx, buf, buf_size);
+     *poutbuf = buf;
+     *poutbuf_size = buf_size;
+     return next;

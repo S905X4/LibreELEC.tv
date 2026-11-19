@@ -1,0 +1,35 @@
+From: hiper25 <whydonit@gmail.com>
+Subject: [PATCH] avcodec/av1dec: renegotiate changed sequence state
+
+A same-size AV1 sequence can change monochrome, bit depth or tools.
+The old path negotiated only its first sequence and reused the old Request
+queue. SC2 correctly rejects changed sequence controls before STREAMOFF.
+
+Compare the zero-initialized CBS value-only headers before releasing the
+old sequence. Drop internal references and renegotiate changed sequences
+through the normal hardware uninit/init path. Repeated identical headers
+retain the existing queue. Exported buffers retain their independent owners.
+Do not flush the CBS parser after it has already parsed the new packet.
+
+--- a/libavcodec/av1dec.c
++++ b/libavcodec/av1dec.c
+@@ -1060,6 +1060,19 @@
+ 
+         switch (unit->type) {
+         case AV1_OBU_SEQUENCE_HEADER:
++            /* CBS allocates zeroed value-only sequence headers. A changed
++             * sequence needs new reference and hardware-format state, even
++             * when its dimensions or sample depth remain unchanged. */
++            if (!s->raw_seq || memcmp(s->raw_seq, &obu->obu.sequence_header,
++                                      sizeof(*s->raw_seq))) {
++                for (int j = 0; j < FF_ARRAY_ELEMS(s->ref); j++)
++                    av1_frame_unref(avctx, &s->ref[j]);
++                av1_frame_unref(avctx, &s->cur_frame);
++                av_buffer_unref(&s->header_ref);
++                s->raw_frame_header = NULL;
++                s->pix_fmt = AV_PIX_FMT_NONE;
++            }
++
+             av_buffer_unref(&s->seq_ref);
+             s->seq_ref = av_buffer_ref(unit->content_ref);
+             if (!s->seq_ref) {

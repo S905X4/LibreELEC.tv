@@ -1,0 +1,53 @@
+From f2f91a7340443e372fa7d95cdf2bf59a60a3cd55 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Sat, 14 Nov 2026 19:24:26 +0800
+Subject: [PATCH] media: meson: keep explicit capture boundaries separate from
+ restart
+
+Do not allow the parser restart shortcut to acknowledge a pending source boundary. Publish RUNNING after explicit source START. Accept SC2 STOP with OUTPUT active before initial CAPTURE starts instead of silently losing the drain request.
+
+Change-Id: I3f9c4104a936f57d0bf3c55e209750edbb1fa603
+---
+ drivers/staging/media/meson/vdec/esparser.c | 1 +
+ drivers/staging/media/meson/vdec/vdec.c     | 6 +++++-
+ 2 files changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/staging/media/meson/vdec/esparser.c b/drivers/staging/media/meson/vdec/esparser.c
+index 094030a6e7fb..9c736bddf095 100644
+--- a/drivers/staging/media/meson/vdec/esparser.c
++++ b/drivers/staging/media/meson/vdec/esparser.c
+@@ -464,6 +464,7 @@ void esparser_queue_all_src(struct work_struct *work)
+ 	 * surface is owned by VB2 again and its allocated backing is unchanged.
+ 	 */
+ 	if ((!sess->should_stop || sess->draining) && !sess->aborted &&
++	    !READ_ONCE(sess->source_change_pending) &&
+ 	    sess->core->platform->revision == VDEC_REVISION_SC2 &&
+ 	    sess->streamon_cap && sess->status == STATUS_NEEDS_RESUME &&
+ 	    sess->capture_width == amvdec_get_output_width(sess) &&
+diff --git a/drivers/staging/media/meson/vdec/vdec.c b/drivers/staging/media/meson/vdec/vdec.c
+index 05be78ed921f..ad5e70306a7d 100644
+--- a/drivers/staging/media/meson/vdec/vdec.c
++++ b/drivers/staging/media/meson/vdec/vdec.c
+@@ -1049,7 +1049,10 @@ vdec_decoder_cmd(struct file *file, void *fh, struct v4l2_decoder_cmd *cmd)
+ 	if (ret)
+ 		return ret;
+ 
+-	if (!(sess->streamon_out & sess->streamon_cap))
++	if (!sess->streamon_out ||
++	    (!sess->streamon_cap &&
++	     (sess->core->platform->revision != VDEC_REVISION_SC2 ||
++	      cmd->cmd != V4L2_DEC_CMD_STOP)))
+ 		return 0;
+ 
+ 	if (cmd->cmd == V4L2_DEC_CMD_START) {
+@@ -1062,6 +1065,7 @@ vdec_decoder_cmd(struct file *file, void *fh, struct v4l2_decoder_cmd *cmd)
+ 			codec_ops->resume(sess);
+ 			if (sess->aborted)
+ 				return -EIO;
++			sess->status = STATUS_RUNNING;
+ 			if (sess->draining)
+ 				sess->drain_deadline = jiffies + msecs_to_jiffies(5000);
+ 			schedule_work(&sess->esparser_queue_work);
+-- 
+2.47.3
+

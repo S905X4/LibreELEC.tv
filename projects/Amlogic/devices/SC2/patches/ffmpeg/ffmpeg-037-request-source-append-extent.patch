@@ -1,0 +1,24 @@
+From: hiper25 <whydonit@gmail.com>
+Subject: [PATCH] avcodec: retain the full Request source append extent
+
+Native frame-based HEVC packs each slice into the same OUTPUT object.
+qent_src_data_copy() reserves and writes offset + len bytes, but reported
+only len as the object's used size. Multi-slice frames therefore reached
+QBUF with only the final slice length despite containing every original
+NAL, and the kernel correctly rejected the earlier slice span.
+
+Report the complete written extent. Offset-zero callers still replace the
+used size, including when a reused buffer receives a shorter new frame.
+No coded bytes, controls, allocations or completion checks are changed.
+
+--- a/libavcodec/v4l2_req_media.c
++++ b/libavcodec/v4l2_req_media.c
+@@ -939,7 +939,7 @@
+     if (!dst)
+         return -1;
+     memcpy((char*)dst + offset, src, len);
+-    dmabuf_len_set(be->dh[0], len);
++    dmabuf_len_set(be->dh[0], offset + len);
+     dmabuf_write_end(be->dh[0]);
+     return 0;
+ }

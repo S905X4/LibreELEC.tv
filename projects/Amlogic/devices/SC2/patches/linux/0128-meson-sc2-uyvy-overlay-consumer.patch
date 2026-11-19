@@ -1,0 +1,201 @@
+From d06f7e46357a422e6797fc7912371c59c48be5c2 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Sat, 14 Nov 2026 10:55:12 +0800
+Subject: [PATCH] drm/meson: add SC2 linear UYVY overlay consumption
+
+Expose standard UYVY on SC2 VD1 and VD2 only. Select packed little-endian
+fetch, canvas endian zero, full-height chroma scopes and no vertical
+420 formatter. Use exact SC2 GEN_REG3 banks and pitch-selected bursts.
+
+Keep the applied byte-order snapshot with the CRTC and restore it when
+leaving UYVY or disabling the plane. Existing format fetch policies and
+other SoCs remain unchanged. Parent pixel tests establish the producer
+layout, not scanout equivalence; actual PRIME import and both-plane
+format-transition validation follow in the full image.
+
+Change-Id: I1abb29e53fd4f7a2a578fa81c9b1ee3a9928efdd
+---
+ drivers/gpu/drm/meson/meson_crtc.c    | 40 ++++++++++++++++++++++++++-
+ drivers/gpu/drm/meson/meson_drv.h     |  1 +
+ drivers/gpu/drm/meson/meson_overlay.c | 27 ++++++++++++++++--
+ 3 files changed, 65 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/meson/meson_crtc.c b/drivers/gpu/drm/meson/meson_crtc.c
+index d6ee87ef55d4..6ca3feb1b8a8 100644
+--- a/drivers/gpu/drm/meson/meson_crtc.c
++++ b/drivers/gpu/drm/meson/meson_crtc.c
+@@ -43,6 +43,8 @@ struct meson_crtc {
+ 	bool osd1_afbcd;
+ 	struct {
+ 		bool interlace;
++		bool uyvy_gen_reg3_active;
++		u32 saved_gen_reg3;
+ 		u32 vsc_ini_phase[2];
+ 		u32 vsc_phase_ctrl[2];
+ 	} video[2];
+@@ -344,6 +346,20 @@ static void meson_crtc_disable_osd1(struct meson_crtc *meson_crtc)
+ 	}
+ }
+ 
++static void meson_crtc_sc2_restore_video_order(struct meson_crtc *meson_crtc,
++					      unsigned int index)
++{
++	struct meson_drm *priv = meson_crtc->priv;
++	unsigned int reg = index ? SC2_VD2_IF0_GEN_REG3 : SC2_VD1_IF0_GEN_REG3;
++	u32 mask = GENMASK(9, 8) | GENMASK(2, 0);
++
++	if (!meson_crtc->video[index].uyvy_gen_reg3_active)
++		return;
++	writel_bits_relaxed(mask, meson_crtc->video[index].saved_gen_reg3 & mask,
++			    priv->io_base + _REG(reg));
++	meson_crtc->video[index].uyvy_gen_reg3_active = false;
++}
++
+ static void meson_crtc_disable_video(struct meson_crtc *meson_crtc,
+ 				     unsigned int index)
+ {
+@@ -358,6 +374,7 @@ static void meson_crtc_disable_video(struct meson_crtc *meson_crtc,
+ 		writel_relaxed(0, priv->io_base +
+ 			       _REG(meson_viu_mif_reg(priv, index ?
+ 						  VD2_IF0_GEN_REG : VD1_IF0_GEN_REG)));
++		meson_crtc_sc2_restore_video_order(meson_crtc, index);
+ 		meson_viu_video_afbc_select(priv, index, false);
+ 	} else if (meson_vpu_is_compatible(priv, VPU_COMPATIBLE_G12A)) {
+ 		writel_relaxed(0, priv->io_base + _REG(VD1_BLEND_SRC_CTRL));
+@@ -535,6 +552,27 @@ static void meson_crtc_write_video_mif(struct meson_drm *priv,
+ 	/* Legacy VD1/VD2 field addresses precede the SoC-specific translation. */
+ 	unsigned int offset = index * (VD2_IF0_GEN_REG - VD1_IF0_GEN_REG);
+ 
++	if (priv->sc2) {
++		struct meson_crtc *meson_crtc = to_meson_crtc(priv->crtc);
++		unsigned int reg = index ? SC2_VD2_IF0_GEN_REG3 :
++					  SC2_VD1_IF0_GEN_REG3;
++		const u32 mask = GENMASK(9, 8) | GENMASK(2, 0);
++		u32 value;
++
++		/* Preserve the configured non-linear byte order across format flips. */
++		if (vd->uyvy) {
++			if (!meson_crtc->video[index].uyvy_gen_reg3_active) {
++				meson_crtc->video[index].saved_gen_reg3 =
++					readl_relaxed(priv->io_base + _REG(reg));
++				meson_crtc->video[index].uyvy_gen_reg3_active = true;
++			}
++			value = vd->stride0 % 32 ? 0 : vd->stride0 % 64 ? 2 : 4;
++			writel_bits_relaxed(mask, value, priv->io_base + _REG(reg));
++		} else {
++			meson_crtc_sc2_restore_video_order(meson_crtc, index);
++		}
++	}
++
+ 	writel_relaxed(vd->if0_gen_reg, priv->io_base +
+ 		       _REG(meson_viu_mif_reg(priv, VD1_IF0_GEN_REG + offset)));
+ 	if (!index || priv->sc2)
+@@ -680,7 +718,7 @@ static void meson_crtc_update_video(struct meson_crtc *meson_crtc,
+ 					    vd->height0,
+ 					    MESON_CANVAS_WRAP_NONE,
+ 					    MESON_CANVAS_BLKMODE_LINEAR,
+-					    MESON_CANVAS_ENDIAN_SWAP64);
++					    vd->uyvy ? 0 : MESON_CANVAS_ENDIAN_SWAP64);
+ 		}
+ 
+ 		writel_relaxed(0, priv->io_base + _REG(meson_viu_afbc_reg(priv, index, AFBC_ENABLE)));
+diff --git a/drivers/gpu/drm/meson/meson_drv.h b/drivers/gpu/drm/meson/meson_drv.h
+index 71b02b9d7f38..d458be6ffc01 100644
+--- a/drivers/gpu/drm/meson/meson_drv.h
++++ b/drivers/gpu/drm/meson/meson_drv.h
+@@ -63,6 +63,7 @@ struct meson_video_state {
+ 	uint32_t fmt_w;
+ 	uint32_t if0_canvas0;
+ 	uint32_t if0_gen_reg2;
++	bool uyvy;
+ 	uint32_t fmt_ctrl;
+ 	uint32_t addr0;
+ 	uint32_t addr1;
+diff --git a/drivers/gpu/drm/meson/meson_overlay.c b/drivers/gpu/drm/meson/meson_overlay.c
+index 5301407136e1..76b21a6af0fc 100644
+--- a/drivers/gpu/drm/meson/meson_overlay.c
++++ b/drivers/gpu/drm/meson/meson_overlay.c
+@@ -52,6 +52,7 @@
+ /* VIU_VD1_FMT_CTRL */
+ #define VD_HORZ_Y_C_RATIO(value)	FIELD_PREP(GENMASK(22, 21), value)
+ #define VD_HORZ_FMT_EN			BIT(20)
++#define VD_HORZ_INITIAL_PHASE(value)	FIELD_PREP(GENMASK(27, 24), value)
+ #define VD_VERT_RPT_LINE0		BIT(16)
+ #define VD_VERT_INITIAL_PHASE(value)	FIELD_PREP(GENMASK(11, 8), value)
+ #define VD_VERT_PHASE_STEP(value)	FIELD_PREP(GENMASK(7, 1), value)
+@@ -447,6 +448,8 @@ static void meson_overlay_setup_scaler_params(struct meson_drm *priv,
+ 
+ 	vd->if0_chroma_y0 = VD_Y_START(vd_start_lines >> 1) |
+ 				      VD_Y_END(vd_end_lines >> 1);
++	if (priv->sc2 && state->fb->format->format == DRM_FORMAT_UYVY)
++		vd->if0_chroma_y0 = vd->if0_luma_y0;
+ 
+ 	vd->vpp_pic_in_height = vd_end_lines - vd_start_lines + 1;
+ 
+@@ -582,10 +585,24 @@ static void meson_overlay_atomic_update(struct drm_plane *plane,
+ 	/* Default values for RGB888/YUV444 */
+ 	vd->if0_gen_reg2 = 0;
+ 	vd->fmt_ctrl = 0;
++	vd->uyvy = priv->sc2 && fb->format->format == DRM_FORMAT_UYVY;
+ 
+ 	/* None will match for AFBC Only formats */
+ 	switch (fb->format->format) {
+ 	/* TOFIX DRM_FORMAT_RGB888 should be supported */
++	case DRM_FORMAT_UYVY:
++		vd->if0_gen_reg |= VD_BYTES_PER_PIXEL(1) | VD_LITTLE_ENDIAN;
++		vd->if0_canvas0 =
++			CANVAS_ADDR2(priv->canvas_id_vd[meson_overlay->index][0]) |
++			CANVAS_ADDR1(priv->canvas_id_vd[meson_overlay->index][0]) |
++			CANVAS_ADDR0(priv->canvas_id_vd[meson_overlay->index][0]);
++		/* SC2 video_hw.c: 4:2:2 has no vertical formatter. */
++		vd->fmt_ctrl = VD_HORZ_Y_C_RATIO(1) | VD_HORZ_FMT_EN |
++			VD_VERT_RPT_LINE0 | VD_VERT_INITIAL_PHASE(12) |
++			VD_VERT_PHASE_STEP(16);
++		if (FIELD_GET(GENMASK(14, 0), vd->if0_luma_x0) & 1)
++			vd->fmt_ctrl |= VD_HORZ_INITIAL_PHASE(8);
++		break;
+ 	case DRM_FORMAT_YUYV:
+ 		vd->if0_gen_reg |= VD_BYTES_PER_PIXEL(1);
+ 		vd->if0_canvas0 =
+@@ -769,6 +786,10 @@ static const struct drm_plane_helper_funcs meson_overlay_helper_funcs = {
+ static bool meson_overlay_format_mod_supported(struct drm_plane *plane,
+ 					       u32 format, u64 modifier)
+ {
++	if (format == DRM_FORMAT_UYVY)
++		return to_meson_overlay(plane)->priv->sc2 &&
++		       modifier == DRM_FORMAT_MOD_LINEAR;
++
+ 	if (modifier == DRM_FORMAT_MOD_LINEAR &&
+ 	    format != DRM_FORMAT_YUV420_8BIT &&
+ 	    format != DRM_FORMAT_YUV420_10BIT)
+@@ -834,6 +855,7 @@ static const uint32_t supported_drm_formats[] = {
+ 	DRM_FORMAT_YUV410,
+ 	DRM_FORMAT_YUV420_8BIT, /* Amlogic FBC Only */
+ 	DRM_FORMAT_YUV420_10BIT, /* Amlogic FBC Only */
++	DRM_FORMAT_UYVY, /* SC2 only; excluded below on older SoCs. */
+ };
+ 
+ static const uint64_t format_modifiers[] = {
+@@ -847,8 +869,9 @@ static const uint64_t format_modifiers[] = {
+ 	DRM_FORMAT_MOD_INVALID,
+ };
+ 
+-/* VD2 shares the sourced SC2 4:2:0 MIF and DOS-FBC paths. */
++/* VD2 shares the sourced SC2 linear 4:2:2, 4:2:0 and DOS-FBC paths. */
+ static const uint32_t sc2_vd2_formats[] = {
++	DRM_FORMAT_UYVY,
+ 	DRM_FORMAT_NV12,
+ 	DRM_FORMAT_NV21,
+ 	DRM_FORMAT_YUV420_8BIT,
+@@ -874,7 +897,7 @@ static int meson_overlay_create_one(struct meson_drm *priv, unsigned int index)
+ 				       &meson_overlay_funcs,
+ 				       index ? sc2_vd2_formats : supported_drm_formats,
+ 				       index ? ARRAY_SIZE(sc2_vd2_formats) :
+-					       ARRAY_SIZE(supported_drm_formats),
++					       ARRAY_SIZE(supported_drm_formats) - !priv->sc2,
+ 				       format_modifiers,
+ 				       DRM_PLANE_TYPE_OVERLAY,
+ 				       "meson_video_vd%u", index + 1);
+-- 
+2.47.3
+

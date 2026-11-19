@@ -1,0 +1,32 @@
+From: hiper25 <whydonit@gmail.com>
+Subject: [PATCH] avcodec: pass native MJPEG paired-field serialization order
+
+Unmarked JPEG field pairs have no AVI1 polarity for firmware to parse.
+Pass explicit TT/BB container order as the standard OUTPUT SEQ_TB/SEQ_BT
+field. The native decoder weaves into raster order without pixel copies.
+Leave unknown and self-describing streams to the driver.
+
+--- a/libavcodec/v4l2_buffers.c
++++ b/libavcodec/v4l2_buffers.c
+@@ -926,6 +926,7 @@
+                                     const int64_t timestamp)
+ {
+     int ret;
++    const V4L2m2mContext *const s = buf_to_m2mctx(out);
+ 
+     if (extlen) {
+         ret = v4l2_bufref_to_buf(out, 0, extdata, extlen, 0);
+@@ -945,6 +946,13 @@
+     out->buf.flags = (pkt->flags & AV_PKT_FLAG_KEY) != 0 ?
+         (out->buf.flags | V4L2_BUF_FLAG_KEYFRAME) :
+         (out->buf.flags & ~V4L2_BUF_FLAG_KEYFRAME);
++
++    if ((s->quirks & FF_V4L2_QUIRK_EXPLICIT_DRAIN) &&
++        s->avctx->codec_id == AV_CODEC_ID_MJPEG) {
++        out->buf.field = s->avctx->field_order == AV_FIELD_TT ? V4L2_FIELD_SEQ_TB :
++                         s->avctx->field_order == AV_FIELD_BB ? V4L2_FIELD_SEQ_BT :
++                         V4L2_FIELD_ANY;
++    }
+ 
+     return ret;
+ }

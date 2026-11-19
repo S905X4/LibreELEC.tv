@@ -1,0 +1,60 @@
+From: hiper25 <whydonit@gmail.com>
+Subject: [PATCH] conf: Add integer bitwise AND evaluation
+
+Select a transport from individual IEC958 status bits without matching
+whole-byte metadata values or altering the PCM payload. Reuse the existing
+integer evaluator and its configuration argument handling.
+
+--- a/src/confmisc.c
++++ b/src/confmisc.c
+@@ -46,6 +46,8 @@
+   <LI>The iadd function - snd_func_iadd() - sum all specified integers.
+       The result is an integer.
+   <LI>The imul function - snd_func_imul() - multiply all specified integers.
++      The result is an integer.
++  <LI>The iand function - snd_func_iand() - bitwise AND of specified integers.
+       The result is an integer.
+   <LI>The datadir function - snd_func_datadir() - returns the
+       ALSA data directory. The result is a string.
+@@ -490,6 +492,9 @@
+ 	char *res = NULL;
+ 	long result = 0, val;
+ 	int idx = 0, err, hit;
++
++	if (op == 2)
++		result = ~0L;
+ 	
+ 	err = snd_config_search(src, "integers", &n);
+ 	if (err < 0) {
+@@ -526,6 +531,7 @@
+ 				switch (op) {
+ 				case 0: result += val; break;
+ 				case 1: result *= val; break;
++				case 2: result &= val; break;
+ 				}
+ 				hit = 1;
+ 			}
+@@ -590,6 +596,23 @@
+ }
+ #ifndef DOC_HIDDEN
+ SND_DLSYM_BUILD_VERSION(snd_func_imul, SND_CONFIG_DLSYM_VERSION_EVALUATE);
++#endif
++
++/**
++ * \brief Returns the bitwise AND of the given integers.
++ * \param dst Result configuration node, with type integer.
++ * \param root Handle to the root source node.
++ * \param src Source node, with a definition for \c integers.
++ * \param private_data Handle to the \c private_data node.
++ * \return A non-negative value if successful, otherwise a negative error code.
++ */
++int snd_func_iand(snd_config_t **dst, snd_config_t *root,
++		  snd_config_t *src, snd_config_t *private_data)
++{
++	return snd_func_iops(dst, root, src, private_data, 2);
++}
++#ifndef DOC_HIDDEN
++SND_DLSYM_BUILD_VERSION(snd_func_iand, SND_CONFIG_DLSYM_VERSION_EVALUATE);
+ #endif
+ 
+ /**

@@ -1,0 +1,37 @@
+From 15bb3858dc868f92094ddcca4ecc06e0e5e53394 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Fri, 13 Nov 2026 02:59:36 +0800
+Subject: [PATCH] drm/meson: Keep direct DWC access in the SC2 PHY data
+
+The dedicated SC2 PHY data accidentally selected the pre-G12A indirect
+DWC register callbacks. SC2 uses directly mapped byte registers plus
+its secure callback for protected registers; the wrong accessors return
+an all-zero controller ID and prevent the display component from binding.
+
+Restore the G12A/SC2 direct callbacks while retaining only the intended
+SC2 CTRL0 power-off values. The failed 847f551 boot and probe log are
+preserved and are not HDMI mode-switch acceptance.
+
+Change-Id: I20657aa0d1701b68ce26ba5e9ad515b01194f396
+---
+ drivers/gpu/drm/meson/meson_dw_hdmi.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/meson/meson_dw_hdmi.c b/drivers/gpu/drm/meson/meson_dw_hdmi.c
+index 19f52d647464..58c9813d8830 100644
+--- a/drivers/gpu/drm/meson/meson_dw_hdmi.c
++++ b/drivers/gpu/drm/meson/meson_dw_hdmi.c
+@@ -667,8 +667,8 @@ static const struct meson_dw_hdmi_data meson_dw_hdmi_g12a_data = {
+ static const struct meson_dw_hdmi_data meson_dw_hdmi_sc2_data = {
+ 	.top_read = dw_hdmi_g12a_top_read,
+ 	.top_write = dw_hdmi_g12a_top_write,
+-	.dwc_read = dw_hdmi_dwc_read,
+-	.dwc_write = dw_hdmi_dwc_write,
++	.dwc_read = dw_hdmi_g12a_dwc_read,
++	.dwc_write = dw_hdmi_g12a_dwc_write,
+ 	.cntl0_init = 0,
+ 	.cntl1_init = PHY_CNTL1_INIT,
+ };
+-- 
+2.47.3
+

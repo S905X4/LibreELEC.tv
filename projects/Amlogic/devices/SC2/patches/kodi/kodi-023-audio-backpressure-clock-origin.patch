@@ -1,0 +1,22 @@
+From: hiper25 <whydonit@gmail.com>
+Subject: [PATCH] VideoPlayer: Scale the audio backpressure duration only
+
+Do not scale the absolute monotonic clock origin when applying playback
+speed to the existing backpressure allowance. Scaling the absolute
+deadline makes slow playback expire immediately at sufficient uptime
+and fast playback wait far beyond the intended duration. Keep sample
+ownership, credit handling and timeout constants unchanged.
+
+--- a/xbmc/cores/VideoPlayer/AudioSinkAE.cpp
++++ b/xbmc/cores/VideoPlayer/AudioSinkAE.cpp
+@@ -116,8 +116,9 @@
+   double timeout;
+   timeout  = DVD_SEC_TO_TIME(m_pAudioStream->GetDelay()) + audioframe.duration;
+   timeout += DVD_SEC_TO_TIME(1.0);
++  // Scale the duration, not the absolute clock origin.
++  timeout *= m_pClock->GetClockSpeed();
+   timeout += m_pClock->GetAbsoluteClock();
+-  timeout *= m_pClock->GetClockSpeed();
+ 
+   unsigned int total = audioframe.nb_frames - audioframe.framesOut;
+   unsigned int frames = total;

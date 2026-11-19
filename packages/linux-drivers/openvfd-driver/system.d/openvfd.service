@@ -1,0 +1,16 @@
+[Unit]
+Description=OpenVFD front-panel clock
+After=systemd-udevd.service
+Before=kodi.service
+ConditionPathExists=/sys/firmware/devicetree/base/openvfd
+
+[Service]
+Type=simple
+ExecStartPre=/sbin/modprobe openvfd
+ExecStartPre=/bin/sh -c 'test -c /dev/openvfd'
+ExecStart=/usr/sbin/OpenVFDService
+# Also runs when a start command fails or the clock process crashes.
+ExecStopPost=/sbin/modprobe -r openvfd
+
+[Install]
+WantedBy=multi-user.target

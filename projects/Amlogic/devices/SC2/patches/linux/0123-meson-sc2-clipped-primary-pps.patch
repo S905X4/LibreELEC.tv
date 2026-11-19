@@ -1,0 +1,43 @@
+From 3a4970a33d5697758dded6727deb21f9e5d13ee2 Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Sat, 14 Nov 2026 06:39:23 +0800
+Subject: [PATCH] drm/meson: use clipped primary destination for SC2 PPS
+
+Atomic validation clips both source and destination. Pair the shared
+PPS output with that clipped destination instead of the raw negative
+CRTC coordinates. Otherwise oversized primary planes wrap output scopes
+and use the wrong scale for every OSD sharing the post-blender PPS.
+
+The original 1080p hardware scenario confirmed wrapped H/V scopes and
+half-sized phase steps. Targeted objects compile; corrected hardware
+surface verification is required with the paired AFBC crop fix.
+
+Change-Id: I17a59f1fd9a27f6d6d797c770f195379914e5ee1
+---
+ drivers/gpu/drm/meson/meson_plane.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/meson/meson_plane.c b/drivers/gpu/drm/meson/meson_plane.c
+index 662e7c289208..d0314a541b45 100644
+--- a/drivers/gpu/drm/meson/meson_plane.c
++++ b/drivers/gpu/drm/meson/meson_plane.c
+@@ -353,10 +353,14 @@ static void meson_plane_atomic_update(struct drm_plane *plane,
+ 	hsc_ini_rpt_p0_num = (hf_bank_len / 2) - 1;
+ 	vsc_ini_rpt_p0_num = (vf_bank_len / 2) - 1;
+ 
++	/* Keep the shared PPS output paired with the helper-clipped input. */
++	if (priv->sc2)
++		dest = new_state->dst;
++
+ 	src_w = drm_rect_width(&new_state->src) >> 16;
+ 	src_h = drm_rect_height(&new_state->src) >> 16;
+-	dst_w = new_state->crtc_w;
+-	dst_h = new_state->crtc_h;
++	dst_w = drm_rect_width(&dest);
++	dst_h = drm_rect_height(&dest);
+ 	if (meson_plane->index) {
+ 		meson_plane_blend_size(priv, state, crtc_state, &blend_w, &blend_h);
+ 		dest = meson_plane_blend_dest(new_state, crtc_state, blend_w, blend_h);
+-- 
+2.47.3
+

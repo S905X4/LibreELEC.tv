@@ -1,0 +1,227 @@
+From 7b0060fb88b01b993ade172b533f87f7dec742ee Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Sun, 15 Nov 2026 03:54:31 +0800
+Subject: [PATCH] media: meson-sc2: export HEVC Main8 FBC and use ordinary
+ input memory
+
+Expose the existing 8-bit scatter reference surface as AMF8 capture, preserving complete exported ownership and the shared double-write scratch. Keep explicit linear NV12/NV21 capture. Use standard vb2_vmalloc for CPU-normalized compressed OUTPUT; leave coherent hardware input, sizes and queue counts unchanged.
+
+Change-Id: Ia864e5b00e267633a9c18eb19f9539deacaa31d9
+---
+ .../platform/amlogic/meson-sc2-vdec/Kconfig   |  6 ++-
+ .../amlogic/meson-sc2-vdec/meson_sc2_hw.c     | 17 +++++---
+ .../amlogic/meson-sc2-vdec/meson_sc2_hw.h     |  4 +-
+ .../amlogic/meson-sc2-vdec/meson_sc2_vdec.c   | 43 ++++++++++++++-----
+ 4 files changed, 48 insertions(+), 22 deletions(-)
+
+diff --git a/drivers/media/platform/amlogic/meson-sc2-vdec/Kconfig b/drivers/media/platform/amlogic/meson-sc2-vdec/Kconfig
+index 0b875bfdc807..73339b77b299 100644
+--- a/drivers/media/platform/amlogic/meson-sc2-vdec/Kconfig
++++ b/drivers/media/platform/amlogic/meson-sc2-vdec/Kconfig
+@@ -7,6 +7,7 @@ config VIDEO_MESON_SC2_HEVC
+ 	select MESON_SC2_DOS
+ 	select MEDIA_CONTROLLER
+ 	select VIDEOBUF2_DMA_CONTIG
++	select VIDEOBUF2_VMALLOC
+ 	select V4L2_MEM2MEM_DEV
+ 	select VIDEOBUF2_V4L2
+ 	help
+@@ -15,8 +16,9 @@ config VIDEO_MESON_SC2_HEVC
+ 	  HEVC OUTPUT contains frame-based native slice controls and raw NAL
+ 	  units without start codes. AV1 OUTPUT tile offsets address coded tile
+ 	  bytes; sequence/frame headers are rebuilt from native AV1 controls.
+-	  Main8 CAPTURE is contiguous NV12 or NV21. HEVC Main10 CAPTURE uses the local
+-	  proposed AMF0 Amlogic scatter-FBC ABI with exported vb2-owned header/body
++	  CPU-only OUTPUT uses ordinary memory. HEVC Main8 CAPTURE uses local
++	  AMF8 scatter-FBC or contiguous NV12/NV21; HEVC Main10 uses local AMF0.
++	  The proposed FBC ABI exports vb2-owned header/body
+ 	  storage, not an eight-bit preview. AV1 supports fixed output size
+ 	  <=1920x1088, superresolution, 64x64/128x128 superblocks and <=256 tiles.
+ 	  Source frame IDs must be validated by userspace before normalization.
+diff --git a/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_hw.c b/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_hw.c
+index 236501acb45a..2a44b35a9c80 100644
+--- a/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_hw.c
++++ b/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_hw.c
+@@ -631,7 +631,7 @@ int meson_sc2_av1_surface_alloc(struct meson_sc2_hw *hw,
+ 	return sc2_surface_alloc(hw, surface, width, height, 8, true);
+ }
+ 
+-/* AMF0 keeps every absolute scatter-page address inside one exported object. */
++/* AMF0/AMF8 keep all absolute scatter-page addresses inside the exported object. */
+ u32 meson_sc2_hevc_fbc_size(u32 width, u32 height)
+ {
+ 	u32 header = sc2_fbc_header_alloc_size(width, height);
+@@ -753,10 +753,10 @@ static int sc2_fbc_bind(struct meson_sc2_hevc_context *ctx,
+ 
+ int meson_sc2_hevc_fbc_bind(struct meson_sc2_hevc_context *ctx,
+ 			   struct meson_sc2_surface *surface,
+-			   u32 width, u32 height, void *cpu, dma_addr_t dma,
+-			   size_t size, struct dma_buf *buffer)
++			   u32 width, u32 height, u8 depth, void *cpu,
++			   dma_addr_t dma, size_t size, struct dma_buf *buffer)
+ {
+-	return sc2_fbc_bind(ctx, surface, width, height, 10, 0x200, true, false,
++	return sc2_fbc_bind(ctx, surface, width, height, depth, 0x200, true, false,
+ 			    cpu, dma, size, buffer);
+ }
+ 
+@@ -1253,13 +1253,16 @@ static int sc2_validate_job(struct meson_sc2_hevc_context *ctx,
+ 	if (job->output_stride != ALIGN(width, 64) || job->output_uv_offset != uv ||
+ 	    job->output_buffer->size < job->output_size)
+ 		return -EINVAL;
+-	if (sps->bit_depth_luma_minus8 == 2) {
+-		if (job->output_format != V4L2_PIX_FMT_AMLOGIC_FBC10 ||
++	if (job->output_format == V4L2_PIX_FMT_AMLOGIC_FBC8 ||
++	    job->output_format == V4L2_PIX_FMT_AMLOGIC_FBC10) {
++		if ((job->output_format == V4L2_PIX_FMT_AMLOGIC_FBC10) !=
++		    (sps->bit_depth_luma_minus8 == 2) ||
+ 		    !job->destination->capture_owned ||
+ 		    job->output_size != meson_sc2_hevc_fbc_size(width, height) ||
+ 		    !ctx->dw8 || ctx->dw8_size < uv + uv / 2)
+ 			return -EINVAL;
+-	} else if ((job->output_format != V4L2_PIX_FMT_NV12 &&
++	} else if (sps->bit_depth_luma_minus8 ||
++		   (job->output_format != V4L2_PIX_FMT_NV12 &&
+ 		    job->output_format != V4L2_PIX_FMT_NV21) ||
+ 		   job->destination->capture_owned || job->output_size < uv + uv / 2) {
+ 		return -EINVAL;
+diff --git a/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_hw.h b/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_hw.h
+index 601b2c9e4173..c619ccbffaa8 100644
+--- a/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_hw.h
++++ b/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_hw.h
+@@ -69,8 +69,8 @@ int meson_sc2_surface_alloc(struct meson_sc2_hw *hw,
+ u32 meson_sc2_hevc_fbc_size(u32 width, u32 height);
+ int meson_sc2_hevc_fbc_bind(struct meson_sc2_hevc_context *context,
+ 			   struct meson_sc2_surface *surface,
+-			   u32 width, u32 height, void *cpu, dma_addr_t dma,
+-			   size_t size, struct dma_buf *buffer);
++			   u32 width, u32 height, u8 depth, void *cpu,
++			   dma_addr_t dma, size_t size, struct dma_buf *buffer);
+ /* Stateful VP9/AVS2 keep the actual 8/10-bit FBC depth; MV storage is
+  * codec-sized (VP9 0x240, AVS2 0x200 bytes per 64x64 block).
+  */
+diff --git a/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_vdec.c b/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_vdec.c
+index 72c117330339..7e9a60c0ec7c 100644
+--- a/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_vdec.c
++++ b/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_vdec.c
+@@ -15,6 +15,7 @@
+ #include <media/v4l2-ioctl.h>
+ #include <media/v4l2-mem2mem.h>
+ #include <media/videobuf2-dma-contig.h>
++#include <media/videobuf2-vmalloc.h>
+ 
+ #include "meson_sc2_hw.h"
+ #include "meson_sc2_stateful.h"
+@@ -89,12 +90,20 @@ static struct v4l2_pix_format_mplane *sc2_format(struct sc2_ctx *ctx,
+ 	return V4L2_TYPE_IS_OUTPUT(type) ? &ctx->source_fmt : &ctx->capture_fmt;
+ }
+ 
++static bool sc2_capture_fbc(u32 fourcc)
++{
++	return fourcc == V4L2_PIX_FMT_AMLOGIC_FBC8 ||
++		fourcc == V4L2_PIX_FMT_AMLOGIC_FBC10;
++}
++
+ static void sc2_capture_format(struct sc2_ctx *ctx,
+ 			       struct v4l2_pix_format_mplane *pix)
+ {
+-	bool fbc = pix->pixelformat == V4L2_PIX_FMT_AMLOGIC_FBC10;
++	bool fbc = sc2_capture_fbc(pix->pixelformat) &&
++		(pix->pixelformat != V4L2_PIX_FMT_AMLOGIC_FBC8 ||
++		 ctx->source_fmt.pixelformat == V4L2_PIX_FMT_HEVC_SLICE);
+ 
+-	pix->pixelformat = fbc ? V4L2_PIX_FMT_AMLOGIC_FBC10 :
++	pix->pixelformat = fbc ? pix->pixelformat :
+ 		pix->pixelformat == V4L2_PIX_FMT_NV21 ? V4L2_PIX_FMT_NV21 :
+ 		V4L2_PIX_FMT_NV12;
+ 	pix->width = ALIGN(ctx->source_fmt.width, 64);
+@@ -182,7 +191,8 @@ static int sc2_enum_fmt(struct file *file, void *priv, struct v4l2_fmtdesc *f)
+ {
+ 	struct sc2_ctx *ctx = sc2_file_ctx(file);
+ 	bool output = V4L2_TYPE_IS_OUTPUT(f->type);
+-	unsigned int last = output ? 1 : 2;
++	unsigned int last = output ? 1 :
++		ctx->source_fmt.pixelformat == V4L2_PIX_FMT_HEVC_SLICE ? 3 : 2;
+ 
+ 	if (f->index > last)
+ 		return -EINVAL;
+@@ -190,9 +200,18 @@ static int sc2_enum_fmt(struct file *file, void *priv, struct v4l2_fmtdesc *f)
+ 		f->pixelformat = f->index ? V4L2_PIX_FMT_AV1_FRAME : V4L2_PIX_FMT_HEVC_SLICE;
+ 		f->flags = V4L2_FMT_FLAG_COMPRESSED;
+ 	} else {
+-		if (!f->index)
++		unsigned int index = f->index;
++
++		if (ctx->source_fmt.pixelformat == V4L2_PIX_FMT_HEVC_SLICE) {
++			if (!index) {
++				f->pixelformat = V4L2_PIX_FMT_AMLOGIC_FBC8;
++				return 0;
++			}
++			index--;
++		}
++		if (!index)
+ 			f->pixelformat = V4L2_PIX_FMT_NV12;
+-		else if (f->index == 1)
++		else if (index == 1)
+ 			f->pixelformat = V4L2_PIX_FMT_AMLOGIC_FBC10;
+ 		else
+ 			f->pixelformat = V4L2_PIX_FMT_NV21;
+@@ -207,7 +226,7 @@ static int sc2_enum_framesizes(struct file *file, void *priv,
+ 			f->pixel_format != V4L2_PIX_FMT_AV1_FRAME &&
+ 			f->pixel_format != V4L2_PIX_FMT_NV12 &&
+ 			f->pixel_format != V4L2_PIX_FMT_NV21 &&
+-			f->pixel_format != V4L2_PIX_FMT_AMLOGIC_FBC10))
++			!sc2_capture_fbc(f->pixel_format)))
+ 		return -EINVAL;
+ 	f->type = V4L2_FRMSIZE_TYPE_STEPWISE;
+ 	f->stepwise.min_width = 64;
+@@ -215,13 +234,13 @@ static int sc2_enum_framesizes(struct file *file, void *priv,
+ 		3840 : SC2_MAX_WIDTH;
+ 	f->stepwise.step_width = f->pixel_format == V4L2_PIX_FMT_NV12 ||
+ 		f->pixel_format == V4L2_PIX_FMT_NV21 ||
+-		f->pixel_format == V4L2_PIX_FMT_AMLOGIC_FBC10 ? 64 : 2;
++		sc2_capture_fbc(f->pixel_format) ? 64 : 2;
+ 	f->stepwise.min_height = 64;
+ 	f->stepwise.max_height = f->pixel_format == V4L2_PIX_FMT_AV1_FRAME ?
+ 		2160 : SC2_MAX_HEIGHT;
+ 	f->stepwise.step_height = f->pixel_format == V4L2_PIX_FMT_NV12 ||
+ 		f->pixel_format == V4L2_PIX_FMT_NV21 ||
+-		f->pixel_format == V4L2_PIX_FMT_AMLOGIC_FBC10 ? 64 : 2;
++		sc2_capture_fbc(f->pixel_format) ? 64 : 2;
+ 	return 0;
+ }
+ 
+@@ -385,7 +404,7 @@ static int sc2_buf_prepare(struct vb2_buffer *vb)
+ 	if (vb->planes[0].data_offset)
+ 		return -EINVAL;
+ 	/* Absolute scatter PFNs require driver-owned, physically contiguous storage. */
+-	if (ctx->capture_fmt.pixelformat == V4L2_PIX_FMT_AMLOGIC_FBC10 &&
++	if (sc2_capture_fbc(ctx->capture_fmt.pixelformat) &&
+ 	    vb->memory != VB2_MEMORY_MMAP)
+ 		return -EOPNOTSUPP;
+ 	mutex_lock(&ctx->state_lock);
+@@ -418,9 +437,10 @@ static int sc2_buf_prepare(struct vb2_buffer *vb)
+ 		else if (ctx->source_fmt.pixelformat == V4L2_PIX_FMT_AV1_FRAME)
+ 			ret = meson_sc2_av1_surface_alloc(ctx->dev->hw, &buf->surface,
+ 				ctx->source_fmt.width, ctx->source_fmt.height);
+-		else if (ctx->capture_fmt.pixelformat == V4L2_PIX_FMT_AMLOGIC_FBC10)
++		else if (sc2_capture_fbc(ctx->capture_fmt.pixelformat))
+ 			ret = meson_sc2_hevc_fbc_bind(ctx->hwctx, &buf->surface,
+ 				ctx->source_fmt.width, ctx->source_fmt.height,
++				ctx->capture_fmt.pixelformat == V4L2_PIX_FMT_AMLOGIC_FBC10 ? 10 : 8,
+ 				vb2_plane_vaddr(vb, 0), vb2_dma_contig_plane_dma_addr(vb, 0),
+ 				vb2_plane_size(vb, 0), dmabuf);
+ 		else
+@@ -543,7 +563,8 @@ static int sc2_queue_init(void *priv, struct vb2_queue *src,
+ 		q->io_modes = VB2_MMAP | VB2_DMABUF;
+ 		q->drv_priv = ctx;
+ 		q->ops = &sc2_queue_ops;
+-		q->mem_ops = &vb2_dma_contig_memops;
++		/* Compressed OUTPUT is copied by the CPU into the coherent input ring. */
++		q->mem_ops = i ? &vb2_dma_contig_memops : &vb2_vmalloc_memops;
+ 		q->buf_struct_size = sizeof(struct sc2_buffer);
+ 		q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
+ 		q->lock = &ctx->dev->lock;
+-- 
+2.47.3
+

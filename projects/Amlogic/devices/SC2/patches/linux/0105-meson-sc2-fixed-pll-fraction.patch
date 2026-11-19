@@ -1,0 +1,37 @@
+From 7391d11181a5a13d567f72236ee2943a72e87eac Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Fri, 13 Nov 2026 17:50:03 +0800
+Subject: [PATCH] clk: meson: Use the SC2 fixed PLL fractional denominator
+
+SC2 exposes a 19-bit fraction register but its BSP scales positive
+fractions by 2^17. The generic default of 2^19 reports the observed
+M=166,N=1,OD=1,frac=87381 as 1.994 GHz instead of approximately 2 GHz.
+MPLL audio dividers then produce the same +0.3009 percent pitch error
+observed independently at the HDMI receiver.
+
+Set the existing frac_max override for this read-only PLL only. Keep
+register width, PLL programming, secure CPU clocks and other SoCs intact.
+The production arithmetic helper reproduces both rates and retains
+integer-fraction behavior. Actual corrected boot and tones remain to test.
+
+Change-Id: I3af3e9b33ce5b799fabca16a1d2189a99a8d41b8
+---
+ drivers/clk/meson/sc2.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/drivers/clk/meson/sc2.c b/drivers/clk/meson/sc2.c
+index a1fb78a7ca27..635c0fd03523 100644
+--- a/drivers/clk/meson/sc2.c
++++ b/drivers/clk/meson/sc2.c
+@@ -165,6 +165,8 @@ static struct clk_regmap sc2_fixed_pll_dco = {
+ 			.shift   = 0,
+ 			.width   = 19,
+ 		},
++		/* SC2's 19-bit field has a 17-bit fractional denominator. */
++		.frac_max = BIT(17),
+ 		.l = {
+ 			.reg_off = ANACTRL_FIXPLL_CTRL0,
+ 			.shift   = 31,
+-- 
+2.47.3
+

@@ -1,0 +1,79 @@
+From 8e8539763f081deffd25b4526fc16610a844792c Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Fri, 13 Nov 2026 21:53:17 +0800
+Subject: [PATCH] media: meson: retain context-owned AV1 global-motion history
+
+The SC2 donor rebinds its firmware-private GMC store/load backing after core restart with current and true-primary physical-picture selection, just as the existing native path does. Keep canonical deltas relative to actual resolved primary controls; remove the blanket nonidentity model rejection without adding host coefficient seeding, guessed bank formats or primary rewriting. Main8/Main10 real global-prediction blocks and overlapping contexts have exact native pixel/PTS/EOF evidence. Model/tool/spec coverage is recorded separately.
+---
+ .../meson-sc2-vdec/av1_request_syntax.c       |  3 +++
+ .../amlogic/meson-sc2-vdec/meson_sc2_av1.h    | 19 +++++++++++--------
+ 2 files changed, 14 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/media/platform/amlogic/meson-sc2-vdec/av1_request_syntax.c b/drivers/media/platform/amlogic/meson-sc2-vdec/av1_request_syntax.c
+index 53b074860db0..28399f0a4674 100644
+--- a/drivers/media/platform/amlogic/meson-sc2-vdec/av1_request_syntax.c
++++ b/drivers/media/platform/amlogic/meson-sc2-vdec/av1_request_syntax.c
+@@ -607,6 +607,9 @@ static void global_param(struct av1_bits *b, struct av1_syntax *s,
+ {
+ 	unsigned int abs_bits = 12, precision = 15;
+ 	int identity = index % 3 == 2 ? 65536 : 0;
++	/* Keep the true primary's predictor: the backend retains firmware GMC
++	 * state with the same completed physical picture as this frame snapshot.
++	 * Parser restart is not a reason to recenter against identity. */
+ 	s32 previous = s->primary ? s->primary->global_motion.params[ref][index] : identity;
+ 	s64 current = s->r->frame->global_motion.params[ref][index];
+ 	s64 predictor;
+diff --git a/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_av1.h b/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_av1.h
+index 990236c31583..0fc51ce9eb0a 100644
+--- a/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_av1.h
++++ b/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_av1.h
+@@ -8,7 +8,7 @@
+ #define AV1_MMU_DMA_CTRL (0x363e * 4)
+ #define A8_PHYSICAL_SLOTS 16
+ /* Page-aligned capacities from vav1.c aom_workbuff_spec[1] (4096x2304).
+- * Only the board's 3840x2160 envelope is advertised. CDF and segmentation
++ * Only the board's 3840x2160 envelope is advertised. CDF, GMC and segmentation
+  * remain per physical slot across parser resets and dependent pictures.
+  */
+ #define AV1_WORK_SIZE 0x510000
+@@ -504,6 +504,9 @@ static void sc2_av1_parser(struct meson_sc2_hevc_context *ctx,
+     sc2_write(hw, HEVC_ASSIST_SCRATCH_1, lower_32_bits(st->work_dma + AV1_RPM));
+     sc2_write(hw, HEVC_ASSIST_SCRATCH_I, lower_32_bits(st->work_dma + AV1_LMEM));
+     sc2_write(hw, HEVC_ASSIST_SCRATCH_5, av1_workspace(st, DAALA));
++    /* vav1 keeps this external store/load allocation across run_front() core
++     * resets. Its contents are firmware-private, produced from canonical OBUs;
++     * never seed coefficients or clear it between dependent pictures. */
+     sc2_write(hw, AV1_GMC_PARAM_BUFF_ADDR, av1_workspace(st, GMC));
+     sc2_write(hw, HEVCD_IPP_LINEBUFF_BASE, av1_workspace(st, IPP));
+     sc2_write(hw, HEVC_DBLK_CFG4, av1_workspace(st, DBLK_PARA));
+@@ -694,11 +697,10 @@ static int sc2_av1_validate(struct meson_sc2_hevc_context *ctx,
+         f->tile_info.tile_cols > 64 ||
+         f->tile_info.tile_rows > 64 || job->syntax->num_tiles > 256)
+         return -EOPNOTSUPP;
+-    /* A fresh parser has no implicit previous global-motion predictor bank.
+-     * Reject nonidentity models instead of silently losing that authority. */
+-    for (i = 0; i < 8; i++)
+-        if (f->global_motion.type[i] != V4L2_AV1_WARP_MODEL_IDENTITY)
+-            return -EOPNOTSUPP;
++    /* Index zero is not an inter reference. Models 1..7 are checked by the
++     * serializer and decoded into the context-owned opaque GMC workspace. */
++    if (f->global_motion.type[0] != V4L2_AV1_WARP_MODEL_IDENTITY)
++        return -EOPNOTSUPP;
+     if (!owner || (owner->context && owner->context != ctx) ||
+         owner->surface.width != f->upscaled_width || owner->surface.height != height ||
+         owner->surface.depth != s->bit_depth || owner->surface.mv_size < SZ_1M ||
+@@ -808,8 +810,9 @@ static int sc2_av1_validate(struct meson_sc2_hevc_context *ctx,
+     st->sequence[9] = st->order_bits ? st->order_bits - 1 : 0;
+     job->syntax->references = st->snapshots;
+     job->syntax->num_references = 8;
+-    /* Each invocation starts a fresh parser; external CDF/segment history is
+-     * explicitly rebound, never zeroed between dependent pictures. */
++    /* Each invocation starts a fresh parser. External CDF/segment/GMC history
++     * survives it; logical refs and true-primary/current physical indices are
++     * rebound explicitly. Only completed pictures can supply that history. */
+     job->syntax->emit_sequence_header = true;
+     return 0;
+ }
+-- 
+2.47.3
+

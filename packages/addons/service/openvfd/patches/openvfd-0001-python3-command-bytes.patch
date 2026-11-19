@@ -1,0 +1,26 @@
+From: LibreELEC HK1 RBOX X4 integration
+Subject: [PATCH] vfddev: keep binary command buffers as bytes on Python 3
+
+led_cmd is opened in binary mode. Treat an empty response as bytes and
+concatenate the packed character-order command as bytes, not text.
+
+--- a/resources/lib/vfddev.py
++++ b/resources/lib/vfddev.py
+@@ -68,7 +68,7 @@ class vfdDev:
+ 		if (ioctl.DIR(cmd) == ioctl.READ and self.__writeVfd(cmd, 0)):
+ 			with open(_led_cmd, "rb") as vfd:
+ 				ret = vfd.read()
+-			if (ret == ''):
++			if (ret == b''):
+ 				ret = None
+ 			if (not isBuf and ret != None):
+ 				ret = int(ret, 0)
+@@ -79,7 +79,7 @@ class vfdDev:
+ 		ret = False
+ 		if (os.path.isfile(_led_cmd)):
+ 			if isBuf:
+-				value = ''.join([struct.pack('I', cmd), value])
++				value = struct.pack('I', cmd) + value
+ 			else:
+ 				value = struct.pack('Ii', cmd, value)
+ 			kodiLog('vfdDev.__writeVfd: value = {0}'.format(repr(value)))

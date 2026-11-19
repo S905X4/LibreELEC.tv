@@ -1,0 +1,34 @@
+From 48de1956a16ebcea81816315e3724b4d0f89dddd Mon Sep 17 00:00:00 2001
+From: hiper25 <whydonit@gmail.com>
+Date: Sun, 15 Nov 2026 02:16:54 +0800
+Subject: [PATCH] media: meson-sc2: clear released capture import ownership
+
+VB2 retries a failed DMABUF prepare after buf_cleanup. Reset the export pointer and list node so the retry cannot release an old reference. Real fixed-driver ENOMEM twice and same-FD recovery preserve the external owner and contents.
+
+Change-Id: I3f152f5d7ddfa7268de951254e596496b74ef2d0
+---
+ .../media/platform/amlogic/meson-sc2-vdec/meson_sc2_vdec.c  | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_vdec.c b/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_vdec.c
+index 91ef1085d65a..72c117330339 100644
+--- a/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_vdec.c
++++ b/drivers/media/platform/amlogic/meson-sc2-vdec/meson_sc2_vdec.c
+@@ -443,10 +443,12 @@ static void sc2_buf_cleanup(struct vb2_buffer *vb)
+ 	if (V4L2_TYPE_IS_OUTPUT(vb->type))
+ 		return;
+ 	mutex_lock(&ctx->state_lock);
+-	list_del(&buf->capture_entry);
++	list_del_init(&buf->capture_entry);
+ 	meson_sc2_surface_free(ctx->dev->hw, &buf->surface);
+-	if (buf->output_buffer)
++	if (buf->output_buffer) {
+ 		dma_buf_put(buf->output_buffer);
++		buf->output_buffer = NULL;
++	}
+ 	mutex_unlock(&ctx->state_lock);
+ }
+ 
+-- 
+2.47.3
+
